@@ -478,7 +478,6 @@ class SimpleADB:
     def pull(self, host_output_path, device_output_path=None, callback=None):
         if device_output_path is None:
             device_output_path = self.output_folder
-        self._adb(["pull", "-a", device_output_path, host_output_path])
         if callback:
             callback()
 
