@@ -26,6 +26,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
     ATTENTION_SINK_EVICTOR,
     AUDIO_ENCODER,
     DECODER_MODEL_VERSION,
+    EAGLE_HEAD,
     EVAL_MODE,
     MODALITY_INPUT_FLAG_MAP,
     TEXT_DECODER,
@@ -286,12 +287,28 @@ class DefaultEval(EvalBase):
                 f"--ngram {args.ngram}",
             ]
         )
+        eagle_args = ""
+        if args.model_mode == "eagle":
+            eagle_head_basename = os.path.basename(self.pte_paths.get(EAGLE_HEAD, ""))
+            eagle_head_path = (
+                eagle_head_basename
+                if not args.enable_x86_64
+                else self.pte_paths.get(EAGLE_HEAD, "")
+            )
+            eagle_args = " ".join(
+                [
+                    f"--eagle_head_path {eagle_head_path}",
+                    f"--max_tree_size {args.max_tree_size}",
+                    f"--draft_len {args.draft_len}",
+                ]
+            )
         runner_args = " ".join(
             [
                 f"--eval_mode {EVAL_MODE[args.model_mode]}",
                 f"--temperature {args.temperature}",
                 f"--system_prompt '{args.system_prompt}'",
                 lookahead_args if args.model_mode == "lookahead" else "",
+                eagle_args,
             ]
         )
         self.runner_cmd = " ".join(

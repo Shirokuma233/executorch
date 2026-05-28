@@ -13,6 +13,7 @@
 #include <executorch/examples/models/llama/runner/runner.h>
 #include <executorch/examples/models/llama/tokenizer/llama_tiktoken.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/client_mem.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/eagle_token_generator.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/lhd_token_generator.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/rpc_mem.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/runner.h>
@@ -99,9 +100,15 @@ Runner::Runner(
     const int window,
     const int gcap,
     std::unique_ptr<tokenizers::Tokenizer> tokenizer,
-    std::unique_ptr<executorch::extension::Module> attention_sink_rope_module)
+    std::unique_ptr<executorch::extension::Module> attention_sink_rope_module,
+    std::unique_ptr<executorch::extension::Module> eagle_head_module,
+    int max_tree_size,
+    int draft_len)
     : module_(std::move(module)),
       attention_sink_rope_module_(std::move(attention_sink_rope_module)),
+      eagle_head_module_(std::move(eagle_head_module)),
+      max_tree_size_(max_tree_size),
+      draft_len_(draft_len),
       ngram_(ngram),
       window_(window),
       gcap_(gcap),
@@ -171,6 +178,7 @@ Error Runner::load() {
       break;
     case EvalMode::kHybrid:
     case EvalMode::kLookaheadDecoding:
+    case EvalMode::kEagleDecoding:
       prompt_processor_method_name = "prefill_forward";
       token_generator_method_name = "kv_forward";
       method_names.emplace_back(prompt_processor_method_name);
@@ -252,7 +260,8 @@ Error Runner::load() {
     prompt_processor_ar_len = token_generator_ar_len;
   } else if (
       eval_mode_ == EvalMode::kHybrid ||
-      eval_mode_ == EvalMode::kLookaheadDecoding) {
+      eval_mode_ == EvalMode::kLookaheadDecoding ||
+      eval_mode_ == EvalMode::kEagleDecoding) {
     auto atten_mask_meta_prompt =
         module_->method_meta(prompt_processor_method_name)
             ->input_tensor_meta(1);
@@ -327,6 +336,84 @@ Error Runner::load() {
         &stats_,
         std::make_unique<MethodMeta>(std::move(
             module_->method_meta(token_generator_method_name).get())));
+  } else if (eval_mode_ == EvalMode::kEagleDecoding) {
+    ET_CHECK_MSG(
+        eagle_head_module_ != nullptr,
+        "Eagle mode requires --eagle_head_path to be set.");
+    // Load the head module's methods.
+    ET_CHECK_OK_OR_RETURN_ERROR(eagle_head_module_->load_method("kv_forward"));
+    ET_CHECK_OK_OR_RETURN_ERROR(
+        eagle_head_module_->load_method("prefill_forward"));
+
+    // Build a KV manager dedicated to the head (single layer).
+    auto head_kv_meta = ET_UNWRAP(eagle_head_module_->method_meta("kv_forward"));
+    // head k_cache shape: [1, n_kv, head_dim, ctx-1]
+    auto head_k_shape = head_kv_meta.input_tensor_meta(/*input_pos+kv*/ 4)->sizes();
+    int64_t head_n_kv = head_k_shape[1];
+    int64_t head_head_dim = head_k_shape[2];
+    int64_t head_max_cache_len = head_k_shape[3];
+
+    eagle_kv_manager_ = std::make_unique<KVManager>(
+        KVManager::Metadata{
+            context_len_,
+            head_head_dim,
+            /*max_ar_len=*/1,
+            static_cast<int32_t>(head_max_cache_len),
+            head_n_kv,
+            /*num_layers=*/1},
+        std::make_unique<MethodMeta>(std::move(head_kv_meta)));
+
+    // TODO(phase-3): read d2t from head pte's get_d2t constant_method.
+    std::vector<int64_t> d2t;
+    if (eagle_head_module_->method_names()->count("get_d2t") > 0) {
+      // get_d2t returns an int64 1D tensor.
+      auto res = eagle_head_module_->get("get_d2t");
+      if (res.ok()) {
+        // TODO(phase-3): copy into d2t vector.
+        ET_LOG(Info, "[Eagle] d2t loaded from head pte (TODO: copy out)");
+      }
+    }
+
+    auto head_prefill_meta =
+        ET_UNWRAP(eagle_head_module_->method_meta("prefill_forward"));
+
+    EagleTokenGenerator::Metadata eagle_md{
+        /*target_context_len=*/context_len_,
+        /*target_num_heads=*/num_heads,
+        /*target_num_layers=*/num_layers,
+        /*target_ar_len=*/token_generator_ar_len,
+        /*target_vocab_size=*/vocab_size,
+        /*use_int64_token=*/use_int64_token,
+        /*target_sliding_window=*/sliding_window,
+        /*target_cache_mode=*/cache_mode_,
+        /*hidden_dim=*/static_cast<int32_t>(head_head_dim * head_n_kv),
+        /*draft_len=*/draft_len_,
+        /*draft_vocab_size=*/0,  // TODO(phase-3): from head metadata
+        /*head_n_kv_heads=*/static_cast<int32_t>(head_n_kv),
+        /*head_head_dim=*/static_cast<int32_t>(head_head_dim),
+        /*max_tree_size=*/max_tree_size_,
+        /*low_layer_idx=*/-1,
+        /*mid_layer_idx=*/-1,
+        /*high_layer_idx=*/-1,
+    };
+
+    auto eagle_gen = std::make_unique<EagleTokenGenerator>(
+        tokenizer_.get(),
+        decoder_runner_.get(),
+        kv_manager_.get(),
+        eagle_head_module_.get(),
+        eagle_kv_manager_.get(),
+        token_generator_method_name,
+        std::move(eos_ids),
+        eagle_md,
+        &stats_,
+        std::make_unique<MethodMeta>(std::move(
+            module_->method_meta(token_generator_method_name).get())),
+        std::make_unique<MethodMeta>(std::move(
+            eagle_head_module_->method_meta("kv_forward").get())),
+        std::make_unique<MethodMeta>(std::move(head_prefill_meta)));
+    eagle_gen->set_d2t(std::move(d2t));
+    token_generator_ = std::move(eagle_gen);
   } else {
     token_generator_ = std::make_unique<TokenGenerator>(
         tokenizer_.get(),

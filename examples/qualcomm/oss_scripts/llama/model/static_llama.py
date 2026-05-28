@@ -666,6 +666,7 @@ class LlamaModel(nn.Module):
         self.output_cache = output_cache
         self.kv_io_bit_width = config.kv_io_bit_width
         self.logits_scaling = config.logits_scaling
+        self.output_hidden_layers = kwargs.get("output_hidden_layers", None)
 
         self.layers = nn.ModuleList(
             [
@@ -732,6 +733,7 @@ class LlamaModel(nn.Module):
 
         hidden_states = self.embedding_scale_factor * self.tok_embeddings(tokens)
 
+        captured_hiddens = [] if self.output_hidden_layers is not None else None
         for ind, decoder_layer in enumerate(self.layers):
             k_caches = None
             v_caches = None
@@ -751,6 +753,8 @@ class LlamaModel(nn.Module):
             )
             output_k_cache.extend(k)
             output_v_cache.extend(v)
+            if captured_hiddens is not None and ind in self.output_hidden_layers:
+                captured_hiddens.append(hidden_states)
 
         hidden_states = self.norm(hidden_states)
         logits = self.output(hidden_states)
@@ -759,6 +763,8 @@ class LlamaModel(nn.Module):
             logits = logits / self.logits_scaling
 
         if self.output_cache:
+            if captured_hiddens is not None:
+                return logits, output_k_cache, output_v_cache, *captured_hiddens
             return logits, output_k_cache, output_v_cache
         return logits
 
@@ -867,6 +873,7 @@ class LlamaModelWithoutEmbedding(LlamaModel):
 
         hidden_states = self.embedding_scale_factor * hidden_states
 
+        captured_hiddens = [] if self.output_hidden_layers is not None else None
         for ind, decoder_layer in enumerate(self.layers):
             k_caches = None
             v_caches = None
@@ -886,6 +893,8 @@ class LlamaModelWithoutEmbedding(LlamaModel):
             )
             output_k_cache.extend(k)
             output_v_cache.extend(v)
+            if captured_hiddens is not None and ind in self.output_hidden_layers:
+                captured_hiddens.append(hidden_states)
 
         hidden_states = self.norm(hidden_states)
         logits = self.output(hidden_states)
@@ -894,6 +903,8 @@ class LlamaModelWithoutEmbedding(LlamaModel):
             logits = logits / self.logits_scaling
 
         if self.output_cache:
+            if captured_hiddens is not None:
+                return logits, output_k_cache, output_v_cache, *captured_hiddens
             return logits, output_k_cache, output_v_cache
         return logits
 
@@ -1025,6 +1036,7 @@ class MultiScopeAwareLlamaModel(LlamaModel):
         )
 
         hidden_states = self.embedding_scale_factor * self.tok_embeddings(tokens)
+        captured_hiddens = [] if self.output_hidden_layers is not None else None
         for ind, decoder_layer in enumerate(self.layers):
             k_caches = None
             v_caches = None
@@ -1055,6 +1067,8 @@ class MultiScopeAwareLlamaModel(LlamaModel):
 
             output_k_cache.extend(k)
             output_v_cache.extend(v)
+            if captured_hiddens is not None and ind in self.output_hidden_layers:
+                captured_hiddens.append(hidden_states)
 
         hidden_states = self.norm(hidden_states)
         logits = self.output(hidden_states)
@@ -1064,6 +1078,8 @@ class MultiScopeAwareLlamaModel(LlamaModel):
             logits = logits * self.final_logit_softcapping
 
         if self.output_cache:
+            if captured_hiddens is not None:
+                return logits, output_k_cache, output_v_cache, *captured_hiddens
             return logits, output_k_cache, output_v_cache
         return logits
 

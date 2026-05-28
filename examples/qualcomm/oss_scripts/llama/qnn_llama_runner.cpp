@@ -68,7 +68,7 @@ DEFINE_int32(
 DEFINE_int32(
     eval_mode,
     1,
-    "0: TokenGenerator(kv) / 1: HybridMode (prefill+kv) / 2: Lookahead Decoding");
+    "0: TokenGenerator(kv) / 1: HybridMode (prefill+kv) / 2: Lookahead Decoding / 3: Eagle Decoding");
 DEFINE_bool(
     shared_buffer,
     false,
@@ -86,6 +86,18 @@ DEFINE_int32(
     gcap,
     0,
     "[Lookahead Decoding] Represents the maximum number of speculations or candidate n-grams that the algorithm considers in each step for verification. It balances the trade-off between computation efficiency and exploring more possibilities.");
+DEFINE_string(
+    eagle_head_path,
+    "",
+    "[Eagle Decoding] Path to the compiled EAGLE draft head pte.");
+DEFINE_int32(
+    max_tree_size,
+    0,
+    "[Eagle Decoding] Max nodes in draft tree (must match target compiled ar_len).");
+DEFINE_int32(
+    draft_len,
+    0,
+    "[Eagle Decoding] Chain-mode draft length (Phase 3).");
 
 std::vector<std::string> CollectPrompts(int argc, char** argv) {
   // Collect all prompts from command line, example usage:
@@ -213,7 +225,8 @@ std::string get_formatted_prompt(
 void start_runner(
     std::unique_ptr<executorch::extension::Module> module,
     std::vector<std::string>& prompts,
-    std::unique_ptr<executorch::extension::Module> attention_sink_rope_module) {
+    std::unique_ptr<executorch::extension::Module> attention_sink_rope_module,
+    std::unique_ptr<executorch::extension::Module> eagle_head_module) {
   bool use_tokenized_prompt =
       gflags::GetCommandLineFlagInfoOrDie("tokenized_prompt").is_default ? false
                                                                          : true;
@@ -232,7 +245,10 @@ void start_runner(
       FLAGS_window,
       FLAGS_gcap,
       nullptr,
-      std::move(attention_sink_rope_module));
+      std::move(attention_sink_rope_module),
+      std::move(eagle_head_module),
+      FLAGS_max_tree_size,
+      FLAGS_draft_len);
   auto decoder_model_version = runner.get_decoder_model_version();
   std::vector<char> buf;
   buf.reserve(5 * FLAGS_seq_len); // assume each token is around 5 char
@@ -297,8 +313,17 @@ int main(int argc, char** argv) {
             FLAGS_attention_sink_rope_path.c_str(),
             executorch::extension::Module::LoadMode::MmapUseMlockIgnoreErrors);
   }
+  std::unique_ptr<executorch::extension::Module> eagle_head_module;
+  if (!FLAGS_eagle_head_path.empty()) {
+    eagle_head_module = std::make_unique<executorch::extension::Module>(
+        FLAGS_eagle_head_path.c_str(),
+        executorch::extension::Module::LoadMode::MmapUseMlockIgnoreErrors);
+  }
   start_runner(
-      std::move(module), prompts, std::move(attention_sink_rope_module));
+      std::move(module),
+      prompts,
+      std::move(attention_sink_rope_module),
+      std::move(eagle_head_module));
 
   return 0;
 }

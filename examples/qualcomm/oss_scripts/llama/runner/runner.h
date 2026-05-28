@@ -63,7 +63,11 @@ class Runner : public executorch::extension::llm::IRunner {
       const int gcap = 0,
       std::unique_ptr<tokenizers::Tokenizer> tokenizer = nullptr,
       std::unique_ptr<executorch::extension::Module>
-          attention_sink_rope_module = nullptr);
+          attention_sink_rope_module = nullptr,
+      std::unique_ptr<executorch::extension::Module> eagle_head_module =
+          nullptr,
+      int max_tree_size = 0,
+      int draft_len = 0);
 
   bool is_loaded() const override;
   executorch::runtime::Error load() override;
@@ -90,11 +94,16 @@ class Runner : public executorch::extension::llm::IRunner {
     kKVCached = 0,
     kHybrid,
     kLookaheadDecoding,
+    kEagleDecoding,
     kUnsupported,
   };
 
   std::unique_ptr<executorch::extension::Module> module_;
   std::unique_ptr<executorch::extension::Module> attention_sink_rope_module_;
+  std::unique_ptr<executorch::extension::Module> eagle_head_module_;
+  std::unique_ptr<KVManager> eagle_kv_manager_;
+  int max_tree_size_{0};
+  int draft_len_{0};
   int32_t context_len_{0};
 
   int ngram_{0};

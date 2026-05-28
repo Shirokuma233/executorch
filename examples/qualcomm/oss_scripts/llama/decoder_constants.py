@@ -20,6 +20,10 @@ TOK_EMBEDDING = "tok_embedding"
 TEXT_DECODER = "text_decoder"
 ATTENTION_SINK_EVICTOR = "attention_sink_evictor"
 
+# Eagle mode component identifiers
+EAGLE_TARGET = "eagle_target"
+EAGLE_HEAD = "eagle_head"
+
 # Mapping of input flags for the runner
 MODALITY_INPUT_FLAG_MAP = {
     AUDIO_ENCODER: "audio_path",
@@ -40,6 +44,7 @@ EVAL_MODE = {
     "kv": 0,
     "hybrid": 1,
     "lookahead": 2,
+    "eagle": 3,
 }
 # The dict's value is mainly for runner to decide what special tokens are required to wrap the prompt.
 DECODER_MODEL_VERSION = {

@@ -36,6 +36,8 @@ from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
     AUDIO_ENCODER,
     DECODE_QDQ_FILENAME,
     DECODER_GRAPH_NAMES,
+    EAGLE_HEAD,
+    EAGLE_TARGET,
     EVAL_MODE,
     PROMPT_EVAL,
     SQNR_EVAL,
@@ -68,6 +70,45 @@ logging.basicConfig(level=logging.INFO, format=FORMAT)
 logging.getLogger().setLevel(logging.INFO)
 # Avoid the error message "Could not initialize NNPACK! Reason: Unsupported hardware."
 torch.backends.nnpack.set_flags(False)
+
+
+def compile_eagle_head(
+    args,
+    decoder_model_config: LLMModelConfig,
+    text_decoder_pte_path: str,
+    eagle_head_pte_path: str,
+    tokenizer,
+    calibration_data,
+):
+    """[Eagle mode] Drive EagleManager to compile target + head pte's."""
+    from executorch.backends.qualcomm.export_utils import get_backend_type
+    from executorch.examples.qualcomm.oss_scripts.llama.wrappers import EagleManager
+
+    eagle_mgr = EagleManager(control_args=args, config=decoder_model_config)
+
+    backend_options = generate_htp_compiler_spec(use_fp16=False)
+    compile_spec = generate_qnn_executorch_compiler_spec(
+        soc_model=get_soc_to_chipset_map()[args.soc_model],
+        backend_options=backend_options,
+        shared_buffer=not args.enable_x86_64,
+    )
+    backend_type = get_backend_type(args)
+
+    eagle_mgr.quantize(
+        calibration_data=calibration_data,
+        skip_quantize_target=False,
+        tokenizer=tokenizer,
+        backend=backend_type,
+        soc_model=args.soc_model,
+    )
+    eagle_mgr.compile(
+        compile_spec=compile_spec,
+        pte_filenames={
+            EAGLE_TARGET: os.path.splitext(os.path.basename(text_decoder_pte_path))[0],
+            EAGLE_HEAD: os.path.splitext(os.path.basename(eagle_head_pte_path))[0],
+        },
+        skip_quantize_target=False,
+    )
 
 
 def compile_attention_sink_evictor(
@@ -212,6 +253,7 @@ def inference(
     attention_sink_evictor_pte_path: str,
     calibration_data,
     is_multimodal,
+    eagle_head_pte_path: str = None,
 ):
 
     assert args.model_mode in EVAL_MODE, f"Unknown model_mode: {args.model_mode}."
@@ -220,6 +262,15 @@ def inference(
     eval_results = {
         "pte_size": os.path.getsize(text_decoder_pte_path),
     }
+
+    if args.model_mode == "eagle":
+        assert eagle_head_pte_path is not None and os.path.exists(
+            eagle_head_pte_path
+        ), f"Eagle mode requires compiled head at {eagle_head_pte_path}"
+        pte_paths.update({EAGLE_HEAD: eagle_head_pte_path})
+        eval_results.update(
+            {"eagle_head_pte_size": os.path.getsize(eagle_head_pte_path)}
+        )
 
     if args.use_attention_sink:
         pte_paths.update({ATTENTION_SINK_EVICTOR: attention_sink_evictor_pte_path})
@@ -496,6 +547,60 @@ def _build_parser():
         default=8,
         type=int,
     )
+    # ---- Eagle speculative decoding (model_mode == "eagle") ----
+    parser.add_argument(
+        "--eagle_head_checkpoint",
+        default=None,
+        type=str,
+        help="[Eagle mode] Path to the EAGLE head weights (HF safetensors file or directory).",
+    )
+    parser.add_argument(
+        "--eagle_head_config",
+        default=None,
+        type=str,
+        help="[Eagle mode] Path to the EAGLE head config json. If omitted and "
+        "--eagle_head_checkpoint is a directory, config.json from that directory is used.",
+    )
+    parser.add_argument(
+        "--max_tree_size",
+        default=16,
+        type=int,
+        help="[Eagle mode] Max nodes in draft tree. Target kv_forward ar_len = next_power_of_two(max_tree_size).",
+    )
+    parser.add_argument(
+        "--draft_len",
+        default=4,
+        type=int,
+        help="[Eagle mode] Chain-mode draft length (used in Phase 3 chain fallback).",
+    )
+    parser.add_argument(
+        "--eagle_draft_backend",
+        default="htp",
+        choices=["htp", "vulkan", "xnnpack"],
+        type=str,
+        help="[Eagle mode] Backend on which the EAGLE draft head executes.",
+    )
+    parser.add_argument(
+        "--eagle_hidden_io",
+        default="fp16",
+        choices=["fp16", "quant16"],
+        type=str,
+        help="[Eagle mode] Precision of the hidden-state IO that flows from target to draft.",
+    )
+    parser.add_argument(
+        "--eagle_layer_indices",
+        default=None,
+        type=str,
+        help="[Eagle mode] Comma-separated indices of target layers to export (low,mid,high). "
+        "Overrides EAGLE head config. Example: '2,16,30'.",
+    )
+    parser.add_argument(
+        "--tree_topology",
+        default="",
+        type=str,
+        help="[Eagle mode, Phase 4] Comma-separated branching factors per depth. "
+        "Example: '1,2,2,2,2,2,2,4' (total 16 nodes). Empty string => chain mode.",
+    )
     parser.add_argument(
         "--use_attention_sink",
         default=None,
@@ -623,6 +728,31 @@ def export_llama(args) -> None:
             (args.window + args.gcap) * (args.ngram - 1)
         ), "Please ensure max_context_len is > next_power_of_two((args.window + args.gcap) * (args.ngram - 1))"
         pte_filename = "lookahead_llama_qnn"
+    elif args.model_mode == "eagle":
+        assert (
+            args.max_context_len >= args.prefill_ar_len
+        ), "Please ensure max_context_len is >= prefill_ar_len"
+        assert (
+            args.use_attention_sink is None
+        ), "Eagle mode is not compatible with attention sink in v1."
+        assert (
+            args.eagle_head_checkpoint is not None or args.pre_gen_pte
+        ), "Eagle mode requires --eagle_head_checkpoint or --pre_gen_pte."
+        # Override target prefill_ar_len so it doubles as the verify ar_len.
+        # Phase 4 (tree): next_pow2(max_tree_size).
+        # Phase 3 (chain): next_pow2(draft_len + 1).
+        if args.tree_topology:
+            verify_ar = next_power_of_two(args.max_tree_size)
+        else:
+            verify_ar = next_power_of_two(args.draft_len + 1)
+        if args.prefill_ar_len < verify_ar:
+            logging.info(
+                "[Eagle] overriding --prefill_ar_len %d -> %d (verify ar_len)",
+                args.prefill_ar_len,
+                verify_ar,
+            )
+            args.prefill_ar_len = verify_ar
+        pte_filename = "eagle_target_qnn"
     else:
         raise RuntimeError(f"Unknown model_mode: {args.model_mode}.")
 
@@ -639,6 +769,7 @@ def export_llama(args) -> None:
         TEXT_ENCODER: f"{TEXT_ENCODER}_qnn",
         VISION_ENCODER: f"{VISION_ENCODER}_qnn",
         TOK_EMBEDDING: f"{TOK_EMBEDDING}_qnn",
+        EAGLE_HEAD: f"eagle_head_{args.eagle_draft_backend}",
     }
     # Prepare tokenizer
     tokenizer_wrapper = TokenizerWrapper(
@@ -659,6 +790,11 @@ def export_llama(args) -> None:
     text_decoder_pte_path = f"{args.artifact}/{pte_filenames[TEXT_DECODER]}.pte"
     attention_sink_evictor_pte_path = f"{args.artifact}/{ATTENTION_SINK_EVICTOR}.pte"
     tok_embedding_pte_path = f"{args.artifact}/{pte_filenames[TOK_EMBEDDING]}.pte"
+    eagle_head_pte_path = (
+        f"{args.artifact}/{pte_filenames[EAGLE_HEAD]}.pte"
+        if args.model_mode == "eagle"
+        else None
+    )
     encoder_pte_paths = {}
     for modality in [AUDIO_ENCODER, VISION_ENCODER]:
         if hasattr(decoder_model_config, modality):
@@ -685,6 +821,8 @@ def export_llama(args) -> None:
         tok_embedding_pte_path = (
             f"{args.pre_gen_pte}/{pte_filenames[TOK_EMBEDDING]}.pte"
         )
+        if args.model_mode == "eagle":
+            eagle_head_pte_path = f"{args.pre_gen_pte}/{pte_filenames[EAGLE_HEAD]}.pte"
         encoder_pte_paths = {}
         for modality in [AUDIO_ENCODER, VISION_ENCODER]:
             if hasattr(decoder_model_config, modality):
@@ -711,18 +849,31 @@ def export_llama(args) -> None:
             attention_sink_evictor_pte_path,
             calibration_data,
             is_multimodal,
+            eagle_head_pte_path=eagle_head_pte_path,
         )
         print(f"Finish the running pre_gen_pte from {args.pre_gen_pte}")
         return
 
-    compile(
-        args,
-        decoder_model_config,
-        pte_filenames,
-        tokenizer,
-        calibration_data,
-        is_multimodal,
-    )
+    if args.model_mode == "eagle":
+        # Eagle mode bypasses MultiModalManager: EagleManager compiles both
+        # the target text decoder (with output_hidden_layers) and the head pte.
+        compile_eagle_head(
+            args,
+            decoder_model_config,
+            text_decoder_pte_path,
+            eagle_head_pte_path,
+            tokenizer,
+            calibration_data,
+        )
+    else:
+        compile(
+            args,
+            decoder_model_config,
+            pte_filenames,
+            tokenizer,
+            calibration_data,
+            is_multimodal,
+        )
     if args.use_attention_sink:
         compile_attention_sink_evictor(
             args,
@@ -773,6 +924,7 @@ def export_llama(args) -> None:
         attention_sink_evictor_pte_path,
         calibration_data,
         is_multimodal,
+        eagle_head_pte_path=eagle_head_pte_path,
     )
 
 

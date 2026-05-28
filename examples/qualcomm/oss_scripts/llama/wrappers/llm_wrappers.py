@@ -14,7 +14,7 @@ import time
 import types
 
 from functools import partial
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -112,6 +112,7 @@ class TextDecoder(Component):
         config: LLMModelConfig,
         mode: Mode,
         apply_embedding: bool = False,
+        output_hidden_layers: Optional[List[int]] = None,
     ):
         self.control_args = control_args
         self.config = config
@@ -119,6 +120,7 @@ class TextDecoder(Component):
         self.passes_job = get_capture_program_passes()
         self.dep_table = get_passes_dependency_for_capture_program()
         self.meta = {}
+        self.output_hidden_layers = output_hidden_layers
         self.quant_recipe: StaticLLMQuantRecipe = (
             self.config.quant_recipe(True) if self.config.quant_recipe else None
         )
@@ -312,6 +314,7 @@ class TextDecoder(Component):
             output_new_cache_only=True,
             output_cache=True,
             use_i64_token=use_i64_token,
+            output_hidden_layers=self.output_hidden_layers,
             **get_model_specific_kwargs(self.control_args, self.config),
         )
 
@@ -791,18 +794,21 @@ class HybridTextDecoder(Component):
         control_args: argparse.Namespace,
         config: LLMModelConfig,
         apply_embedding: bool = False,
+        output_hidden_layers: Optional[List[int]] = None,
     ):
         self.decode = TextDecoder(
             control_args,
             config,
             Mode.DECODE,
             apply_embedding=apply_embedding,
+            output_hidden_layers=output_hidden_layers,
         )
         self.prefill = TextDecoder(
             control_args,
             config,
             Mode.PREFILL,
             apply_embedding=apply_embedding,
+            output_hidden_layers=output_hidden_layers,
         )
         self.control_args = control_args
         self.config = config

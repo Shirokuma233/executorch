@@ -11,6 +11,9 @@ from executorch.examples.qualcomm.oss_scripts.llama.wrappers.attention_sink_wrap
 from executorch.examples.qualcomm.oss_scripts.llama.wrappers.base_component import (
     next_power_of_two,
 )
+from executorch.examples.qualcomm.oss_scripts.llama.wrappers.eagle_wrappers import (
+    EagleManager,
+)
 from executorch.examples.qualcomm.oss_scripts.llama.wrappers.llm_wrappers import (
     MultiModalManager,
 )
@@ -18,6 +21,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.wrappers.llm_wrappers import
 __all__ = [
     is_attention_sink_config_equal,
     HybridAttentionSinkEvictor,
+    EagleManager,
     MultiModalManager,
     next_power_of_two,
 ]
