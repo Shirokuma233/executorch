@@ -784,8 +784,19 @@ class EagleManager(Component):
         self.config = config
         self._sub_components = [self.target, self.head_compiler]
 
-        # daisy chain
-        self.set_next(self.target).set_next(self.head_compiler)
+        # Daisy chain.
+        # Note: HybridTextDecoder.__init__ already sets up
+        #   self.target -> self.target.decode -> self.target.prefill
+        # internally. We need to splice head_compiler at the END of that
+        # chain (after target.prefill), NOT directly after target — otherwise
+        # target.decode / target.prefill (the real TextDecoder.quantize /
+        # TextDecoder.compile workers) get bypassed.
+        self.set_next(self.target)
+        # Walk to the tail of target's existing chain.
+        tail = self.target
+        while tail._next_handler is not None:
+            tail = tail._next_handler
+        tail.set_next(self.head_compiler)
 
     def process(self, request: Request) -> Request:
         Processor.process(self, request)
