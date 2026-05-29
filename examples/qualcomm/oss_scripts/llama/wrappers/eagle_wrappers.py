@@ -158,21 +158,43 @@ def load_eagle_head_config(ckpt_path: str, override_path: Optional[str] = None) 
 def _hf_precompute_rope(
     head_dim: int, max_pos: int, theta: float
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """HuggingFace-style RoPE precompute.
+
+    Produces cos / sin of shape ``[max_pos, head_dim]`` with the
+    "duplicate-and-concat" layout (matches transformers' LlamaRotaryEmbedding):
+
+        inv_freq = 1 / (theta ** (arange(0, dim, 2) / dim))     # [dim/2]
+        freqs    = outer(t, inv_freq)                           # [max_pos, dim/2]
+        emb      = concat([freqs, freqs], -1)                   # [max_pos, dim]
+
+    Used together with ``_apply_rope_hf`` below.
+    """
     inv_freq = 1.0 / (
         theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
     )
     t = torch.arange(max_pos, dtype=torch.float32)
-    freqs = torch.outer(t, inv_freq)
-    return freqs.cos(), freqs.sin()
+    freqs = torch.outer(t, inv_freq)                            # [max_pos, dim/2]
+    emb = torch.cat([freqs, freqs], dim=-1)                     # [max_pos, dim]
+    return emb.cos(), emb.sin()
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """HF-style rotate_half: cat([-x2, x1], -1) where x = [x1 | x2]."""
+    half = x.shape[-1] // 2
+    x1 = x[..., :half]
+    x2 = x[..., half:]
+    return torch.cat([-x2, x1], dim=-1)
 
 
 def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """x: [..., head_dim]; cos/sin: [..., head_dim/2]."""
-    half = x.shape[-1] // 2
-    x1, x2 = x[..., :half], x[..., half:]
-    rot1 = x1 * cos - x2 * sin
-    rot2 = x2 * cos + x1 * sin
-    return torch.cat([rot1, rot2], dim=-1)
+    """HuggingFace-style RoPE apply.
+
+    Equivalent to ``q * cos + rotate_half(q) * sin``. Inputs:
+      * ``x``   : [..., head_dim]
+      * ``cos`` / ``sin`` : [..., head_dim]   (NOT head_dim/2; pre-duplicated)
+    """
+    return x * cos + _rotate_half(x) * sin
+
 
 
 class RMSNorm(nn.Module):
@@ -197,6 +219,10 @@ class EagleHeadConfig:
 
     def __init__(self, raw: dict):
         self.hidden_size: int = raw["hidden_size"]
+        # If target and draft have different hidden sizes, the ckpt's
+        # config carries `target_hidden_size`. EAGLE's fc collapses
+        # 3 * target_hidden_size -> hidden_size.
+        self.target_hidden_size: int = raw.get("target_hidden_size", self.hidden_size)
         self.num_attention_heads: int = raw["num_attention_heads"]
         self.num_key_value_heads: int = raw["num_key_value_heads"]
         self.head_dim: int = raw["head_dim"]
@@ -232,7 +258,7 @@ class EagleAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,  # [B, S, 2H]
-        freqs_cos: torch.Tensor,  # [S, head_dim/2]
+        freqs_cos: torch.Tensor,  # [S, head_dim]   (HF-style, pre-duplicated)
         freqs_sin: torch.Tensor,
         atten_mask: torch.Tensor,  # [B, S, ctx]
         k_cache: Optional[torch.Tensor],  # [B, n_kv, head_dim, ctx-S]
@@ -248,9 +274,9 @@ class EagleAttention(nn.Module):
         k = self.k_proj(x).view(B, S, Hk, D).transpose(1, 2)  # [B, Hk, S, D]
         v = self.v_proj(x).view(B, S, Hk, D).transpose(1, 2)
 
-        # apply RoPE on q, k
-        cos = freqs_cos.view(1, 1, S, -1)
-        sin = freqs_sin.view(1, 1, S, -1)
+        # apply HF-style RoPE on q, k. cos/sin: [S, head_dim] -> broadcast to [1,1,S,D]
+        cos = freqs_cos.view(1, 1, S, D)
+        sin = freqs_sin.view(1, 1, S, D)
         q = _apply_rope(q, cos, sin)
         k = _apply_rope(k, cos, sin)
 
@@ -327,17 +353,16 @@ class EagleHead(nn.Module):
         self.norm = RMSNorm(H, cfg.rms_norm_eps)
         self.lm_head = nn.Linear(H, cfg.draft_vocab_size, bias=False)
 
-        # PREFILL only: fc(3H -> H)
+        # PREFILL only: fc(3 * target_H -> H). For Qwen3-1.7B target_H == H == 2048.
         if mode == Mode.PREFILL:
-            self.fc = nn.Linear(cfg.num_hidden_inputs * H, H, bias=False)
+            self.fc = nn.Linear(
+                cfg.num_hidden_inputs * cfg.target_hidden_size, H, bias=False
+            )
         else:
             self.fc = None
 
-        # rope buffers
+        # rope buffers — HuggingFace style: cos/sin have shape [max_ctx, head_dim]
         cos, sin = _hf_precompute_rope(cfg.head_dim, max_context_len, cfg.rope_theta)
-        # cos/sin shape: [max_context_len, head_dim/2]
-        cos = cos[:, : cos.shape[-1]]
-        sin = sin[:, : sin.shape[-1]]
         self.register_buffer("freqs_cos", cos, persistent=False)
         self.register_buffer("freqs_sin", sin, persistent=False)
 
@@ -387,11 +412,17 @@ class EagleHead(nn.Module):
         attn_out, k_out, v_out = self.self_attn(
             x, freqs_cos, freqs_sin, atten_mask, k_cache, v_cache
         )
-        h = prev_feature + attn_out  # residual on prev_feature
-        h = h + self.mlp(self.post_attention_layernorm(h))
-        a_out = self.norm(h)  # final RMS, exposed to runtime
-        logits = self.lm_head(a_out)  # [B, S, draft_vocab]
-        return logits, a_out, k_out, v_out
+        h = prev_feature + attn_out  # 1st residual on prev_feature
+        h = h + self.mlp(self.post_attention_layernorm(h))  # 2nd residual
+
+        # IMPORTANT: `h` (post-MLP, pre-final-norm) is what gets fed back as
+        # `prev_feature` in the next decode step — `hidden_norm` will norm it
+        # again, so we must NOT pre-norm here. The final RMS is only applied
+        # in the lm_head path, matching the official drafter where
+        # `forward()` returns raw hidden and `_get_topk_tokens` does
+        # `lm_head(self.norm(hidden))`.
+        logits = self.lm_head(self.norm(h))  # [B, S, draft_vocab]
+        return logits, h, k_out, v_out
 
     def _forward_prefill(
         self,
@@ -432,8 +463,10 @@ class EagleHead(nn.Module):
         ctx = self.max_context_len
 
         if self.mode == Mode.PREFILL:
+            # Prefill input is hidden_LMH = cat(low, mid, high) along feat dim
             prev_in = torch.zeros(
-                (1, S, cfg.num_hidden_inputs * H), dtype=torch.float32
+                (1, S, cfg.num_hidden_inputs * cfg.target_hidden_size),
+                dtype=torch.float32,
             )
         else:
             prev_in = torch.zeros((1, S, H), dtype=torch.float32)
