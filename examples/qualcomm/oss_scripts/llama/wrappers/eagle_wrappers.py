@@ -362,20 +362,22 @@ class EagleHead(nn.Module):
             self.fc = None
 
         # rope buffers — HuggingFace style: cos/sin have shape [max_ctx, head_dim]
+        # NOTE: persistent=True so torch.export's convert_constant_dim_order_pass
+        # can find input specs for these lifted tensors.
         cos, sin = _hf_precompute_rope(cfg.head_dim, max_context_len, cfg.rope_theta)
-        self.register_buffer("freqs_cos", cos, persistent=False)
-        self.register_buffer("freqs_sin", sin, persistent=False)
+        self.register_buffer("freqs_cos", cos, persistent=True)
+        self.register_buffer("freqs_sin", sin, persistent=True)
 
         # d2t / t2d are saved as buffers but NOT used in forward (host-side at runtime)
         self.register_buffer(
             "d2t",
             torch.zeros(cfg.draft_vocab_size, dtype=torch.int64),
-            persistent=False,
+            persistent=True,
         )
         self.register_buffer(
             "t2d",
             torch.zeros(cfg.target_vocab_size, dtype=torch.bool),
-            persistent=False,
+            persistent=True,
         )
 
     # -----------------------------------------------------------------
@@ -643,39 +645,9 @@ class EagleDecoderWrapper(Component):
 
     @log_info
     def compile(self, request: Request):
-        """Lower the head's single graph (kv_forward or prefill_forward) to QNN."""
-        data = request.method_data[EAGLE_HEAD]
-        graph_name = "prefill_forward" if self.mode == Mode.PREFILL else "kv_forward"
-
-        # Use only the spec for our graph.
-        compile_spec = data.compile_spec
-        if isinstance(compile_spec, list) and len(compile_spec) > 1:
-            # If caller provided per-graph specs, pick by name; else use [0].
-            compile_spec = compile_spec[0]
-
-        edge_prog_mgr = to_edge_transform_and_lower_to_qnn(
-            module={graph_name: self.head},
-            inputs={graph_name: self.export_input},
-            compiler_specs={graph_name: compile_spec},
-            constant_methods={**self.meta},
-            dep_table={graph_name: self.dep_table},
-            passes_job={graph_name: self.passes_job},
-            skip_node_op_set={"llama.fallback.default"},
-        )
-
-        executorch_config = ExecutorchBackendConfig(
-            memory_planning_pass=MemoryPlanningPass(
-                alloc_graph_input=False,
-                alloc_graph_output=False,
-            ),
-            passes=[BuildQuantIo()],
-        )
-        exec_prog_mgr = edge_prog_mgr.to_executorch(executorch_config)
-        out_path = f"{self.control_args.artifact}/{data.pte_filename}.pte"
-        # PREFILL graph and DECODE graph are written to the SAME pte (combined
-        # below by EagleHeadDualCompiler); single-mode write is for debugging.
-        with open(out_path, "wb") as f:
-            exec_prog_mgr.write_to_file(f)
+        """No-op: EagleHeadDualCompiler handles the actual lowering for both
+        DECODE and PREFILL graphs in a single .pte."""
+        return
 
 
 class EagleHeadDualCompiler(Component):
@@ -785,12 +757,22 @@ class EagleManager(Component):
             getattr(control_args, "eagle_layer_indices", None)
         )
 
+        # Phase 2 first-pass: keep target's forward bit-identical to hybrid mode
+        # (output_hidden_layers=None) so target compile uses the well-tested
+        # path. Hidden export is a later optimization; for now Phase 3 runtime
+        # will not have hidden_LMH from target — it must be computed offline
+        # or the pipeline must fall back to standard verify (TODO).
+        # TODO(phase-2): re-enable hidden export once we resolve the
+        # "Missing input spec for lifted tensor freqs_cos" issue triggered by
+        # the modified forward returning extra tensors.
+        target_hidden_layers = None  # was: layer_indices
+
         # Target decoder: HybridTextDecoder with output_hidden_layers wired
         self.target = HybridTextDecoder(
             control_args,
             config,
             apply_embedding=False,
-            output_hidden_layers=layer_indices,
+            output_hidden_layers=target_hidden_layers,
         )
 
         # Head dual-graph compiler

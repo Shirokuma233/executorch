@@ -86,13 +86,22 @@ def compile_eagle_head(
 
     eagle_mgr = EagleManager(control_args=args, config=decoder_model_config)
 
-    backend_options = generate_htp_compiler_spec(use_fp16=False)
-    compile_spec = generate_qnn_executorch_compiler_spec(
-        soc_model=get_soc_to_chipset_map()[args.soc_model],
-        backend_options=backend_options,
-        shared_buffer=not args.enable_x86_64,
+    backend_options = generate_htp_compiler_spec(
+        use_fp16=False,  # 走 PTQ 量化路径
+        use_multi_contexts=decoder_model_config.num_sharding > 1,
+        use_weight_sharing=not args.enable_x86_64,
     )
-    backend_type = get_backend_type(args)
+    # Both decode and prefill graphs share the same compile spec
+    compile_spec_list = [
+        generate_qnn_executorch_compiler_spec(
+            soc_model=get_soc_to_chipset_map()[args.soc_model],
+            backend_options=backend_options,
+            shared_buffer=not args.enable_x86_64,
+            use_mha2sha=True,
+            online_prepare=args.online_prepare,
+        )
+    ] * len(DECODER_GRAPH_NAMES)
+    backend_type = get_backend_type("htp")
 
     eagle_mgr.quantize(
         calibration_data=calibration_data,
@@ -102,7 +111,7 @@ def compile_eagle_head(
         soc_model=args.soc_model,
     )
     eagle_mgr.compile(
-        compile_spec=compile_spec,
+        compile_spec=compile_spec_list,
         pte_filenames={
             EAGLE_TARGET: os.path.splitext(os.path.basename(text_decoder_pte_path))[0],
             EAGLE_HEAD: os.path.splitext(os.path.basename(eagle_head_pte_path))[0],
