@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/eagle_sampler.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/token_generator.h>
 #include <executorch/extension/module/module.h>
 
@@ -157,6 +158,11 @@ class EagleTokenGenerator : public TokenGenerator {
 
   // d2t mapping (loaded from head pte's get_d2t constant_method)
   std::vector<int64_t> d2t_;
+
+  // Sampler: 32000-way argmax + d2t draft→target id mapping.
+  // Constructed lazily in init_io() once we know the draft logits dtype and
+  // d2t has been populated via set_d2t().
+  std::unique_ptr<EagleSampler> sampler_;
 
   // Head IO buffers.
   // TODO(phase-3): allocate via buffer_manager and wire up TensorImpls.

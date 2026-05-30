@@ -728,6 +728,25 @@ class EagleHeadDualCompiler(Component):
             exec_prog_mgr.write_to_file(f)
         logging.info(f"Eagle head pte written to {out_path}")
 
+        # Dump d2t / t2d as raw int64 / bool binaries. The QNN runtime reads
+        # these from sibling files since QNN constant_methods loaded into the
+        # head pte aren't easily accessible from C++ for arrays of this size.
+        d2t = self.decode.head.d2t.detach().cpu().to(torch.int64).contiguous()
+        t2d = self.decode.head.t2d.detach().cpu().to(torch.bool).contiguous()
+        d2t_path = f"{self.control_args.artifact}/d2t.bin"
+        t2d_path = f"{self.control_args.artifact}/t2d.bin"
+        with open(d2t_path, "wb") as f:
+            f.write(d2t.numpy().tobytes())
+        with open(t2d_path, "wb") as f:
+            f.write(t2d.numpy().tobytes())
+        logging.info(
+            "Eagle d2t/t2d dumped: d2t=%dB (%d int64) / t2d=%dB (%d bool)",
+            os.path.getsize(d2t_path),
+            d2t.numel(),
+            os.path.getsize(t2d_path),
+            t2d.numel(),
+        )
+
 
 # ---------------------------------------------------------------------------
 # EagleManager — top-level Component that compiles target + head together
@@ -757,15 +776,12 @@ class EagleManager(Component):
             getattr(control_args, "eagle_layer_indices", None)
         )
 
-        # Phase 2 first-pass: keep target's forward bit-identical to hybrid mode
-        # (output_hidden_layers=None) so target compile uses the well-tested
-        # path. Hidden export is a later optimization; for now Phase 3 runtime
-        # will not have hidden_LMH from target — it must be computed offline
-        # or the pipeline must fall back to standard verify (TODO).
-        # TODO(phase-2): re-enable hidden export once we resolve the
-        # "Missing input spec for lifted tensor freqs_cos" issue triggered by
-        # the modified forward returning extra tensors.
-        target_hidden_layers = None  # was: layer_indices
+        # Phase 3: target must export low/mid/high hidden states so the runtime
+        # can refresh the head with hidden_LMH after each verify step. We pass
+        # the parsed indices through to HybridTextDecoder, which forwards to
+        # static_llama.LlamaModel.forward — that has been Phase 1-modified to
+        # append the requested hidden states to the return tuple.
+        target_hidden_layers = layer_indices
 
         # Target decoder: HybridTextDecoder with output_hidden_layers wired
         self.target = HybridTextDecoder(

@@ -94,24 +94,61 @@ EagleTokenGenerator::EagleTokenGenerator(
 void EagleTokenGenerator::init_io(
     IMemAlloc* buffer_manager,
     Result<MethodMeta> method_meta) {
+  // We need to clone method_meta because TokenGenerator::init_io() consumes
+  // it via std::move. After that we still want to query num_outputs() etc.
+  // for the hidden tensor binding. Do that BEFORE delegating.
+  size_t target_num_outputs = method_meta->num_outputs();
+  size_t expected_logits_kv = 1 + 2 * eagle_meta_.target_num_layers;
+  bool target_has_hidden = (target_num_outputs >= expected_logits_kv + 3);
+
+  if (target_has_hidden) {
+    ET_LOG(
+        Info,
+        "[Eagle] init_io: target pte has %zu outputs (= 1 logits + 2*%lld KV "
+        "+ 3 hidden). Hidden export confirmed.",
+        target_num_outputs,
+        static_cast<long long>(eagle_meta_.target_num_layers));
+  } else {
+    ET_LOG(
+        Error,
+        "[Eagle] init_io: target pte has only %zu outputs, expected at least "
+        "%zu (logits + KV + 3 hidden). Hidden states unavailable — head "
+        "refresh after verify cannot run; speculative loop will be disabled.",
+        target_num_outputs,
+        expected_logits_kv + 3);
+  }
+
   // 1) Standard target IO (input toks, attn mask, pos, KV).
   TokenGenerator::init_io(buffer_manager, std::move(method_meta));
 
-  // 2) Bind target's three extra hidden outputs.
-  // Target output layout per Phase 1 modification:
-  //   [0]: logits
-  //   [1..1+num_layers): k_cache_out
-  //   [1+num_layers..1+2*num_layers): v_cache_out
-  //   [1+2*num_layers]:   hidden_low
-  //   [1+2*num_layers+1]: hidden_mid
-  //   [1+2*num_layers+2]: hidden_high
-  //
-  // TODO(phase-3): use decoder_runner_->set_outputs(...) to bind preallocated
-  // buffers for the three hidden outputs and store their pointers in
-  // target_hidden_{low,mid,high}_.
-  ET_LOG(
-      Info,
-      "[Eagle] init_io: target hidden binding TODO (Phase 3)");
+  // 2) Allocate buffers for target's three extra hidden outputs and bind them
+  // through DecoderRunner::set_outputs after the parent init.
+  // TODO(phase-3): the actual set_outputs call must use TensorImpl wrappers
+  // around these buffers; the parent class already populated output_tensors_
+  // for [logits, k_cache_out*, v_cache_out*]. We append three more.
+  // For now we just allocate the host-side buffers; binding wiring is part
+  // of P3-2 implementation.
+  if (target_has_hidden) {
+    size_t hidden_dim = eagle_meta_.hidden_dim;
+    size_t ar = eagle_meta_.target_ar_len;
+    size_t bytes_per_hidden = ar * hidden_dim * 2;  // fp16
+    target_hidden_low_  = buffer_manager->allocate(bytes_per_hidden);
+    target_hidden_mid_  = buffer_manager->allocate(bytes_per_hidden);
+    target_hidden_high_ = buffer_manager->allocate(bytes_per_hidden);
+    ET_LOG(
+        Info,
+        "[Eagle] target hidden buffers allocated: %zuB each "
+        "(ar=%zu * H=%zu * fp16)",
+        bytes_per_hidden,
+        ar,
+        hidden_dim);
+    // TODO(phase-3): wire these into output_tensors_ via TensorImpl + call
+    // decoder_runner_->set_outputs(method_name_, output_tensors_).
+  } else {
+    target_hidden_low_ = nullptr;
+    target_hidden_mid_ = nullptr;
+    target_hidden_high_ = nullptr;
+  }
 
   // 3) Allocate head IO buffers (host-side scratch; not RPC-shared yet).
   size_t H = eagle_meta_.hidden_dim;
@@ -120,7 +157,7 @@ void EagleTokenGenerator::init_io(
   size_t hd = eagle_meta_.head_head_dim;
 
   // dtype: fp16 by default (matches --eagle_hidden_io fp16). Use 2 bytes.
-  // TODO(phase-3): respect actual dtype from method_meta.
+  // TODO(phase-3): respect actual dtype from head method_meta.
   size_t fp16_b = 2;
 
   head_prev_feature_buf_.resize(H * fp16_b);
@@ -139,6 +176,21 @@ void EagleTokenGenerator::init_io(
       head_attn_mask_buf_.size(),
       head_k_cache_buf_.size(),
       head_logits_buf_.size());
+
+  // 4) Build the sampler (delegates 32000-way argmax + d2t mapping). Falls
+  // back to identity d2t if not yet populated; runner should call set_d2t()
+  // before generate().
+  if (d2t_.empty()) {
+    ET_LOG(
+        Info,
+        "[Eagle] init_io: d2t not yet provided, sampler will use identity "
+        "mapping until Runner::set_d2t() is called.");
+    d2t_.assign(eagle_meta_.draft_vocab_size, 0);
+  }
+  sampler_ = std::make_unique<EagleSampler>(
+      EagleSampler::Dtype::kFp16,
+      eagle_meta_.draft_vocab_size,
+      d2t_);
 }
 
 // ============================================================================
@@ -242,15 +294,15 @@ void EagleTokenGenerator::target_verify(
 }
 
 // ============================================================================
-// Sampling
+// Sampling (delegates to EagleSampler)
 // ============================================================================
-uint64_t EagleTokenGenerator::sample_draft(const std::byte* /*draft_logits_buf*/) {
-  // TODO(phase-3): 32000-way argmax. Be careful with the dtype:
-  //   - If head logits are quantized uint16, dequantize first using the head
-  //     pte's get_logits_scale / get_logits_zero_point constant_methods.
-  //   - If fp16 (Phase 2 default), reinterpret as __fp16 and argmax directly.
-  ET_LOG(Error, "[Eagle] sample_draft is TODO");
-  return 0;
+uint64_t EagleTokenGenerator::sample_draft(
+    const std::byte* draft_logits_buf) {
+  if (!sampler_) {
+    ET_LOG(Error, "[Eagle] sample_draft called before init_io");
+    return 0;
+  }
+  return sampler_->argmax_draft(draft_logits_buf);
 }
 
 } // namespace example

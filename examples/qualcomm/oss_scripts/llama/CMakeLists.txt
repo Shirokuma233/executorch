@@ -41,6 +41,8 @@ list(
   ${CMAKE_CURRENT_LIST_DIR}/runner/lhd_token_generator.h
   ${CMAKE_CURRENT_LIST_DIR}/runner/eagle_token_generator.cpp
   ${CMAKE_CURRENT_LIST_DIR}/runner/eagle_token_generator.h
+  ${CMAKE_CURRENT_LIST_DIR}/runner/eagle_sampler.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/runner/eagle_sampler.h
   ${CMAKE_CURRENT_LIST_DIR}/runner/tree_attention.cpp
   ${CMAKE_CURRENT_LIST_DIR}/runner/tree_attention.h
   ${CMAKE_CURRENT_LIST_DIR}/runner/attention_sink_rope_runner.cpp

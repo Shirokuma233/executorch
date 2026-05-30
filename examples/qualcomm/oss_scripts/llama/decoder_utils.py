@@ -440,7 +440,7 @@ def _prefill_chunking(
 
             # Run inference.
             if inputs.input_ids is not None:
-                logits, new_k_caches, new_v_caches = module(
+                logits, new_k_caches, new_v_caches, *_eagle_extra = module(
                     tmp_token_list,
                     *inputs.atten_mask,
                     tmp_pos,
@@ -455,7 +455,7 @@ def _prefill_chunking(
                     *v_caches,
                 )
             else:
-                logits, new_k_caches, new_v_caches = module(
+                logits, new_k_caches, new_v_caches, *_eagle_extra = module(
                     tmp_embedding,
                     *inputs.atten_mask,
                     tmp_pos,
@@ -552,7 +552,7 @@ def _generate(
             ]
 
             if inputs.input_ids is not None:
-                logits, new_k_caches, new_v_caches = module(
+                logits, new_k_caches, new_v_caches, *_eagle_extra = module(
                     tmp_token_list,
                     *inputs.atten_mask,
                     tmp_pos,
@@ -567,7 +567,7 @@ def _generate(
                     *v_caches,
                 )
             else:
-                logits, new_k_caches, new_v_caches = module(
+                logits, new_k_caches, new_v_caches, *_eagle_extra = module(
                     embedding,
                     *inputs.atten_mask,
                     tmp_pos,
@@ -625,7 +625,7 @@ def _generate(
             )
             # inference
             if inputs.input_ids is not None:
-                logits, new_k_caches, new_v_caches = module(
+                logits, new_k_caches, new_v_caches, *_eagle_extra = module(
                     torch.tensor(input_tokens, dtype=inputs.input_ids_dtype).unsqueeze(
                         0
                     ),
@@ -644,7 +644,7 @@ def _generate(
                     *v_caches,
                 )
             else:
-                logits, new_k_caches, new_v_caches = module(
+                logits, new_k_caches, new_v_caches, *_eagle_extra = module(
                     tok_embedding(
                         torch.tensor(
                             input_tokens, dtype=inputs.input_ids_dtype
