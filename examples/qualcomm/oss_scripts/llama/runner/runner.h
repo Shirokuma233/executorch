@@ -67,7 +67,10 @@ class Runner : public executorch::extension::llm::IRunner {
       std::unique_ptr<executorch::extension::Module> eagle_head_module =
           nullptr,
       int max_tree_size = 0,
-      int draft_len = 0);
+      int draft_len = 0,
+      const std::string& eagle_d2t_path = "",
+      const std::string& eagle_t2d_path = "",
+      const std::string& eagle_embed_path = "");
 
   bool is_loaded() const override;
   executorch::runtime::Error load() override;
@@ -104,6 +107,9 @@ class Runner : public executorch::extension::llm::IRunner {
   std::unique_ptr<KVManager> eagle_kv_manager_;
   int max_tree_size_{0};
   int draft_len_{0};
+  std::string eagle_d2t_path_;
+  std::string eagle_t2d_path_;
+  std::string eagle_embed_path_;
   int32_t context_len_{0};
 
   int ngram_{0};

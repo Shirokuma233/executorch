@@ -13,6 +13,7 @@
 #include <executorch/extension/module/module.h>
 
 #include <cstdint>
+#include <array>
 #include <memory>
 #include <vector>
 
@@ -98,6 +99,14 @@ class EagleTokenGenerator : public TokenGenerator {
   // Must be called after construction, before generate().
   void set_d2t(std::vector<int64_t> d2t) { d2t_ = std::move(d2t); }
 
+  // Provide target embedding table (fp16[vocab_size * hidden_size], row-major).
+  // Used by head steps to look up tok_emb for each draft token.
+  void set_embed_table(std::vector<uint16_t> embed_table, int32_t vocab_size, int32_t hidden_size) {
+    embed_table_ = std::move(embed_table);
+    embed_vocab_size_ = vocab_size;
+    embed_hidden_size_ = hidden_size;
+  }
+
   // Phase 4: configure tree topology. If `branching_per_depth` is empty, the
   // generator runs in chain mode. Otherwise it builds a static tree of size
   // <= max_tree_size at each verify step.
@@ -113,6 +122,9 @@ class EagleTokenGenerator : public TokenGenerator {
         static_cast<int64_t>(draft_id) + d2t_[draft_id]);
   }
 
+  // Lookup fp16 embedding row for token_id into dst[hidden_size].
+  void lookup_embedding(uint64_t token_id, uint16_t* dst) const;
+
   // ---- Draft path (head module) ----
   // Run head.prefill_forward with a [3H] hidden vector to seed `prev_a` and
   // produce the first draft logits.
@@ -121,7 +133,8 @@ class EagleTokenGenerator : public TokenGenerator {
   void head_prefill_step(
       const float* hidden_LMH,    // [3 * hidden_dim], host fp16/fp32
       uint64_t prev_token,
-      int64_t pos);
+      int64_t rope_pos,
+      int64_t cache_pos);
 
   // Run head.kv_forward(prev_a, emb(prev_token)) for one step and return the
   // sampled draft id. Writes the new `prev_a` to `prev_a_buffer`.
@@ -129,7 +142,8 @@ class EagleTokenGenerator : public TokenGenerator {
   uint64_t head_decode_step(
       const float* prev_a,
       uint64_t prev_token,
-      int64_t pos,
+      int64_t rope_pos,
+      int64_t cache_pos,
       float* prev_a_buffer);
 
   // ---- Verify path (target module) ----
@@ -174,11 +188,30 @@ class EagleTokenGenerator : public TokenGenerator {
   std::vector<std::byte> head_k_cache_buf_;
   std::vector<std::byte> head_v_cache_buf_;
   std::vector<std::byte> head_logits_buf_;         // [draft_vocab_size]
+  executorch::aten::ScalarType head_prev_feature_dtype_;
+  executorch::aten::ScalarType head_tok_emb_dtype_;
+  executorch::aten::ScalarType head_attn_mask_dtype_;
+  executorch::aten::ScalarType head_kv_dtype_;
+  executorch::aten::ScalarType head_logits_dtype_;
 
-  // Target hidden output binding pointers (filled in init_io).
-  std::byte* target_hidden_low_;
-  std::byte* target_hidden_mid_;
-  std::byte* target_hidden_high_;
+  // Embed table: fp16[vocab_size * hidden_size], row-major.
+  std::vector<uint16_t> embed_table_;
+  int32_t embed_vocab_size_{0};
+  int32_t embed_hidden_size_{0};
+
+  // Target hidden output buffers (3 layers: low / mid / high), fp16.
+  std::vector<std::byte> target_hidden_low_buf_;
+  std::vector<std::byte> target_hidden_mid_buf_;
+  std::vector<std::byte> target_hidden_high_buf_;
+  std::array<executorch::aten::ScalarType, 3> target_hidden_dtypes_;
+  std::array<std::vector<executorch::aten::TensorImpl::SizesType>, 3>
+      target_hidden_sizes_;
+  std::array<std::vector<executorch::aten::TensorImpl::DimOrderType>, 3>
+      target_hidden_dim_orders_;
+  // TensorImpl wrappers for the three hidden output tensors.
+  std::unique_ptr<executorch::aten::TensorImpl> hidden_low_impl_;
+  std::unique_ptr<executorch::aten::TensorImpl> hidden_mid_impl_;
+  std::unique_ptr<executorch::aten::TensorImpl> hidden_high_impl_;
 
   // Stats accumulator.
   uint64_t total_drafted_{0};

@@ -173,8 +173,8 @@ def _hf_precompute_rope(
         theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
     )
     t = torch.arange(max_pos, dtype=torch.float32)
-    freqs = torch.outer(t, inv_freq)                            # [max_pos, dim/2]
-    emb = torch.cat([freqs, freqs], dim=-1)                     # [max_pos, dim]
+    freqs = torch.outer(t, inv_freq)  # [max_pos, dim/2]
+    emb = torch.cat([freqs, freqs], dim=-1)  # [max_pos, dim]
     return emb.cos(), emb.sin()
 
 
@@ -194,7 +194,6 @@ def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.
       * ``cos`` / ``sin`` : [..., head_dim]   (NOT head_dim/2; pre-duplicated)
     """
     return x * cos + _rotate_half(x) * sin
-
 
 
 class RMSNorm(nn.Module):
@@ -551,10 +550,16 @@ class EagleHead(nn.Module):
 
 
 def parse_layer_indices(s: Optional[str], n_layers: int = 28) -> List[int]:
-    """Parse `--eagle_layer_indices` like '1,14,27'. Default uniform sample."""
+    """Parse `--eagle_layer_indices` like '2,14,25'.
+
+    Default matches the SafeAILab EAGLE-3 training-time hardcode in
+    target's modeling_*_kv.py:
+        ``idx == 2 or idx == len(layers)//2 or idx == len(layers)-3``
+    For Qwen3-1.7B (28 layers) this is ``[2, 14, 25]``. Using anything
+    else feeds the drafter features it never saw during training.
+    """
     if s is None or s == "":
-        # Default: uniformly sample low/mid/high (Qwen3-1.7B has 28 layers)
-        return [1, n_layers // 2, n_layers - 1]
+        return [2, n_layers // 2, n_layers - 3]
     parts = [int(x.strip()) for x in s.split(",")]
     assert len(parts) == 3, f"--eagle_layer_indices needs 3 ints, got {parts}"
     return parts
@@ -768,13 +773,12 @@ class EagleManager(Component):
         config: LLMModelConfig,
     ):
         # Hidden-layer indices for target's MultiScopeAware/Llama forward.
-        # Default: uniform over n_layers; override via --eagle_layer_indices.
-        # NOTE: Qwen3-1.7B has 28 layers; we don't know other models' n_layers
-        # at this moment without loading the params json. We just default to
-        # [1, 14, 27]; user can override.
+        # Default matches the SafeAILab training-time hardcode
+        # (idx ∈ {2, n//2, n-3}); override via --eagle_layer_indices.
         layer_indices = parse_layer_indices(
             getattr(control_args, "eagle_layer_indices", None)
         )
+        logging.info("[Eagle] target hidden layer indices: %s", layer_indices)
 
         # Phase 3: target must export low/mid/high hidden states so the runtime
         # can refresh the head with hidden_LMH after each verify step. We pass

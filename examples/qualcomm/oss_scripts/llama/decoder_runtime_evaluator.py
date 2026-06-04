@@ -288,6 +288,7 @@ class DefaultEval(EvalBase):
             ]
         )
         eagle_args = ""
+        self.eagle_bin_files = []
         if args.model_mode == "eagle":
             eagle_head_basename = os.path.basename(self.pte_paths.get(EAGLE_HEAD, ""))
             eagle_head_path = (
@@ -295,11 +296,30 @@ class DefaultEval(EvalBase):
                 if not args.enable_x86_64
                 else self.pte_paths.get(EAGLE_HEAD, "")
             )
+            eagle_d2t_path = os.path.join(args.artifact, "d2t.bin")
+            eagle_t2d_path = os.path.join(args.artifact, "t2d.bin")
+            eagle_embed_path = os.path.join(args.artifact, "embed.bin")
+            if args.enable_x86_64:
+                eagle_d2t_arg = eagle_d2t_path
+                eagle_t2d_arg = eagle_t2d_path
+                eagle_embed_arg = eagle_embed_path
+            else:
+                eagle_d2t_arg = os.path.basename(eagle_d2t_path)
+                eagle_t2d_arg = os.path.basename(eagle_t2d_path)
+                eagle_embed_arg = os.path.basename(eagle_embed_path)
+                self.eagle_bin_files = [
+                    eagle_d2t_path,
+                    eagle_t2d_path,
+                    eagle_embed_path,
+                ]
             eagle_args = " ".join(
                 [
                     f"--eagle_head_path {eagle_head_path}",
                     f"--max_tree_size {args.max_tree_size}",
                     f"--draft_len {args.draft_len}",
+                    f"--eagle_d2t_path {eagle_d2t_arg}",
+                    f"--eagle_t2d_path {eagle_t2d_arg}",
+                    f"--eagle_embed_path {eagle_embed_arg}",
                 ]
             )
         runner_args = " ".join(
@@ -364,6 +384,8 @@ class DefaultEval(EvalBase):
             extra_files = [self.runtime_tokenizer_path]
             if self.is_multimodal:
                 extra_files.extend(self.modality_input_files)
+            if self.eagle_bin_files:
+                extra_files.extend(self.eagle_bin_files)
             self.adb.push(inputs=[], files=extra_files)
             # 加上LD_LIBRARY_PATH和ADSP_LIBRARY_PATH
             lib_path_cmd = f"export LD_LIBRARY_PATH={self.device_workspace} && export ADSP_LIBRARY_PATH={self.device_workspace};"

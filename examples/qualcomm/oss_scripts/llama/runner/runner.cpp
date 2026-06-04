@@ -103,12 +103,18 @@ Runner::Runner(
     std::unique_ptr<executorch::extension::Module> attention_sink_rope_module,
     std::unique_ptr<executorch::extension::Module> eagle_head_module,
     int max_tree_size,
-    int draft_len)
+    int draft_len,
+    const std::string& eagle_d2t_path,
+    const std::string& eagle_t2d_path,
+    const std::string& eagle_embed_path)
     : module_(std::move(module)),
       attention_sink_rope_module_(std::move(attention_sink_rope_module)),
       eagle_head_module_(std::move(eagle_head_module)),
       max_tree_size_(max_tree_size),
       draft_len_(draft_len),
+      eagle_d2t_path_(eagle_d2t_path),
+      eagle_t2d_path_(eagle_t2d_path),
+      eagle_embed_path_(eagle_embed_path),
       ngram_(ngram),
       window_(window),
       gcap_(gcap),
@@ -363,19 +369,94 @@ Error Runner::load() {
             /*num_layers=*/1},
         std::make_unique<MethodMeta>(std::move(head_kv_meta)));
 
-    // TODO(phase-3): read d2t from head pte's get_d2t constant_method.
+    // Load d2t mapping from sibling .bin file (populated from --eagle_d2t_path
+    // or defaulted to the same dir as the head pte by the caller).
     std::vector<int64_t> d2t;
-    if (eagle_head_module_->method_names()->count("get_d2t") > 0) {
-      // get_d2t returns an int64 1D tensor.
+    if (!eagle_d2t_path_.empty()) {
+      std::ifstream f(eagle_d2t_path_, std::ios::binary | std::ios::ate);
+      if (f.is_open()) {
+        auto sz = f.tellg();
+        f.seekg(0);
+        size_t n = static_cast<size_t>(sz) / sizeof(int64_t);
+        d2t.resize(n);
+        f.read(reinterpret_cast<char*>(d2t.data()), sz);
+        ET_LOG(
+            Info,
+            "[Eagle] d2t loaded from %s: %zu entries",
+            eagle_d2t_path_.c_str(),
+            n);
+      } else {
+        ET_LOG(
+            Error,
+            "[Eagle] Cannot open d2t file: %s. Falling back to pte "
+            "constant_method or identity.",
+            eagle_d2t_path_.c_str());
+      }
+    }
+    // Fallback: try head pte constant_method.
+    if (d2t.empty() &&
+        eagle_head_module_->method_names()->count("get_d2t") > 0) {
       auto res = eagle_head_module_->get("get_d2t");
       if (res.ok()) {
-        // TODO(phase-3): copy into d2t vector.
-        ET_LOG(Info, "[Eagle] d2t loaded from head pte (TODO: copy out)");
+        auto& ev = res.get();
+        if (ev.isTensor()) {
+          auto t = ev.toTensor();
+          const auto* ptr = t.const_data_ptr<int64_t>();
+          d2t.assign(ptr, ptr + t.numel());
+          ET_LOG(
+              Info,
+              "[Eagle] d2t loaded from head pte constant_method: %zu entries",
+              d2t.size());
+        }
       }
     }
 
     auto head_prefill_meta =
         ET_UNWRAP(eagle_head_module_->method_meta("prefill_forward"));
+
+    // Read head hyperparams from constant_methods (populated by EagleHead.get_metadata()).
+    auto read_int_meta = [&](const std::string& name, int32_t fallback) -> int32_t {
+      if (eagle_head_module_->method_names()->count(name) > 0) {
+        auto res = eagle_head_module_->get(name);
+        if (res.ok() && res.get().isInt()) {
+          return static_cast<int32_t>(res.get().toInt());
+        }
+      }
+      ET_LOG(Info, "[Eagle] constant_method '%s' not found, using fallback %d",
+             name.c_str(), fallback);
+      return fallback;
+    };
+    int32_t head_hidden_size = read_int_meta(
+        "get_eagle_hidden_size",
+        static_cast<int32_t>(head_head_dim * head_n_kv));
+    int32_t head_draft_vocab = read_int_meta(
+        "get_eagle_draft_vocab_size",
+        static_cast<int32_t>(d2t.size()));
+    if (head_draft_vocab == 0 && !d2t.empty()) {
+      head_draft_vocab = static_cast<int32_t>(d2t.size());
+    }
+
+    // Load embed table from sibling embed.bin (option B for head embedding).
+    std::vector<uint16_t> embed_table;  // fp16[vocab_size * hidden_size]
+    if (!eagle_embed_path_.empty()) {
+      std::ifstream ef(eagle_embed_path_, std::ios::binary | std::ios::ate);
+      if (ef.is_open()) {
+        auto esz = ef.tellg();
+        ef.seekg(0);
+        embed_table.resize(static_cast<size_t>(esz) / sizeof(uint16_t));
+        ef.read(reinterpret_cast<char*>(embed_table.data()), esz);
+        ET_LOG(
+            Info,
+            "[Eagle] embed.bin loaded from %s: %zu fp16 values",
+            eagle_embed_path_.c_str(),
+            embed_table.size());
+      } else {
+        ET_LOG(
+            Error,
+            "[Eagle] Cannot open embed.bin: %s. Head will not have embeddings.",
+            eagle_embed_path_.c_str());
+      }
+    }
 
     EagleTokenGenerator::Metadata eagle_md{
         /*target_context_len=*/context_len_,
@@ -386,9 +467,9 @@ Error Runner::load() {
         /*use_int64_token=*/use_int64_token,
         /*target_sliding_window=*/sliding_window,
         /*target_cache_mode=*/cache_mode_,
-        /*hidden_dim=*/static_cast<int32_t>(head_head_dim * head_n_kv),
+        /*hidden_dim=*/head_hidden_size,
         /*draft_len=*/draft_len_,
-        /*draft_vocab_size=*/0,  // TODO(phase-3): from head metadata
+        /*draft_vocab_size=*/head_draft_vocab,
         /*head_n_kv_heads=*/static_cast<int32_t>(head_n_kv),
         /*head_head_dim=*/static_cast<int32_t>(head_head_dim),
         /*max_tree_size=*/max_tree_size_,
@@ -413,6 +494,12 @@ Error Runner::load() {
             eagle_head_module_->method_meta("kv_forward").get())),
         std::make_unique<MethodMeta>(std::move(head_prefill_meta)));
     eagle_gen->set_d2t(std::move(d2t));
+    if (!embed_table.empty()) {
+      eagle_gen->set_embed_table(
+          std::move(embed_table),
+          eagle_md.target_vocab_size,
+          head_hidden_size);
+    }
     token_generator_ = std::move(eagle_gen);
   } else {
     token_generator_ = std::make_unique<TokenGenerator>(
@@ -437,14 +524,21 @@ Error Runner::load() {
 
   buffer_manager_ = std::make_unique<ClientMem>();
   if (shared_buffer_) {
+    size_t cache_size = kv_manager_->total_cache_size_in_bytes();
+    if (eagle_kv_manager_ != nullptr) {
+      cache_size += eagle_kv_manager_->total_cache_size_in_bytes();
+    }
     buffer_manager_ = std::make_unique<RpcMem>(
-        kv_manager_->total_cache_size_in_bytes(),
+        cache_size,
         prompt_processor_->total_prompt_processor_io_size_in_bytes(),
         token_generator_->total_token_generator_io_size_in_bytes());
   }
   ET_LOG(Info, "creating io_memory");
   // prepare io
   kv_manager_->init_cache(buffer_manager_.get(), prompt_processor_ar_len);
+  if (eagle_kv_manager_ != nullptr) {
+    eagle_kv_manager_->init_cache(buffer_manager_.get(), 1);
+  }
   prompt_processor_->init_io(
       buffer_manager_.get(),
       module_->method_meta(prompt_processor_method_name));

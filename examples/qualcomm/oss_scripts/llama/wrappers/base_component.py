@@ -87,14 +87,18 @@ def process_model_args(
     """
     # TODO: support batch inputs if necessary
     if mode == Mode.DECODE:
-        ar_len = (
+        if control_args.model_mode == "lookahead":
             # To get better performance, we round up to the nearest power of 2.
-            next_power_of_two(
+            ar_len = next_power_of_two(
                 (control_args.window + control_args.gcap) * (control_args.ngram - 1)
             )
-            if control_args.model_mode == "lookahead"
-            else 1
-        )
+        elif control_args.model_mode == "eagle":
+            if control_args.tree_topology:
+                ar_len = next_power_of_two(control_args.max_tree_size)
+            else:
+                ar_len = next_power_of_two(control_args.draft_len + 1)
+        else:
+            ar_len = 1
     else:
         ar_len = control_args.prefill_ar_len
 

@@ -21,13 +21,14 @@ namespace example {
  *
  * Two dtypes are supported (EAGLE head IO is fp16 by default in our build):
  *   - kFp16:    raw __fp16 logits, host argmax over draft_vocab_size entries
- *   - kQuant16: uint16 quantized logits, dequantized via head pte's
+   *   - kFp32:    raw float logits
+   *   - kQuant16: uint16 quantized logits, dequantized via head pte's
  *               get_logits_scale / get_logits_zero_point constant_methods
  *               before argmax. (TODO; not used in Phase 2 fp16 build.)
  */
 class EagleSampler {
  public:
-  enum class Dtype { kFp16, kQuant16 };
+  enum class Dtype { kFp16, kFp32, kQuant16 };
 
   EagleSampler(
       Dtype dtype,

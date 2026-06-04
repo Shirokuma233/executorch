@@ -98,6 +98,21 @@ DEFINE_int32(
     draft_len,
     0,
     "[Eagle Decoding] Chain-mode draft length (Phase 3).");
+DEFINE_string(
+    eagle_d2t_path,
+    "",
+    "[Eagle Decoding] Path to d2t.bin (int64[draft_vocab_size]). "
+    "Default: <eagle_head dir>/d2t.bin");
+DEFINE_string(
+    eagle_t2d_path,
+    "",
+    "[Eagle Decoding] Path to t2d.bin (bool[target_vocab_size]). "
+    "Default: <eagle_head dir>/t2d.bin");
+DEFINE_string(
+    eagle_embed_path,
+    "",
+    "[Eagle Decoding] Path to embed.bin (fp16[target_vocab, hidden]). "
+    "Default: <eagle_head dir>/embed.bin");
 
 std::vector<std::string> CollectPrompts(int argc, char** argv) {
   // Collect all prompts from command line, example usage:
@@ -226,7 +241,10 @@ void start_runner(
     std::unique_ptr<executorch::extension::Module> module,
     std::vector<std::string>& prompts,
     std::unique_ptr<executorch::extension::Module> attention_sink_rope_module,
-    std::unique_ptr<executorch::extension::Module> eagle_head_module) {
+    std::unique_ptr<executorch::extension::Module> eagle_head_module,
+    const std::string& eagle_d2t_path,
+    const std::string& eagle_t2d_path,
+    const std::string& eagle_embed_path) {
   bool use_tokenized_prompt =
       gflags::GetCommandLineFlagInfoOrDie("tokenized_prompt").is_default ? false
                                                                          : true;
@@ -248,7 +266,10 @@ void start_runner(
       std::move(attention_sink_rope_module),
       std::move(eagle_head_module),
       FLAGS_max_tree_size,
-      FLAGS_draft_len);
+      FLAGS_draft_len,
+      eagle_d2t_path,
+      eagle_t2d_path,
+      eagle_embed_path);
   auto decoder_model_version = runner.get_decoder_model_version();
   std::vector<char> buf;
   buf.reserve(5 * FLAGS_seq_len); // assume each token is around 5 char
@@ -319,11 +340,34 @@ int main(int argc, char** argv) {
         FLAGS_eagle_head_path.c_str(),
         executorch::extension::Module::LoadMode::MmapUseMlockIgnoreErrors);
   }
+
+  // Default sibling paths: if not explicitly given, derive from head pte dir.
+  auto sibling_path = [](const std::string& head, const std::string& name) {
+    if (!head.empty()) {
+      auto sep = head.find_last_of("/\\");
+      std::string dir =
+          (sep != std::string::npos) ? head.substr(0, sep) : ".";
+      return dir + "/" + name;
+    }
+    return std::string{};
+  };
+  std::string d2t_path = FLAGS_eagle_d2t_path.empty()
+      ? sibling_path(FLAGS_eagle_head_path, "d2t.bin")
+      : FLAGS_eagle_d2t_path;
+  std::string t2d_path = FLAGS_eagle_t2d_path.empty()
+      ? sibling_path(FLAGS_eagle_head_path, "t2d.bin")
+      : FLAGS_eagle_t2d_path;
+  std::string embed_path = FLAGS_eagle_embed_path.empty()
+      ? sibling_path(FLAGS_eagle_head_path, "embed.bin")
+      : FLAGS_eagle_embed_path;
   start_runner(
       std::move(module),
       prompts,
       std::move(attention_sink_rope_module),
-      std::move(eagle_head_module));
+      std::move(eagle_head_module),
+      d2t_path,
+      t2d_path,
+      embed_path);
 
   return 0;
 }

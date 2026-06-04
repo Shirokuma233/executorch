@@ -41,6 +41,8 @@ inline size_t getDtypeSize(executorch::aten::ScalarType dtype) {
       return sizeof(uint8_t);
     case executorch::aten::ScalarType::UInt16:
       return sizeof(uint16_t);
+    case executorch::aten::ScalarType::Half:
+      return sizeof(uint16_t);
     default:
       ET_CHECK_MSG(
           false,

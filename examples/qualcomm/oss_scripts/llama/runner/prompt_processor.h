@@ -81,7 +81,7 @@ class PromptProcessor {
    */
   inline const size_t total_prompt_processor_io_size_in_bytes() const {
     return input_toks_.size + input_pos_.size + attention_mask_.size +
-        window_attention_mask_.size + logits_.size;
+        window_attention_mask_.size + logits_.size + extra_outputs_size_;
   }
 
  protected:
@@ -113,6 +113,8 @@ class PromptProcessor {
   TensorStructRaw attention_mask_;
   TensorStructRaw window_attention_mask_;
   TensorStructRaw logits_;
+  std::vector<TensorStructRaw> extra_outputs_;
+  size_t extra_outputs_size_{0};
 
   // layer -> TensorImpl
   std::vector<std::unique_ptr<executorch::aten::TensorImpl>> k_cache_in_;

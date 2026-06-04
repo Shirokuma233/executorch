@@ -601,7 +601,8 @@ def _build_parser():
         default=None,
         type=str,
         help="[Eagle mode] Comma-separated indices of target layers to export (low,mid,high). "
-        "Overrides EAGLE head config. Example: '2,16,30'.",
+        "Default matches EAGLE-3 training-time hardcode (2, n//2, n-3). "
+        "Example: '2,14,25' for Qwen3-1.7B (28 layers).",
     )
     parser.add_argument(
         "--tree_topology",

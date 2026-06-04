@@ -64,6 +64,27 @@ PromptProcessor::PromptProcessor(
   logits_.dtype = logits->scalar_type();
   logits_.size =
       metadata_.ar_len * metadata_.vocab_size * logits_.getElementSize();
+
+  size_t first_extra_output = 1;
+  if (!is_bert()) {
+    first_extra_output += 2 * static_cast<size_t>(metadata_.num_layers);
+  }
+  if (method_meta->num_outputs() > first_extra_output) {
+    extra_outputs_.reserve(method_meta->num_outputs() - first_extra_output);
+  }
+  for (size_t output_idx = first_extra_output;
+       output_idx < method_meta->num_outputs();
+       ++output_idx) {
+    Result<TensorInfo> extra_output = method_meta->output_tensor_meta(output_idx);
+    TensorStructRaw extra;
+    extra.dtype = extra_output->scalar_type();
+    extra.size = extra.getElementSize();
+    for (const auto dim : extra_output->sizes()) {
+      extra.size *= static_cast<size_t>(dim);
+    }
+    extra_outputs_size_ += extra.size;
+    extra_outputs_.emplace_back(std::move(extra));
+  }
 };
 
 void PromptProcessor::init_io(
@@ -198,6 +219,21 @@ void PromptProcessor::init_io(
           cache[layer]->nbytes(),
           kv_cache.get());
     }
+  }
+
+  for (auto& extra_output : extra_outputs_) {
+    Result<TensorInfo> extra_meta = method_meta->output_tensor_meta(index++);
+    extra_output.data = buffer_manager->allocate(extra_output.size);
+    extra_output.tensor = std::make_unique<TensorImpl>(
+        extra_meta->scalar_type(),
+        extra_meta->sizes().size(),
+        const_cast<TensorImpl::SizesType*>(extra_meta->sizes().data()),
+        extra_output.data,
+        const_cast<TensorImpl::DimOrderType*>(
+            extra_meta->dim_order().data()));
+    output_tensors_.emplace_back(extra_output.tensor.get());
+    buffer_manager->add_memory_info(
+        extra_output.data, extra_output.size, extra_meta.get());
   }
   // Prepare the vector of EValue to run inference
   inputs_.reserve(input_tensors_.size());

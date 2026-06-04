@@ -55,6 +55,19 @@ uint64_t EagleSampler::argmax_draft(const std::byte* logits_buf) const {
     return static_cast<uint64_t>(best);
   }
 
+  if (dtype_ == Dtype::kFp32) {
+    const float* p = reinterpret_cast<const float*>(logits_buf);
+    int best = 0;
+    float best_val = p[0];
+    for (int i = 1; i < draft_vocab_size_; ++i) {
+      if (p[i] > best_val) {
+        best_val = p[i];
+        best = i;
+      }
+    }
+    return static_cast<uint64_t>(best);
+  }
+
   // kQuant16: dequantize then argmax. Strictly we don't need to dequantize for
   // argmax because (x - zp) * scale is monotonic in x when scale > 0 — so the
   // argmax in uint16 space equals the argmax in real space. We just argmax
