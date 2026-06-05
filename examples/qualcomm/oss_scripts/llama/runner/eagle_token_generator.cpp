@@ -375,15 +375,12 @@ void EagleTokenGenerator::head_prefill_step(
         head_tok_emb_buf_.data(), head_tok_emb_dtype_, i, emb_fp16[i]);
   }
 
-  // 3. Build causal attn_mask for the head-local cache position
-  //    (single slot attending to everything up to cache_pos, inclusive):
-  //    [1, ctx] with 0 at [0..cache_pos] and
-  //    -inf beyond.
-  int ctx = eagle_meta_.target_context_len;
-  for (int i = 0; i < ctx; ++i) {
-    write_mask_value(
-        head_attn_mask_buf_.data(), head_attn_mask_dtype_, i, i <= cache_pos);
-  }
+  std::vector<int32_t> attention_map{-1};
+  head_kv_manager_->init_attention_mask(
+      head_attn_mask_buf_.data(),
+      attention_map,
+      1,
+      static_cast<int32_t>(cache_pos));
 
   // 4. Position.
   *reinterpret_cast<int32_t*>(head_pos_buf_.data()) =
@@ -520,12 +517,12 @@ uint64_t EagleTokenGenerator::head_decode_step(
         head_tok_emb_buf_.data(), head_tok_emb_dtype_, i, emb_fp16[i]);
   }
 
-  // Attn mask: single slot, sees [0..pos].
-  int ctx = eagle_meta_.target_context_len;
-  for (int i = 0; i < ctx; ++i) {
-    write_mask_value(
-        head_attn_mask_buf_.data(), head_attn_mask_dtype_, i, i <= cache_pos);
-  }
+  std::vector<int32_t> attention_map{-1};
+  head_kv_manager_->init_attention_mask(
+      head_attn_mask_buf_.data(),
+      attention_map,
+      1,
+      static_cast<int32_t>(cache_pos));
 
   *reinterpret_cast<int32_t*>(head_pos_buf_.data()) =
       static_cast<int32_t>(rope_pos);
