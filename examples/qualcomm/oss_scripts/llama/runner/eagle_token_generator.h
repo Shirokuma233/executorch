@@ -107,6 +107,10 @@ class EagleTokenGenerator : public TokenGenerator {
     embed_hidden_size_ = hidden_size;
   }
 
+  void set_prompt_prefill_hidden(
+      const std::vector<TensorStructRaw>& extra_outputs,
+      int32_t num_prompt_tokens);
+
   // Phase 4: configure tree topology. If `branching_per_depth` is empty, the
   // generator runs in chain mode. Otherwise it builds a static tree of size
   // <= max_tree_size at each verify step.
@@ -198,6 +202,11 @@ class EagleTokenGenerator : public TokenGenerator {
   std::vector<uint16_t> embed_table_;
   int32_t embed_vocab_size_{0};
   int32_t embed_hidden_size_{0};
+
+  // Target hidden output buffers (3 layers: low / mid / high), fp16.
+  std::vector<float> prompt_hidden_LMH_;
+  int32_t prompt_hidden_tokens_{0};
+  int32_t prompt_hidden_token_start_{0};
 
   // Target hidden output buffers (3 layers: low / mid / high), fp16.
   std::vector<std::byte> target_hidden_low_buf_;

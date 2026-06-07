@@ -72,20 +72,26 @@ inline uint16_t fp32_to_fp16(float f) {
 }
 
 inline float read_hidden_scalar(
-    const std::vector<std::byte>& buffer,
+    const std::byte* data,
     ScalarType dtype,
     size_t index) {
   switch (dtype) {
     case ScalarType::Float:
-      return reinterpret_cast<const float*>(buffer.data())[index];
+      return reinterpret_cast<const float*>(data)[index];
     case ScalarType::Half:
     case ScalarType::UInt16:
-      return fp16_to_fp32(
-          reinterpret_cast<const uint16_t*>(buffer.data())[index]);
+      return fp16_to_fp32(reinterpret_cast<const uint16_t*>(data)[index]);
     default:
       ET_CHECK_MSG(false, "[Eagle] unsupported hidden dtype");
       return 0.0f;
   }
+}
+
+inline float read_hidden_scalar(
+    const std::vector<std::byte>& buffer,
+    ScalarType dtype,
+    size_t index) {
+  return read_hidden_scalar(buffer.data(), dtype, index);
 }
 
 inline size_t dtype_size(ScalarType dtype) {
@@ -211,6 +217,54 @@ EagleTokenGenerator::EagleTokenGenerator(
       eagle_meta_.draft_len,
       eagle_meta_.draft_vocab_size,
       eagle_meta_.hidden_dim);
+}
+
+void EagleTokenGenerator::set_prompt_prefill_hidden(
+    const std::vector<TensorStructRaw>& extra_outputs,
+    int32_t num_prompt_tokens) {
+  prompt_hidden_LMH_.clear();
+  prompt_hidden_tokens_ = 0;
+  prompt_hidden_token_start_ = 0;
+  if (extra_outputs.size() < 3 || num_prompt_tokens <= 0) {
+    return;
+  }
+
+  const int H = eagle_meta_.hidden_dim;
+  const int H3 = 3 * H;
+  const size_t slots = extra_outputs[0].size /
+      (static_cast<size_t>(H) * extra_outputs[0].getElementSize());
+  int32_t n = std::min<int32_t>(num_prompt_tokens, static_cast<int32_t>(slots));
+  if (num_prompt_tokens > static_cast<int32_t>(slots)) {
+    n = 1 + ((num_prompt_tokens - 1) % static_cast<int32_t>(slots));
+    prompt_hidden_token_start_ = num_prompt_tokens - n;
+  }
+  if (n <= 0) {
+    return;
+  }
+  if (num_prompt_tokens > static_cast<int32_t>(slots)) {
+    ET_LOG(
+        Info,
+        "[Eagle] prompt hidden only has %zu slots for %d prompt tokens; "
+        "chain init will use the visible prefill chunk",
+        slots,
+        num_prompt_tokens);
+  }
+
+  prompt_hidden_LMH_.assign(
+      static_cast<size_t>(n) * static_cast<size_t>(H3), 0.0f);
+  for (int k = 0; k < n; ++k) {
+    for (int h = 0; h < H; ++h) {
+      const size_t src_index = static_cast<size_t>(k) * H + h;
+      const size_t dst_base = static_cast<size_t>(k) * H3;
+      prompt_hidden_LMH_[dst_base + h] = read_hidden_scalar(
+          extra_outputs[0].data, extra_outputs[0].dtype, src_index);
+      prompt_hidden_LMH_[dst_base + H + h] = read_hidden_scalar(
+          extra_outputs[1].data, extra_outputs[1].dtype, src_index);
+      prompt_hidden_LMH_[dst_base + 2 * H + h] = read_hidden_scalar(
+          extra_outputs[2].data, extra_outputs[2].dtype, src_index);
+    }
+  }
+  prompt_hidden_tokens_ = n;
 }
 
 // ---------------------------------------------------------------------------
@@ -486,6 +540,11 @@ void EagleTokenGenerator::head_prefill_step(
       set_err == Error::Ok,
       "[Eagle] head prefill_forward set_outputs failed");
 
+  ET_LOG(
+      Info,
+      "[Eagle] exec head prefill_forward rope=%lld cache=%lld",
+      static_cast<long long>(rope_pos),
+      static_cast<long long>(cache_pos));
   auto res = head_module_->execute("prefill_forward", head_inputs);
   ET_CHECK_MSG(res.ok(), "[Eagle] head prefill_forward execute failed");
 
@@ -624,6 +683,12 @@ uint64_t EagleTokenGenerator::head_decode_step(
   auto set_err = head_module_->set_outputs("kv_forward", head_outputs_ev2);
   ET_CHECK_MSG(set_err == Error::Ok, "[Eagle] head kv_forward set_outputs failed");
 
+  ET_LOG(
+      Info,
+      "[Eagle] exec head kv_forward rope=%lld cache=%lld token=%llu",
+      static_cast<long long>(rope_pos),
+      static_cast<long long>(cache_pos),
+      static_cast<unsigned long long>(prev_token));
   auto res = head_module_->execute("kv_forward", head_inputs);
   ET_CHECK_MSG(res.ok(), "[Eagle] head kv_forward execute failed");
 
@@ -678,6 +743,16 @@ void EagleTokenGenerator::target_verify(
       attention_mask_.data, attention_map, ar, static_cast<int32_t>(cur_pos));
 
   // 4. Run target.
+  ET_LOG(
+      Info,
+      "[Eagle] exec target %s cur_pos=%lld ar=%d n=%d first=%llu",
+      method_name_.c_str(),
+      static_cast<long long>(cur_pos),
+      ar,
+      n,
+      packed_tokens.empty()
+          ? 0ULL
+          : static_cast<unsigned long long>(packed_tokens[0]));
   auto logits_res = decoder_runner_->step(method_name_, inputs_);
   ET_CHECK_MSG(logits_res.ok(), "[Eagle] target verify step failed");
   executorch::aten::Tensor& logits_tensor = logits_res.get();
@@ -788,26 +863,57 @@ Result<int64_t> EagleTokenGenerator::generate(
           Error::Ok,
       "[Eagle] set_outputs failed");
 
-  // Bootstrap: run the target on last_committed once to get the hidden state
-  // needed to seed the head. Do not commit the target KV here; the first
-  // verify pass below still includes last_committed in slot 0.
-  {
+  // Initialize the head like SafeAILab topK_genrate():
+  //   hidden = target(prompt), input_ids = prompt[1:] + first target token.
+  // The first generated token has already been sampled by prompt prefill and is
+  // passed as tokens.back(); it is not in the target KV cache yet.
+  if (!prompt_hidden_LMH_.empty() &&
+      tokens.size() >=
+          static_cast<size_t>(prompt_hidden_token_start_ + prompt_hidden_tokens_ + 1)) {
+    for (int k = 0; k < prompt_hidden_tokens_; ++k) {
+      const float* hidden =
+          prompt_hidden_LMH_.data() + static_cast<size_t>(k) * H3;
+      uint64_t shifted_token =
+          tokens[static_cast<size_t>(prompt_hidden_token_start_ + k + 1)];
+      head_prefill_step(hidden, shifted_token, head_cache_pos, head_cache_pos);
+      ++head_cache_pos;
+    }
+    for (int i = 0; i < H; ++i) {
+      prev_a[i] = read_hidden_scalar(
+          head_prev_feature_buf_, head_prev_feature_dtype_, static_cast<size_t>(i));
+    }
+  } else {
     std::vector<uint64_t> bootstrap_sampled;
     target_verify(
         {last_committed}, cur_pos, &bootstrap_sampled, &hidden_LMH_per_slot);
 
     head_prefill_step(
-        hidden_LMH_per_slot.data(), last_committed, cur_pos, head_cache_pos);
+        hidden_LMH_per_slot.data(), last_committed, head_cache_pos, head_cache_pos);
     for (int i = 0; i < H; ++i) {
       prev_a[i] = read_hidden_scalar(
           head_prev_feature_buf_, head_prev_feature_dtype_, static_cast<size_t>(i));
     }
-    head_cache_pos = 1;
+    ++head_cache_pos;
   }
 
   // ---- Main loop ----
   while (cur_pos < static_cast<int64_t>(seq_len) - 1) {
+    ET_LOG(
+        Info,
+        "[Eagle] loop cur_pos=%lld",
+        static_cast<long long>(cur_pos));
+    if (cur_pos + draft_len >= static_cast<int64_t>(seq_len)) {
+      ET_LOG(
+          Info,
+          "[Eagle] stop before verify: cur_pos=%lld draft_len=%d seq_len=%d",
+          static_cast<long long>(cur_pos),
+          draft_len,
+          seq_len);
+      break;
+    }
+
     // --- DRAFT ---
+    int64_t stable_head_cache_pos = head_cache_pos;
     std::vector<uint64_t> draft_target_ids;  // target-vocab ids proposed by head
     uint64_t draft_id = sample_draft(head_logits_buf_.data());
     uint64_t prev_token = draft_to_target(draft_id);
@@ -817,7 +923,7 @@ Result<int64_t> EagleTokenGenerator::generate(
       draft_id = head_decode_step(
           prev_a.data(),
           prev_token,
-          cur_pos + k,
+          head_cache_pos,
           head_cache_pos,
           prev_a_next.data());
       uint64_t target_id = draft_to_target(draft_id);
@@ -899,23 +1005,27 @@ Result<int64_t> EagleTokenGenerator::generate(
     last_committed = committed_tok;
 
     // --- REFRESH HEAD ---
-    // Use target hidden at slot `accepted` to re-seed head prev_a.
+    // Append the accepted target-hidden path to the head's stable KV. The token
+    // fed with hidden slot k is the next token on the committed path; the last
+    // slot is paired with the newly sampled bonus token.
     {
-      std::vector<float> refresh_hidden(static_cast<size_t>(H3));
-      const float* slot_base =
-          hidden_LMH_per_slot.data() +
-          static_cast<size_t>(accepted) * static_cast<size_t>(H3);
-      memcpy(refresh_hidden.data(), slot_base, static_cast<size_t>(H3) * sizeof(float));
-
-      head_cache_pos = 0;
-      head_prefill_step(refresh_hidden.data(), committed_tok, cur_pos, head_cache_pos);
+      head_cache_pos = stable_head_cache_pos;
+      for (int k = 0; k <= accepted; ++k) {
+        const float* slot_base =
+            hidden_LMH_per_slot.data() +
+            static_cast<size_t>(k) * static_cast<size_t>(H3);
+        uint64_t shifted_token =
+            (k < accepted) ? draft_target_ids[static_cast<size_t>(k)]
+                           : committed_tok;
+        head_prefill_step(slot_base, shifted_token, head_cache_pos, head_cache_pos);
+        ++head_cache_pos;
+      }
       for (int i = 0; i < H; ++i) {
         prev_a[i] = read_hidden_scalar(
             head_prev_feature_buf_,
             head_prev_feature_dtype_,
             static_cast<size_t>(i));
       }
-      head_cache_pos = 1;
     }
   }
 

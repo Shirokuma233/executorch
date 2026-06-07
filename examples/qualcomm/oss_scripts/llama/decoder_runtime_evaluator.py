@@ -362,6 +362,7 @@ class DefaultEval(EvalBase):
                     f"--seq_len {seq_len}",
                 ]
             )
+            print(f"[Runtime command]\n{runner_cmd}")
             subprocess.run(
                 runner_cmd,
                 shell=True,
@@ -390,6 +391,7 @@ class DefaultEval(EvalBase):
             # 加上LD_LIBRARY_PATH和ADSP_LIBRARY_PATH
             lib_path_cmd = f"export LD_LIBRARY_PATH={self.device_workspace} && export ADSP_LIBRARY_PATH={self.device_workspace};"
             runner_cmd = " ".join([lib_path_cmd, runner_cmd])
+            print(f"[Runtime command]\n{runner_cmd}")
             self.adb.execute(custom_runner_cmd=runner_cmd)
             self.adb.pull(
                 host_output_path=self.host_output_response_path,

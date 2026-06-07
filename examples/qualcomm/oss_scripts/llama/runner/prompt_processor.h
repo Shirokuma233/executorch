@@ -60,6 +60,10 @@ class PromptProcessor {
    */
   virtual const std::vector<std::byte>& get_all_logits();
 
+  const std::vector<TensorStructRaw>& get_extra_outputs() const {
+    return extra_outputs_;
+  }
+
   /**
    * Prefill an LLM Module with the given text input.
    * @param prompt_tokens The text prompt tokens to the LLM Module. Encoded by

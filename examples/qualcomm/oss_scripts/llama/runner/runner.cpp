@@ -650,6 +650,14 @@ Error Runner::generate_from_prompt_or_file(
       "RSS after prompt prefill: %f MiB (0 if unsupported)",
       get_rss_bytes() / 1024.0 / 1024.0);
 
+  if (eval_mode_ == EvalMode::kEagleDecoding) {
+    if (auto* eagle_generator =
+            dynamic_cast<EagleTokenGenerator*>(token_generator_.get())) {
+      eagle_generator->set_prompt_prefill_hidden(
+          prompt_processor_->get_extra_outputs(), num_prompt_tokens);
+    }
+  }
+
   // start the main loop
   prompt_tokens.push_back(cur_token);
   int64_t num_generated_tokens = ET_UNWRAP(token_generator_->generate(
