@@ -83,6 +83,14 @@ class TokenGenerator {
         window_attention_mask_.size + logits_.size;
   }
 
+  uint64_t graph_execute_calls() const {
+    return graph_execute_calls_;
+  }
+
+  double graph_execute_time_ms() const {
+    return graph_execute_time_ms_;
+  }
+
  protected:
   tokenizers::Tokenizer* tokenizer_;
   DecoderRunner* decoder_runner_;
@@ -125,5 +133,8 @@ class TokenGenerator {
 
   // Unused by default, only used when dump_logits_path is provided.
   std::vector<std::byte> token_all_logits_;
+
+  uint64_t graph_execute_calls_{0};
+  double graph_execute_time_ms_{0.0};
 };
 } // namespace example

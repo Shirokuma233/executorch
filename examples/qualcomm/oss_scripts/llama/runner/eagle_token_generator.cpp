@@ -10,6 +10,7 @@
 
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/eagle_token_generator.h>
 
+#include <executorch/extension/llm/runner/util.h>
 #include <executorch/runtime/platform/log.h>
 
 #include <algorithm>
@@ -22,6 +23,7 @@ using executorch::runtime::EValue;
 using executorch::runtime::MethodMeta;
 using executorch::runtime::Result;
 using executorch::runtime::TensorInfo;
+using executorch::extension::llm::time_in_ms;
 
 namespace example {
 
@@ -545,7 +547,10 @@ void EagleTokenGenerator::head_prefill_step(
       "[Eagle] exec head prefill_forward rope=%lld cache=%lld",
       static_cast<long long>(rope_pos),
       static_cast<long long>(cache_pos));
+  long start_ms = time_in_ms();
   auto res = head_module_->execute("prefill_forward", head_inputs);
+  head_prefill_time_ms_ += static_cast<double>(time_in_ms() - start_ms);
+  ++head_prefill_calls_;
   ET_CHECK_MSG(res.ok(), "[Eagle] head prefill_forward execute failed");
 
   // 8. Advance head KV.
@@ -689,7 +694,10 @@ uint64_t EagleTokenGenerator::head_decode_step(
       static_cast<long long>(rope_pos),
       static_cast<long long>(cache_pos),
       static_cast<unsigned long long>(prev_token));
+  long start_ms = time_in_ms();
   auto res = head_module_->execute("kv_forward", head_inputs);
+  head_decode_time_ms_ += static_cast<double>(time_in_ms() - start_ms);
+  ++head_decode_calls_;
   ET_CHECK_MSG(res.ok(), "[Eagle] head kv_forward execute failed");
 
   head_kv_manager_->update_cache(1, static_cast<int32_t>(cache_pos), 1, {});
@@ -753,7 +761,10 @@ void EagleTokenGenerator::target_verify(
       packed_tokens.empty()
           ? 0ULL
           : static_cast<unsigned long long>(packed_tokens[0]));
+  long start_ms = time_in_ms();
   auto logits_res = decoder_runner_->step(method_name_, inputs_);
+  target_verify_time_ms_ += static_cast<double>(time_in_ms() - start_ms);
+  ++target_verify_calls_;
   ET_CHECK_MSG(logits_res.ok(), "[Eagle] target verify step failed");
   executorch::aten::Tensor& logits_tensor = logits_res.get();
 
@@ -818,6 +829,14 @@ Result<int64_t> EagleTokenGenerator::generate(
     bool dump_logits,
     AttentionSinkRopeRunner* attention_sink_rope_runner) {
   ET_CHECK_MSG(!tokens.empty(), "tokens must not be empty");
+  total_drafted_ = 0;
+  total_accepted_ = 0;
+  target_verify_calls_ = 0;
+  head_decode_calls_ = 0;
+  head_prefill_calls_ = 0;
+  target_verify_time_ms_ = 0.0;
+  head_decode_time_ms_ = 0.0;
+  head_prefill_time_ms_ = 0.0;
 
   const bool tree_mode = !tree_branching_per_depth_.empty();
   if (tree_mode) {
@@ -1039,6 +1058,32 @@ done:
         static_cast<unsigned long long>(total_accepted_),
         static_cast<unsigned long long>(total_drafted_));
   }
+  ET_LOG(
+      Info,
+      "[Eagle] profile target_verify: calls=%llu total=%.3fms avg=%.3fms",
+      static_cast<unsigned long long>(target_verify_calls_),
+      target_verify_time_ms_,
+      target_verify_calls_ == 0
+          ? 0.0
+          : target_verify_time_ms_ /
+              static_cast<double>(target_verify_calls_));
+  ET_LOG(
+      Info,
+      "[Eagle] profile head_decode: calls=%llu total=%.3fms avg=%.3fms",
+      static_cast<unsigned long long>(head_decode_calls_),
+      head_decode_time_ms_,
+      head_decode_calls_ == 0
+          ? 0.0
+          : head_decode_time_ms_ / static_cast<double>(head_decode_calls_));
+  ET_LOG(
+      Info,
+      "[Eagle] profile head_prefill: calls=%llu total=%.3fms avg=%.3fms",
+      static_cast<unsigned long long>(head_prefill_calls_),
+      head_prefill_time_ms_,
+      head_prefill_calls_ == 0
+          ? 0.0
+          : head_prefill_time_ms_ /
+              static_cast<double>(head_prefill_calls_));
   return cur_pos - start_pos;
 }
 

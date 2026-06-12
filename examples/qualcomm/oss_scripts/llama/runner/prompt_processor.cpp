@@ -8,8 +8,10 @@
 
 #include <c10/util/safe_numerics.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/prompt_processor.h>
+#include <executorch/extension/llm/runner/util.h>
 #include <numeric>
 using executorch::aten::TensorImpl;
+using executorch::extension::llm::time_in_ms;
 using executorch::runtime::EValue;
 using executorch::runtime::MethodMeta;
 using executorch::runtime::Result;
@@ -301,6 +303,8 @@ Result<uint64_t> PromptProcessor::prefill(
   int64_t prompt_pos = 0;
   int32_t n_update = metadata_.ar_len;
   int num_iters = 1 + ((num_prompt_tokens - 1) / metadata_.ar_len);
+  graph_execute_calls_ = 0;
+  graph_execute_time_ms_ = 0.0;
   ET_LOG(
       Info,
       "Prompt Processor: total %d prompt tokens (AR-%d * %d iters)",
@@ -372,7 +376,11 @@ Result<uint64_t> PromptProcessor::prefill(
     prepare_io(prompt_tokens, prompt_pos, shifted_pos);
 
     // Run inference
+    const uint64_t graph_start_ms = time_in_ms();
     decoder_runner_->step(method_name_, inputs_);
+    graph_execute_time_ms_ +=
+        static_cast<double>(time_in_ms() - graph_start_ms);
+    ++graph_execute_calls_;
     if (dump_logits) {
       prompt_all_logits_.insert(
           prompt_all_logits_.end(),

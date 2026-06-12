@@ -88,6 +88,14 @@ class PromptProcessor {
         window_attention_mask_.size + logits_.size + extra_outputs_size_;
   }
 
+  uint64_t graph_execute_calls() const {
+    return graph_execute_calls_;
+  }
+
+  double graph_execute_time_ms() const {
+    return graph_execute_time_ms_;
+  }
+
  protected:
   // If the cache length is zero, it indicates a BERT model, which does not use
   // position ids or KV cache inputs.
@@ -134,5 +142,8 @@ class PromptProcessor {
 
   // Unused by default, only used when dump_logits_path is provided.
   std::vector<std::byte> prompt_all_logits_;
+
+  uint64_t graph_execute_calls_{0};
+  double graph_execute_time_ms_{0.0};
 };
 } // namespace example

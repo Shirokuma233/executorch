@@ -515,7 +515,7 @@ class Qwen3_1_7B(LLMModelConfig):
     convert_weights = convert_qwen3_weights
     transform_weight = False
     instruct_model = True
-    num_sharding = 1
+    num_sharding = 2
     masked_softmax = True
     seq_mse_candidates = 0
     r1 = False

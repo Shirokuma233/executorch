@@ -225,6 +225,12 @@ class EagleTokenGenerator : public TokenGenerator {
   // Stats accumulator.
   uint64_t total_drafted_{0};
   uint64_t total_accepted_{0};
+  uint64_t target_verify_calls_{0};
+  uint64_t head_decode_calls_{0};
+  uint64_t head_prefill_calls_{0};
+  double target_verify_time_ms_{0.0};
+  double head_decode_time_ms_{0.0};
+  double head_prefill_time_ms_{0.0};
 
   // Phase 4 tree config. Empty => chain mode.
   std::vector<int> tree_branching_per_depth_;

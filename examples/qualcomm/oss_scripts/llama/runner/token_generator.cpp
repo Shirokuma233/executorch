@@ -7,9 +7,11 @@
  */
 
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/token_generator.h>
+#include <executorch/extension/llm/runner/util.h>
 #include <numeric>
 
 using executorch::aten::TensorImpl;
+using executorch::extension::llm::time_in_ms;
 using executorch::runtime::EValue;
 using executorch::runtime::MethodMeta;
 using executorch::runtime::Result;
@@ -235,6 +237,8 @@ Result<int64_t> TokenGenerator::generate(
   // Token after prefill
   uint64_t cur_token = tokens.back();
   uint64_t prev_token;
+  graph_execute_calls_ = 0;
+  graph_execute_time_ms_ = 0.0;
   // Rearrange KV cache first
   kv_manager_->rearrange_cache(metadata_.ar_len);
   std::vector<int32_t> attention_map(metadata_.ar_len);
@@ -300,7 +304,11 @@ Result<int64_t> TokenGenerator::generate(
     prepare_io(cur_token, shifted_pos);
 
     // Run inference
+    const uint64_t graph_start_ms = time_in_ms();
     auto logits_res = decoder_runner_->step(method_name_, inputs_);
+    graph_execute_time_ms_ +=
+        static_cast<double>(time_in_ms() - graph_start_ms);
+    ++graph_execute_calls_;
     if (dump_logits) {
       token_all_logits_.insert(
           token_all_logits_.end(),

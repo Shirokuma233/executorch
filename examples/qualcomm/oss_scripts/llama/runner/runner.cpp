@@ -544,6 +544,10 @@ Error Runner::load() {
       module_->method_meta(prompt_processor_method_name));
   token_generator_->init_io(
       buffer_manager_.get(), module_->method_meta(token_generator_method_name));
+  ET_LOG(
+      Info,
+      "RSS after io_memory init: %f MiB (0 if unsupported)",
+      get_rss_bytes() / 1024.0 / 1024.0);
   return Error::Ok;
 }
 
@@ -680,6 +684,26 @@ Error Runner::generate_from_prompt_or_file(
   stats_.num_prompt_tokens = num_prompt_tokens;
   stats_.num_generated_tokens = num_generated_tokens;
   print_report(stats_);
+  if (eval_mode_ == EvalMode::kHybrid) {
+    const uint64_t prefill_calls = prompt_processor_->graph_execute_calls();
+    const double prefill_time_ms = prompt_processor_->graph_execute_time_ms();
+    ET_LOG(
+        Info,
+        "[Hybrid] profile prefill_forward: calls=%llu total=%.3fms avg=%.3fms",
+        static_cast<unsigned long long>(prefill_calls),
+        prefill_time_ms,
+        prefill_calls == 0
+            ? 0.0
+            : prefill_time_ms / static_cast<double>(prefill_calls));
+    const uint64_t kv_calls = token_generator_->graph_execute_calls();
+    const double kv_time_ms = token_generator_->graph_execute_time_ms();
+    ET_LOG(
+        Info,
+        "[Hybrid] profile kv_forward: calls=%llu total=%.3fms avg=%.3fms",
+        static_cast<unsigned long long>(kv_calls),
+        kv_time_ms,
+        kv_calls == 0 ? 0.0 : kv_time_ms / static_cast<double>(kv_calls));
+  }
   print_performance_report(stats_, performance_output_path_);
   if (dump_logits) {
     save_logits(

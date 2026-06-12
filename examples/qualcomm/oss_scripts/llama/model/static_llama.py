@@ -117,8 +117,8 @@ class AttentionSinkRope(nn.Module):
                 config.rope_freq_base,
                 config.partial_rotary_factor,
             )
-            freqs_cos = freqs_cos[:, : freqs_cos.shape[-1] // 2]
-            freqs_sin = freqs_sin[:, : freqs_sin.shape[-1] // 2]
+            freqs_cos = freqs_cos[:, : freqs_cos.shape[-1] // 2].contiguous()
+            freqs_sin = freqs_sin[:, : freqs_sin.shape[-1] // 2].contiguous()
         else:
             freqs_cos, freqs_sin = precompute_freqs_cis(
                 config.head_dim,
@@ -156,8 +156,12 @@ class AttentionSinkRope(nn.Module):
                 rope_freq_base,
                 config.partial_rotary_factor,
             )
-            local_freqs_cos = local_freqs_cos[:, : local_freqs_cos.shape[-1] // 2]
-            local_freqs_sin = local_freqs_sin[:, : local_freqs_sin.shape[-1] // 2]
+            local_freqs_cos = local_freqs_cos[
+                :, : local_freqs_cos.shape[-1] // 2
+            ].contiguous()
+            local_freqs_sin = local_freqs_sin[
+                :, : local_freqs_sin.shape[-1] // 2
+            ].contiguous()
             local_original_freqs_cos = local_freqs_cos.narrow(
                 0, self.original_position, self.num_to_keep
             )
@@ -685,8 +689,8 @@ class LlamaModel(nn.Module):
                 config.rope_freq_base,
                 config.partial_rotary_factor,
             )
-            freqs_cos = freqs_cos[:, : freqs_cos.shape[-1] // 2]
-            freqs_sin = freqs_sin[:, : freqs_sin.shape[-1] // 2]
+            freqs_cos = freqs_cos[:, : freqs_cos.shape[-1] // 2].contiguous()
+            freqs_sin = freqs_sin[:, : freqs_sin.shape[-1] // 2].contiguous()
         else:
             freqs_cos, freqs_sin = precompute_freqs_cis(
                 config.head_dim,
@@ -735,6 +739,9 @@ class LlamaModel(nn.Module):
 
         captured_hiddens = [] if self.output_hidden_layers is not None else None
         for ind, decoder_layer in enumerate(self.layers):
+            if captured_hiddens is not None and ind in self.output_hidden_layers:
+                captured_hiddens.append(hidden_states)
+
             k_caches = None
             v_caches = None
             if self.use_kv_cache:
@@ -753,8 +760,6 @@ class LlamaModel(nn.Module):
             )
             output_k_cache.extend(k)
             output_v_cache.extend(v)
-            if captured_hiddens is not None and ind in self.output_hidden_layers:
-                captured_hiddens.append(hidden_states)
 
         hidden_states = self.norm(hidden_states)
         logits = self.output(hidden_states)
@@ -875,6 +880,9 @@ class LlamaModelWithoutEmbedding(LlamaModel):
 
         captured_hiddens = [] if self.output_hidden_layers is not None else None
         for ind, decoder_layer in enumerate(self.layers):
+            if captured_hiddens is not None and ind in self.output_hidden_layers:
+                captured_hiddens.append(hidden_states)
+
             k_caches = None
             v_caches = None
             if self.use_kv_cache:
@@ -893,8 +901,6 @@ class LlamaModelWithoutEmbedding(LlamaModel):
             )
             output_k_cache.extend(k)
             output_v_cache.extend(v)
-            if captured_hiddens is not None and ind in self.output_hidden_layers:
-                captured_hiddens.append(hidden_states)
 
         hidden_states = self.norm(hidden_states)
         logits = self.output(hidden_states)
@@ -1001,8 +1007,12 @@ class MultiScopeAwareLlamaModel(LlamaModel):
             config.local_rope_theta,
             config.partial_rotary_factor,
         )
-        local_freqs_cos = local_freqs_cos[:, : local_freqs_cos.shape[-1] // 2]
-        local_freqs_sin = local_freqs_sin[:, : local_freqs_sin.shape[-1] // 2]
+        local_freqs_cos = local_freqs_cos[
+            :, : local_freqs_cos.shape[-1] // 2
+        ].contiguous()
+        local_freqs_sin = local_freqs_sin[
+            :, : local_freqs_sin.shape[-1] // 2
+        ].contiguous()
         self.register_buffer("local_freqs_cos", local_freqs_cos, persistent=False)
         self.register_buffer("local_freqs_sin", local_freqs_sin, persistent=False)
 
@@ -1038,6 +1048,9 @@ class MultiScopeAwareLlamaModel(LlamaModel):
         hidden_states = self.embedding_scale_factor * self.tok_embeddings(tokens)
         captured_hiddens = [] if self.output_hidden_layers is not None else None
         for ind, decoder_layer in enumerate(self.layers):
+            if captured_hiddens is not None and ind in self.output_hidden_layers:
+                captured_hiddens.append(hidden_states)
+
             k_caches = None
             v_caches = None
             if self.use_kv_cache:
@@ -1067,8 +1080,6 @@ class MultiScopeAwareLlamaModel(LlamaModel):
 
             output_k_cache.extend(k)
             output_v_cache.extend(v)
-            if captured_hiddens is not None and ind in self.output_hidden_layers:
-                captured_hiddens.append(hidden_states)
 
         hidden_states = self.norm(hidden_states)
         logits = self.output(hidden_states)
