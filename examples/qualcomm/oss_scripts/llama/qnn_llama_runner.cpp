@@ -93,11 +93,19 @@ DEFINE_string(
 DEFINE_int32(
     max_tree_size,
     0,
-    "[Eagle Decoding] Max nodes in draft tree (must match target compiled ar_len).");
+    "[Eagle Decoding] Max tree nodes including the root (must fit target compiled ar_len).");
 DEFINE_int32(
     draft_len,
     0,
     "[Eagle Decoding] Chain-mode draft length (Phase 3).");
+DEFINE_int32(
+    tree_depth,
+    4,
+    "[Eagle Decoding] EAGLE tree expansion depth. Set 0 to use chain mode.");
+DEFINE_int32(
+    tree_topk,
+    4,
+    "[Eagle Decoding] EAGLE top-k branches retained at each tree expansion.");
 DEFINE_string(
     eagle_d2t_path,
     "",
@@ -267,6 +275,8 @@ void start_runner(
       std::move(eagle_head_module),
       FLAGS_max_tree_size,
       FLAGS_draft_len,
+      FLAGS_tree_depth,
+      FLAGS_tree_topk,
       eagle_d2t_path,
       eagle_t2d_path,
       eagle_embed_path);

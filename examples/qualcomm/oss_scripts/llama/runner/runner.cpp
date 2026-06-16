@@ -104,6 +104,8 @@ Runner::Runner(
     std::unique_ptr<executorch::extension::Module> eagle_head_module,
     int max_tree_size,
     int draft_len,
+    int tree_depth,
+    int tree_topk,
     const std::string& eagle_d2t_path,
     const std::string& eagle_t2d_path,
     const std::string& eagle_embed_path)
@@ -112,6 +114,8 @@ Runner::Runner(
       eagle_head_module_(std::move(eagle_head_module)),
       max_tree_size_(max_tree_size),
       draft_len_(draft_len),
+      tree_depth_(tree_depth),
+      tree_topk_(tree_topk),
       eagle_d2t_path_(eagle_d2t_path),
       eagle_t2d_path_(eagle_t2d_path),
       eagle_embed_path_(eagle_embed_path),
@@ -353,17 +357,32 @@ Error Runner::load() {
 
     // Build a KV manager dedicated to the head (single layer).
     auto head_kv_meta = ET_UNWRAP(eagle_head_module_->method_meta("kv_forward"));
+    auto head_prefill_meta =
+        ET_UNWRAP(eagle_head_module_->method_meta("prefill_forward"));
     // head k_cache shape: [1, n_kv, head_dim, ctx-1]
     auto head_k_shape = head_kv_meta.input_tensor_meta(/*input_pos+kv*/ 4)->sizes();
     int64_t head_n_kv = head_k_shape[1];
     int64_t head_head_dim = head_k_shape[2];
     int64_t head_max_cache_len = head_k_shape[3];
+    auto head_kv_out_shape = head_kv_meta.output_tensor_meta(/*k_out*/ 2)->sizes();
+    auto head_prefill_out_shape =
+        head_prefill_meta.output_tensor_meta(/*k_out*/ 2)->sizes();
+    int32_t head_kv_ar_len = static_cast<int32_t>(
+        head_kv_out_shape[head_kv_out_shape.size() - 1]);
+    int32_t head_prefill_ar_len = static_cast<int32_t>(
+        head_prefill_out_shape[head_prefill_out_shape.size() - 1]);
+    int32_t head_max_ar_len = std::max(head_kv_ar_len, head_prefill_ar_len);
+    ET_LOG(
+        Info,
+        "[Eagle] head compiled ar: kv=%d prefill=%d",
+        head_kv_ar_len,
+        head_prefill_ar_len);
 
     eagle_kv_manager_ = std::make_unique<KVManager>(
         KVManager::Metadata{
             context_len_,
             head_head_dim,
-            /*max_ar_len=*/1,
+            /*max_ar_len=*/head_max_ar_len,
             static_cast<int32_t>(head_max_cache_len),
             head_n_kv,
             /*num_layers=*/1},
@@ -410,9 +429,6 @@ Error Runner::load() {
         }
       }
     }
-
-    auto head_prefill_meta =
-        ET_UNWRAP(eagle_head_module_->method_meta("prefill_forward"));
 
     // Read head hyperparams from constant_methods (populated by EagleHead.get_metadata()).
     auto read_int_meta = [&](const std::string& name, int32_t fallback) -> int32_t {
@@ -473,6 +489,8 @@ Error Runner::load() {
         /*head_n_kv_heads=*/static_cast<int32_t>(head_n_kv),
         /*head_head_dim=*/static_cast<int32_t>(head_head_dim),
         /*max_tree_size=*/max_tree_size_,
+        /*tree_depth=*/tree_depth_,
+        /*tree_topk=*/tree_topk_,
         /*low_layer_idx=*/-1,
         /*mid_layer_idx=*/-1,
         /*high_layer_idx=*/-1,

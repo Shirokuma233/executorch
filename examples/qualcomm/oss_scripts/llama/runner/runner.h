@@ -68,6 +68,8 @@ class Runner : public executorch::extension::llm::IRunner {
           nullptr,
       int max_tree_size = 0,
       int draft_len = 0,
+      int tree_depth = 4,
+      int tree_topk = 4,
       const std::string& eagle_d2t_path = "",
       const std::string& eagle_t2d_path = "",
       const std::string& eagle_embed_path = "");
@@ -107,6 +109,8 @@ class Runner : public executorch::extension::llm::IRunner {
   std::unique_ptr<KVManager> eagle_kv_manager_;
   int max_tree_size_{0};
   int draft_len_{0};
+  int tree_depth_{4};
+  int tree_topk_{4};
   std::string eagle_d2t_path_;
   std::string eagle_t2d_path_;
   std::string eagle_embed_path_;

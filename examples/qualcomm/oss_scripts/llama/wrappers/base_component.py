@@ -93,7 +93,7 @@ def process_model_args(
                 (control_args.window + control_args.gcap) * (control_args.ngram - 1)
             )
         elif control_args.model_mode == "eagle":
-            if control_args.tree_topology:
+            if control_args.tree_depth > 0 and control_args.tree_topk > 0:
                 ar_len = next_power_of_two(control_args.max_tree_size)
             else:
                 ar_len = next_power_of_two(control_args.draft_len + 1)

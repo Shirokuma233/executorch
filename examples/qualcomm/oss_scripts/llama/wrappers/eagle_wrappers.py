@@ -590,12 +590,12 @@ class EagleDecoderWrapper(Component):
         self.dep_table = get_passes_dependency_for_capture_program()
         self.meta = {}
 
-        # ar_len strategy (mirrors process_model_args):
-        #   PREFILL: ar=1 (head prefill consumes a single hidden vector after target verify)
-        #   DECODE:  ar=1 (chain head step)
-        # NOTE: EAGLE head always processes 1 token per call. There is no need
-        # to expose prefill_ar_len here.
-        ar_len = 1
+        # Static shapes for the two head graphs. QNN graphs are not dynamically
+        # shaped, so runtime can only use <= these values via padding.
+        if mode == Mode.PREFILL:
+            ar_len = max(1, int(getattr(control_args, "prefill_ar_len_eagle", 1)))
+        else:
+            ar_len = max(1, int(getattr(control_args, "tree_topk", 1)))
         max_ctx = control_args.max_context_len
 
         self.head = EagleHead(head_cfg, mode, ar_len, max_ctx)

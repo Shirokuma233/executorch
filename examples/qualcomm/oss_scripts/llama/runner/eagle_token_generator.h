@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <array>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace example {
@@ -57,6 +58,8 @@ class EagleTokenGenerator : public TokenGenerator {
     int32_t head_n_kv_heads;     // 8 for Qwen3 head
     int32_t head_head_dim;       // 128
     int32_t max_tree_size;       // Phase 4: total nodes in tree
+    int32_t tree_depth;          // EAGLE tree expansion depth
+    int32_t tree_topk;           // EAGLE per-node top-k
 
     // Hidden-state layer indices (low/mid/high) — informational only.
     int low_layer_idx;
@@ -139,6 +142,18 @@ class EagleTokenGenerator : public TokenGenerator {
       uint64_t prev_token,
       int64_t rope_pos,
       int64_t cache_pos);
+  void head_prefill_batch(
+      const float* hidden_LMH, // [valid_count, 3 * hidden_dim]
+      const uint64_t* prev_tokens,
+      int32_t valid_count,
+      int64_t rope_pos,
+      int64_t cache_pos);
+
+  struct DraftChoice {
+    uint64_t draft_id;
+    uint64_t target_id;
+    double logp;
+  };
 
   // Run head.kv_forward(prev_a, emb(prev_token)) for one step and return the
   // sampled draft id. Writes the new `prev_a` to `prev_a_buffer`.
@@ -149,6 +164,16 @@ class EagleTokenGenerator : public TokenGenerator {
       int64_t rope_pos,
       int64_t cache_pos,
       float* prev_a_buffer);
+  void head_decode_batch(
+      const std::vector<float>& prev_a_batch,
+      const std::vector<uint64_t>& prev_tokens,
+      const std::vector<std::vector<int32_t>>& visible_past_slots,
+      int64_t stable_cache_len,
+      int64_t rope_pos,
+      int64_t cache_pos,
+      int32_t topk,
+      std::vector<float>* next_prev_batch,
+      std::vector<std::vector<DraftChoice>>* choices_by_parent);
 
   // ---- Verify path (target module) ----
   // Pack [last_committed, draft1, ..., draftN] into target ar slot, fill the
@@ -166,6 +191,45 @@ class EagleTokenGenerator : public TokenGenerator {
   // ---- Sampling ----
   // 32000-way argmax over the head's draft logits.
   uint64_t sample_draft(const std::byte* draft_logits_buf);
+
+  struct TreeNode {
+    int parent;
+    int depth;
+    int cache_slot;
+    uint64_t target_id;
+    double score;
+    std::vector<uint64_t> path;
+    std::vector<int32_t> visible_past_slots;
+  };
+
+  struct TreeProposal {
+    std::vector<TreeNode> nodes;
+    std::vector<uint64_t> packed_tokens;
+    std::vector<int32_t> parent_slots;
+    std::vector<int32_t> position_offsets;
+    std::vector<std::vector<int32_t>> retrieve_indices;
+  };
+
+  std::vector<DraftChoice> topk_from_head_logits(int32_t topk) const;
+  std::vector<DraftChoice> topk_from_logits_slot(
+      const std::byte* logits,
+      executorch::aten::ScalarType dtype,
+      int32_t slot,
+      int32_t topk) const;
+  void replay_head_path(
+      const std::vector<float>& stable_prev_a,
+      const std::vector<uint64_t>& path,
+      int64_t stable_head_cache_pos,
+      std::vector<float>* out_prev_a);
+  TreeProposal build_tree_proposal(
+      uint64_t root_token,
+      const std::vector<float>& stable_prev_a,
+      int64_t stable_head_cache_pos);
+  void target_verify_tree(
+      const TreeProposal& proposal,
+      int64_t cur_pos,
+      std::vector<uint64_t>* target_sampled_tokens,
+      std::vector<float>* out_hidden_LMH_per_slot);
 
   // ---- Members ----
   executorch::extension::Module* head_module_;

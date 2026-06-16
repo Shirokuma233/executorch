@@ -572,15 +572,35 @@ def _build_parser():
     )
     parser.add_argument(
         "--max_tree_size",
-        default=16,
+        default=0,
         type=int,
-        help="[Eagle mode] Max nodes in draft tree. Target kv_forward ar_len = next_power_of_two(max_tree_size).",
+        help="[Eagle mode] Max nodes in draft tree including the root. "
+        "If 0, defaults to 1 + tree_topk * (tree_depth + 1).",
     )
     parser.add_argument(
         "--draft_len",
         default=4,
         type=int,
         help="[Eagle mode] Chain-mode draft length (used in Phase 3 chain fallback).",
+    )
+    parser.add_argument(
+        "--tree_depth",
+        default=4,
+        type=int,
+        help="[Eagle mode] EAGLE tree expansion depth. Set 0 to use chain mode.",
+    )
+    parser.add_argument(
+        "--tree_topk",
+        default=4,
+        type=int,
+        help="[Eagle mode] EAGLE top-k branches retained at each tree expansion.",
+    )
+    parser.add_argument(
+        "--prefill_ar_len_eagle",
+        default=0,
+        type=int,
+        help="[Eagle mode] Static ar_len for the EAGLE head prefill graph. "
+        "If 0, defaults to --prefill_ar_len.",
     )
     parser.add_argument(
         "--eagle_draft_backend",
@@ -748,10 +768,16 @@ def export_llama(args) -> None:
         assert (
             args.eagle_head_checkpoint is not None or args.pre_gen_pte
         ), "Eagle mode requires --eagle_head_checkpoint or --pre_gen_pte."
+        if args.prefill_ar_len_eagle <= 0:
+            args.prefill_ar_len_eagle = args.prefill_ar_len
+        assert (
+            args.max_context_len >= args.prefill_ar_len_eagle
+        ), "Please ensure max_context_len is >= prefill_ar_len_eagle"
+        if args.max_tree_size <= 0 and args.tree_depth > 0 and args.tree_topk > 0:
+            args.max_tree_size = 1 + args.tree_topk * (args.tree_depth + 1)
         # Override target prefill_ar_len so it doubles as the verify ar_len.
-        # Phase 4 (tree): next_pow2(max_tree_size).
-        # Phase 3 (chain): next_pow2(draft_len + 1).
-        if args.tree_topology:
+        # Tree mode: next_pow2(max_tree_size). Chain mode: next_pow2(draft_len + 1).
+        if args.tree_depth > 0 and args.tree_topk > 0:
             verify_ar = next_power_of_two(args.max_tree_size)
         else:
             verify_ar = next_power_of_two(args.draft_len + 1)

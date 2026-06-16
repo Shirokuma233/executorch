@@ -291,14 +291,17 @@ class DefaultEval(EvalBase):
         self.eagle_bin_files = []
         if args.model_mode == "eagle":
             eagle_head_basename = os.path.basename(self.pte_paths.get(EAGLE_HEAD, ""))
+            eagle_sidecar_dir = os.path.dirname(self.pte_paths.get(EAGLE_HEAD, ""))
+            if not eagle_sidecar_dir:
+                eagle_sidecar_dir = args.pre_gen_pte if args.pre_gen_pte else args.artifact
             eagle_head_path = (
                 eagle_head_basename
                 if not args.enable_x86_64
                 else self.pte_paths.get(EAGLE_HEAD, "")
             )
-            eagle_d2t_path = os.path.join(args.artifact, "d2t.bin")
-            eagle_t2d_path = os.path.join(args.artifact, "t2d.bin")
-            eagle_embed_path = os.path.join(args.artifact, "embed.bin")
+            eagle_d2t_path = os.path.join(eagle_sidecar_dir, "d2t.bin")
+            eagle_t2d_path = os.path.join(eagle_sidecar_dir, "t2d.bin")
+            eagle_embed_path = os.path.join(eagle_sidecar_dir, "embed.bin")
             if args.enable_x86_64:
                 eagle_d2t_arg = eagle_d2t_path
                 eagle_t2d_arg = eagle_t2d_path
@@ -317,6 +320,8 @@ class DefaultEval(EvalBase):
                     f"--eagle_head_path {eagle_head_path}",
                     f"--max_tree_size {args.max_tree_size}",
                     f"--draft_len {args.draft_len}",
+                    f"--tree_depth {args.tree_depth}",
+                    f"--tree_topk {args.tree_topk}",
                     f"--eagle_d2t_path {eagle_d2t_arg}",
                     f"--eagle_t2d_path {eagle_t2d_arg}",
                     f"--eagle_embed_path {eagle_embed_arg}",
