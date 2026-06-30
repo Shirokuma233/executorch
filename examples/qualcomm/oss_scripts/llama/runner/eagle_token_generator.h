@@ -210,12 +210,12 @@ class EagleTokenGenerator : public TokenGenerator {
     std::vector<std::vector<int32_t>> retrieve_indices;
   };
 
-  std::vector<DraftChoice> topk_from_head_logits(int32_t topk) const;
+  std::vector<DraftChoice> topk_from_head_logits(int32_t topk);
   std::vector<DraftChoice> topk_from_logits_slot(
       const std::byte* logits,
       executorch::aten::ScalarType dtype,
       int32_t slot,
-      int32_t topk) const;
+      int32_t topk);
   void replay_head_path(
       const std::vector<float>& stable_prev_a,
       const std::vector<uint64_t>& path,
@@ -292,9 +292,25 @@ class EagleTokenGenerator : public TokenGenerator {
   uint64_t target_verify_calls_{0};
   uint64_t head_decode_calls_{0};
   uint64_t head_prefill_calls_{0};
+  uint64_t draft_topk_calls_{0};
+  uint64_t head_decode_cpu_calls_{0};
+  uint64_t head_prefill_cpu_calls_{0};
+  uint64_t target_tree_prepare_calls_{0};
+  uint64_t target_tree_sample_calls_{0};
+  uint64_t target_hidden_copy_calls_{0};
+  uint64_t tree_build_cpu_calls_{0};
+  uint64_t tree_accept_calls_{0};
   double target_verify_time_ms_{0.0};
   double head_decode_time_ms_{0.0};
   double head_prefill_time_ms_{0.0};
+  double draft_topk_time_ms_{0.0};
+  double head_decode_cpu_time_ms_{0.0};
+  double head_prefill_cpu_time_ms_{0.0};
+  double target_tree_prepare_time_ms_{0.0};
+  double target_tree_sample_time_ms_{0.0};
+  double target_hidden_copy_time_ms_{0.0};
+  double tree_build_cpu_time_ms_{0.0};
+  double tree_accept_time_ms_{0.0};
 
   // Phase 4 tree config. Empty => chain mode.
   std::vector<int> tree_branching_per_depth_;

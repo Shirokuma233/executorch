@@ -436,6 +436,7 @@ void EagleTokenGenerator::head_prefill_batch(
   }
   const int H = eagle_meta_.hidden_dim;
   const int H3 = 3 * H;
+  const long cpu_start_ms = time_in_ms();
   auto h_meta = head_prefill_method_meta_->input_tensor_meta(0).get();
   auto e_meta = head_prefill_method_meta_->input_tensor_meta(1).get();
   auto m_meta = head_prefill_method_meta_->input_tensor_meta(2).get();
@@ -588,18 +589,22 @@ void EagleTokenGenerator::head_prefill_batch(
       "[Eagle] head prefill_forward set_outputs failed");
 
   ET_LOG(
-      Info,
+      Debug,
       "[Eagle] exec head prefill_forward rope=%lld cache=%lld ar=%d n=%d",
       static_cast<long long>(rope_pos),
       static_cast<long long>(cache_pos),
       ar,
       valid_count);
+  head_prefill_cpu_time_ms_ +=
+      static_cast<double>(time_in_ms() - cpu_start_ms);
+  ++head_prefill_cpu_calls_;
   long start_ms = time_in_ms();
   auto res = head_module_->execute("prefill_forward", head_inputs);
   head_prefill_time_ms_ += static_cast<double>(time_in_ms() - start_ms);
   ++head_prefill_calls_;
   ET_CHECK_MSG(res.ok(), "[Eagle] head prefill_forward execute failed");
 
+  const long post_cpu_start_ms = time_in_ms();
   std::vector<bool> selected(static_cast<size_t>(ar), false);
   for (int k = 0; k < valid_count; ++k) {
     selected[static_cast<size_t>(k)] = true;
@@ -619,6 +624,8 @@ void EagleTokenGenerator::head_prefill_batch(
       head_prev_feature_buf_.data(),
       pf_buf.data() + static_cast<size_t>(last) * prev_stride,
       prev_stride);
+  head_prefill_cpu_time_ms_ +=
+      static_cast<double>(time_in_ms() - post_cpu_start_ms);
 }
 
 // ---------------------------------------------------------------------------
@@ -664,8 +671,9 @@ void EagleTokenGenerator::head_decode_batch(
     int64_t cache_pos,
     int32_t topk,
     std::vector<float>* next_prev_batch,
-    std::vector<std::vector<DraftChoice>>* choices_by_parent) {
+      std::vector<std::vector<DraftChoice>>* choices_by_parent) {
   const int H = eagle_meta_.hidden_dim;
+  const long cpu_start_ms = time_in_ms();
   auto pf_in_meta = head_kv_method_meta_->input_tensor_meta(0).get();
   auto e_meta = head_kv_method_meta_->input_tensor_meta(1).get();
   auto m_meta = head_kv_method_meta_->input_tensor_meta(2).get();
@@ -852,18 +860,22 @@ void EagleTokenGenerator::head_decode_batch(
   ET_CHECK_MSG(set_err == Error::Ok, "[Eagle] head kv_forward set_outputs failed");
 
   ET_LOG(
-      Info,
+      Debug,
       "[Eagle] exec head kv_forward rope=%lld cache=%lld ar=%d n=%d",
       static_cast<long long>(rope_pos),
       static_cast<long long>(cache_pos),
       ar,
       valid_count);
+  head_decode_cpu_time_ms_ +=
+      static_cast<double>(time_in_ms() - cpu_start_ms);
+  ++head_decode_cpu_calls_;
   long start_ms = time_in_ms();
   auto res = head_module_->execute("kv_forward", head_inputs);
   head_decode_time_ms_ += static_cast<double>(time_in_ms() - start_ms);
   ++head_decode_calls_;
   ET_CHECK_MSG(res.ok(), "[Eagle] head kv_forward execute failed");
 
+  const long post_cpu_start_ms = time_in_ms();
   std::vector<bool> selected(static_cast<size_t>(ar), false);
   for (int k = 0; k < valid_count; ++k) {
     selected[static_cast<size_t>(k)] = true;
@@ -889,6 +901,8 @@ void EagleTokenGenerator::head_decode_batch(
   }
   choices_by_parent->clear();
   choices_by_parent->reserve(static_cast<size_t>(valid_count));
+  head_decode_cpu_time_ms_ +=
+      static_cast<double>(time_in_ms() - post_cpu_start_ms);
   for (int k = 0; k < valid_count; ++k) {
     choices_by_parent->push_back(
         topk_from_logits_slot(logits_buf.data(), logits_meta.scalar_type(), k, topk));
@@ -1002,7 +1016,7 @@ uint64_t EagleTokenGenerator::sample_draft(const std::byte* draft_logits_buf) {
 }
 
 std::vector<EagleTokenGenerator::DraftChoice>
-EagleTokenGenerator::topk_from_head_logits(int32_t topk) const {
+EagleTokenGenerator::topk_from_head_logits(int32_t topk) {
   return topk_from_logits_slot(
       head_logits_buf_.data(), head_logits_dtype_, /*slot=*/0, topk);
 }
@@ -1012,10 +1026,18 @@ EagleTokenGenerator::topk_from_logits_slot(
     const std::byte* logits_buf,
     ScalarType dtype,
     int32_t slot,
-    int32_t topk) const {
+    int32_t topk) {
+  const long start_ms = time_in_ms();
   const int32_t vocab = eagle_meta_.draft_vocab_size;
   topk = std::max<int32_t>(1, std::min<int32_t>(topk, vocab));
-  std::vector<double> logits(static_cast<size_t>(vocab));
+
+  struct TopEntry {
+    int32_t index;
+    double logit;
+  };
+
+  std::vector<TopEntry> top_entries;
+  top_entries.reserve(static_cast<size_t>(topk));
   double max_logit = -std::numeric_limits<double>::infinity();
   const size_t base = static_cast<size_t>(slot) * static_cast<size_t>(vocab);
   for (int32_t i = 0; i < vocab; ++i) {
@@ -1026,40 +1048,48 @@ EagleTokenGenerator::topk_from_logits_slot(
       value = fp16_to_fp32(
           reinterpret_cast<const uint16_t*>(logits_buf)[base + i]);
     }
-    logits[static_cast<size_t>(i)] = value;
     max_logit = std::max(max_logit, value);
+
+    auto insert_pos = top_entries.begin();
+    while (insert_pos != top_entries.end() &&
+           (insert_pos->logit > value ||
+            (insert_pos->logit == value && insert_pos->index < i))) {
+      ++insert_pos;
+    }
+    if (static_cast<int32_t>(top_entries.size()) < topk) {
+      top_entries.insert(insert_pos, TopEntry{i, value});
+    } else if (insert_pos != top_entries.end()) {
+      top_entries.insert(insert_pos, TopEntry{i, value});
+      top_entries.pop_back();
+    }
   }
 
   double sum_exp = 0.0;
-  for (double value : logits) {
-    sum_exp += std::exp(value - max_logit);
+  if (dtype == ScalarType::Float) {
+    const float* logits = reinterpret_cast<const float*>(logits_buf) + base;
+    for (int32_t i = 0; i < vocab; ++i) {
+      sum_exp += std::exp(static_cast<double>(logits[i]) - max_logit);
+    }
+  } else {
+    const uint16_t* logits =
+        reinterpret_cast<const uint16_t*>(logits_buf) + base;
+    for (int32_t i = 0; i < vocab; ++i) {
+      sum_exp += std::exp(fp16_to_fp32(logits[i]) - max_logit);
+    }
   }
   const double logsum = max_logit + std::log(sum_exp);
 
-  std::vector<int32_t> indices(static_cast<size_t>(vocab));
-  std::iota(indices.begin(), indices.end(), 0);
-  std::partial_sort(
-      indices.begin(),
-      indices.begin() + topk,
-      indices.end(),
-      [&](int32_t a, int32_t b) {
-        const double la = logits[static_cast<size_t>(a)];
-        const double lb = logits[static_cast<size_t>(b)];
-        if (la == lb) {
-          return a < b;
-        }
-        return la > lb;
-      });
-
   std::vector<DraftChoice> out;
   out.reserve(static_cast<size_t>(topk));
-  for (int32_t i = 0; i < topk; ++i) {
-    const uint64_t draft_id = static_cast<uint64_t>(indices[static_cast<size_t>(i)]);
+  for (const TopEntry& entry : top_entries) {
+    const uint64_t draft_id = static_cast<uint64_t>(entry.index);
     out.push_back(DraftChoice{
         draft_id,
         draft_to_target(draft_id),
-        logits[static_cast<size_t>(draft_id)] - logsum});
+        entry.logit - logsum});
   }
+  draft_topk_time_ms_ += static_cast<double>(time_in_ms() - start_ms);
+  ++draft_topk_calls_;
   return out;
 }
 
@@ -1089,6 +1119,8 @@ EagleTokenGenerator::TreeProposal EagleTokenGenerator::build_tree_proposal(
     uint64_t root_token,
     const std::vector<float>& stable_prev_a,
     int64_t stable_head_cache_pos) {
+  double non_graph_time_ms = 0.0;
+  long cpu_start_ms = time_in_ms();
   const int32_t depth = std::max<int32_t>(0, eagle_meta_.tree_depth);
   const int32_t topk = std::max<int32_t>(1, eagle_meta_.tree_topk);
   int32_t max_tree_nodes = eagle_meta_.max_tree_size > 0
@@ -1107,10 +1139,11 @@ EagleTokenGenerator::TreeProposal EagleTokenGenerator::build_tree_proposal(
 
   std::vector<TreeNode> all_nodes;
   std::vector<int32_t> active;
-  auto initial = topk_from_head_logits(topk);
-  all_nodes.reserve(
-      static_cast<size_t>(topk + depth * topk * topk));
+  all_nodes.reserve(static_cast<size_t>(topk + depth * topk * topk));
   active.reserve(static_cast<size_t>(topk));
+  non_graph_time_ms += static_cast<double>(time_in_ms() - cpu_start_ms);
+  auto initial = topk_from_head_logits(topk);
+  cpu_start_ms = time_in_ms();
   for (const DraftChoice& choice : initial) {
     all_nodes.push_back(TreeNode{
         /*parent=*/-1,
@@ -1127,8 +1160,10 @@ EagleTokenGenerator::TreeProposal EagleTokenGenerator::build_tree_proposal(
   for (auto& prev : node_prev_features) {
     prev = stable_prev_a;
   }
+  non_graph_time_ms += static_cast<double>(time_in_ms() - cpu_start_ms);
   int64_t generated_cache_slots = 0;
   for (int32_t level = 0; level < depth && !active.empty(); ++level) {
+    cpu_start_ms = time_in_ms();
     const int32_t batch = static_cast<int32_t>(active.size());
     std::vector<float> prev_batch(static_cast<size_t>(batch) * eagle_meta_.hidden_dim);
     std::vector<uint64_t> token_batch(static_cast<size_t>(batch));
@@ -1148,6 +1183,7 @@ EagleTokenGenerator::TreeProposal EagleTokenGenerator::build_tree_proposal(
     std::vector<float> next_prev_batch;
     std::vector<std::vector<DraftChoice>> choices_by_parent;
     const int64_t batch_cache_pos = stable_head_cache_pos + generated_cache_slots;
+    non_graph_time_ms += static_cast<double>(time_in_ms() - cpu_start_ms);
     head_decode_batch(
         prev_batch,
         token_batch,
@@ -1158,6 +1194,7 @@ EagleTokenGenerator::TreeProposal EagleTokenGenerator::build_tree_proposal(
         topk,
         &next_prev_batch,
         &choices_by_parent);
+    cpu_start_ms = time_in_ms();
     for (int32_t row = 0; row < batch; ++row) {
       all_nodes[static_cast<size_t>(active[static_cast<size_t>(row)])].cache_slot =
           static_cast<int32_t>(batch_cache_pos + row);
@@ -1211,8 +1248,10 @@ EagleTokenGenerator::TreeProposal EagleTokenGenerator::build_tree_proposal(
       children.resize(static_cast<size_t>(topk));
     }
     active = std::move(children);
+    non_graph_time_ms += static_cast<double>(time_in_ms() - cpu_start_ms);
   }
 
+  cpu_start_ms = time_in_ms();
   std::vector<int32_t> ranked(static_cast<size_t>(all_nodes.size()));
   std::iota(ranked.begin(), ranked.end(), 0);
   std::partial_sort(
@@ -1307,6 +1346,10 @@ EagleTokenGenerator::TreeProposal EagleTokenGenerator::build_tree_proposal(
     proposal.retrieve_indices.push_back(std::vector<int32_t>{0});
   }
 
+  non_graph_time_ms += static_cast<double>(time_in_ms() - cpu_start_ms);
+  tree_build_cpu_time_ms_ += non_graph_time_ms;
+  ++tree_build_cpu_calls_;
+
   ET_LOG(
       Debug,
       "[Eagle] tree proposal nodes=%zu leaves=%zu depth=%d topk=%d",
@@ -1326,6 +1369,7 @@ void EagleTokenGenerator::target_verify_tree(
   const int n = static_cast<int>(proposal.packed_tokens.size());
   ET_CHECK_MSG(n <= ar, "[Eagle] tree proposal is larger than target ar_len");
 
+  const long prepare_start_ms = time_in_ms();
   for (int k = 0; k < ar; ++k) {
     int64_t tok = (k < n) ? static_cast<int64_t>(proposal.packed_tokens[k]) : 0;
     if (eagle_meta_.use_int64_token) {
@@ -1349,9 +1393,12 @@ void EagleTokenGenerator::target_verify_tree(
   }
   kv_manager_->init_attention_mask(
       attention_mask_.data, attention_map, ar, static_cast<int32_t>(cur_pos));
+  target_tree_prepare_time_ms_ +=
+      static_cast<double>(time_in_ms() - prepare_start_ms);
+  ++target_tree_prepare_calls_;
 
   ET_LOG(
-      Info,
+      Debug,
       "[Eagle] exec target tree %s cur_pos=%lld ar=%d n=%d candidate_paths=%zu",
       method_name_.c_str(),
       static_cast<long long>(cur_pos),
@@ -1365,12 +1412,17 @@ void EagleTokenGenerator::target_verify_tree(
   ET_CHECK_MSG(logits_res.ok(), "[Eagle] target tree verify step failed");
   executorch::aten::Tensor& logits_tensor = logits_res.get();
 
+  const long sample_start_ms = time_in_ms();
   target_sampled_tokens->resize(static_cast<size_t>(ar));
   for (int k = 0; k < ar; ++k) {
     int32_t tok = decoder_runner_->logits_to_token(logits_tensor, k);
     (*target_sampled_tokens)[k] = static_cast<uint64_t>(tok);
   }
+  target_tree_sample_time_ms_ +=
+      static_cast<double>(time_in_ms() - sample_start_ms);
+  ++target_tree_sample_calls_;
 
+  const long hidden_copy_start_ms = time_in_ms();
   const int H = eagle_meta_.hidden_dim;
   const int H3 = 3 * H;
   out_hidden_LMH_per_slot->assign(
@@ -1396,6 +1448,9 @@ void EagleTokenGenerator::target_verify_tree(
   if (!target_hidden_high_buf_.empty()) {
     copy_hidden(target_hidden_high_buf_, target_hidden_dtypes_[2], 2 * H);
   }
+  target_hidden_copy_time_ms_ +=
+      static_cast<double>(time_in_ms() - hidden_copy_start_ms);
+  ++target_hidden_copy_calls_;
 }
 
 // ---------------------------------------------------------------------------
@@ -1414,9 +1469,25 @@ Result<int64_t> EagleTokenGenerator::generate(
   target_verify_calls_ = 0;
   head_decode_calls_ = 0;
   head_prefill_calls_ = 0;
+  draft_topk_calls_ = 0;
+  head_decode_cpu_calls_ = 0;
+  head_prefill_cpu_calls_ = 0;
+  target_tree_prepare_calls_ = 0;
+  target_tree_sample_calls_ = 0;
+  target_hidden_copy_calls_ = 0;
+  tree_build_cpu_calls_ = 0;
+  tree_accept_calls_ = 0;
   target_verify_time_ms_ = 0.0;
   head_decode_time_ms_ = 0.0;
   head_prefill_time_ms_ = 0.0;
+  draft_topk_time_ms_ = 0.0;
+  head_decode_cpu_time_ms_ = 0.0;
+  head_prefill_cpu_time_ms_ = 0.0;
+  target_tree_prepare_time_ms_ = 0.0;
+  target_tree_sample_time_ms_ = 0.0;
+  target_hidden_copy_time_ms_ = 0.0;
+  tree_build_cpu_time_ms_ = 0.0;
+  tree_accept_time_ms_ = 0.0;
 
   const bool tree_mode = eagle_meta_.tree_depth > 0 && eagle_meta_.tree_topk > 0;
 
@@ -1503,7 +1574,7 @@ Result<int64_t> EagleTokenGenerator::generate(
   // ---- Main loop ----
   while (cur_pos < static_cast<int64_t>(seq_len) - 1) {
     ET_LOG(
-        Info,
+        Debug,
         "[Eagle] loop cur_pos=%lld",
         static_cast<long long>(cur_pos));
     if (tree_mode) {
@@ -1529,6 +1600,7 @@ Result<int64_t> EagleTokenGenerator::generate(
       target_verify_tree(
           proposal, cur_pos, &target_sampled, &hidden_LMH_per_slot);
 
+      const long accept_start_ms = time_in_ms();
       int best_leaf = 0;
       int best_accept = 0;
       for (int leaf = 0;
@@ -1551,6 +1623,8 @@ Result<int64_t> EagleTokenGenerator::generate(
           best_leaf = leaf;
         }
       }
+      tree_accept_time_ms_ += static_cast<double>(time_in_ms() - accept_start_ms);
+      ++tree_accept_calls_;
 
       const std::vector<int32_t>& best_path =
           proposal.retrieve_indices[static_cast<size_t>(best_leaf)];
@@ -1829,6 +1903,76 @@ done:
           ? 0.0
           : head_prefill_time_ms_ /
               static_cast<double>(head_prefill_calls_));
+  if (head_decode_cpu_calls_ > 0) {
+    ET_LOG(
+        Info,
+        "[Eagle] profile head_decode_cpu: calls=%llu total=%.3fms avg=%.3fms",
+        static_cast<unsigned long long>(head_decode_cpu_calls_),
+        head_decode_cpu_time_ms_,
+        head_decode_cpu_time_ms_ /
+            static_cast<double>(head_decode_cpu_calls_));
+  }
+  if (head_prefill_cpu_calls_ > 0) {
+    ET_LOG(
+        Info,
+        "[Eagle] profile head_prefill_cpu: calls=%llu total=%.3fms avg=%.3fms",
+        static_cast<unsigned long long>(head_prefill_cpu_calls_),
+        head_prefill_cpu_time_ms_,
+        head_prefill_cpu_time_ms_ /
+            static_cast<double>(head_prefill_cpu_calls_));
+  }
+  if (draft_topk_calls_ > 0) {
+    ET_LOG(
+        Info,
+        "[Eagle] profile draft_topk_cpu: calls=%llu total=%.3fms avg=%.3fms",
+        static_cast<unsigned long long>(draft_topk_calls_),
+        draft_topk_time_ms_,
+        draft_topk_time_ms_ / static_cast<double>(draft_topk_calls_));
+  }
+  if (tree_build_cpu_calls_ > 0) {
+    ET_LOG(
+        Info,
+        "[Eagle] profile tree_build_cpu: calls=%llu total=%.3fms avg=%.3fms",
+        static_cast<unsigned long long>(tree_build_cpu_calls_),
+        tree_build_cpu_time_ms_,
+        tree_build_cpu_time_ms_ /
+            static_cast<double>(tree_build_cpu_calls_));
+  }
+  if (target_tree_prepare_calls_ > 0) {
+    ET_LOG(
+        Info,
+        "[Eagle] profile target_tree_prepare_cpu: calls=%llu total=%.3fms avg=%.3fms",
+        static_cast<unsigned long long>(target_tree_prepare_calls_),
+        target_tree_prepare_time_ms_,
+        target_tree_prepare_time_ms_ /
+            static_cast<double>(target_tree_prepare_calls_));
+  }
+  if (target_tree_sample_calls_ > 0) {
+    ET_LOG(
+        Info,
+        "[Eagle] profile target_tree_sample_cpu: calls=%llu total=%.3fms avg=%.3fms",
+        static_cast<unsigned long long>(target_tree_sample_calls_),
+        target_tree_sample_time_ms_,
+        target_tree_sample_time_ms_ /
+            static_cast<double>(target_tree_sample_calls_));
+  }
+  if (target_hidden_copy_calls_ > 0) {
+    ET_LOG(
+        Info,
+        "[Eagle] profile target_hidden_copy_cpu: calls=%llu total=%.3fms avg=%.3fms",
+        static_cast<unsigned long long>(target_hidden_copy_calls_),
+        target_hidden_copy_time_ms_,
+        target_hidden_copy_time_ms_ /
+            static_cast<double>(target_hidden_copy_calls_));
+  }
+  if (tree_accept_calls_ > 0) {
+    ET_LOG(
+        Info,
+        "[Eagle] profile tree_accept_cpu: calls=%llu total=%.3fms avg=%.3fms",
+        static_cast<unsigned long long>(tree_accept_calls_),
+        tree_accept_time_ms_,
+        tree_accept_time_ms_ / static_cast<double>(tree_accept_calls_));
+  }
   return cur_pos - start_pos;
 }
 
