@@ -24,6 +24,12 @@ ATTENTION_SINK_EVICTOR = "attention_sink_evictor"
 EAGLE_TARGET = "eagle_target"
 EAGLE_HEAD = "eagle_head"
 
+# DFlash mode component identifiers
+DFLASH_TARGET = "dflash_target"
+DFLASH_DRAFT = "dflash_draft"
+# DFlash draft is a single block-diffusion graph (no prefill/decode split).
+DFLASH_GRAPH_NAMES = ["dflash_block"]
+
 # Mapping of input flags for the runner
 MODALITY_INPUT_FLAG_MAP = {
     AUDIO_ENCODER: "audio_path",
@@ -45,6 +51,7 @@ EVAL_MODE = {
     "hybrid": 1,
     "lookahead": 2,
     "eagle": 3,
+    "dflash": 4,
 }
 # The dict's value is mainly for runner to decide what special tokens are required to wrap the prompt.
 DECODER_MODEL_VERSION = {
@@ -63,6 +70,7 @@ DECODER_MODEL_VERSION = {
     "qwen2_5-1_5b": "qwen2_5",
     "qwen3-0_6b": "qwen3",
     "qwen3-1_7b": "qwen3",
+    "qwen3-4b": "qwen3",
     "smollm2_135m": "smollm2_135m",
     "smollm3-3b": "smollm3",
     "glm-1_5b": "glm",

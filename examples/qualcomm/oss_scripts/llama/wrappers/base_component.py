@@ -97,6 +97,9 @@ def process_model_args(
                 ar_len = next_power_of_two(control_args.max_tree_size)
             else:
                 ar_len = next_power_of_two(control_args.draft_len + 1)
+        elif control_args.model_mode == "dflash":
+            # Target verifies a whole draft block per step.
+            ar_len = next_power_of_two(control_args.block_size)
         else:
             ar_len = 1
     else:

@@ -121,6 +121,27 @@ DEFINE_string(
     "",
     "[Eagle Decoding] Path to embed.bin (fp16[target_vocab, hidden]). "
     "Default: <eagle_head dir>/embed.bin");
+DEFINE_string(
+    dflash_draft_path,
+    "",
+    "[DFlash Decoding] Path to the compiled DFlash draft pte.");
+DEFINE_int32(
+    block_size,
+    16,
+    "[DFlash Decoding] Draft block size (drafts block_size-1 tokens per step).");
+DEFINE_int32(
+    dflash_max_context_len,
+    0,
+    "[DFlash Decoding] Fixed context length the draft attends to (0 => model).");
+DEFINE_string(
+    dflash_embed_path,
+    "",
+    "[DFlash Decoding] Path to embed.bin (fp16[target_vocab, hidden]). "
+    "Default: <dflash_draft dir>/embed.bin");
+DEFINE_string(
+    dflash_lm_head_path,
+    "",
+    "[DFlash Decoding] Path to lm_head.bin. Empty => reuse embed.bin (tied).");
 
 std::vector<std::string> CollectPrompts(int argc, char** argv) {
   // Collect all prompts from command line, example usage:
@@ -252,7 +273,10 @@ void start_runner(
     std::unique_ptr<executorch::extension::Module> eagle_head_module,
     const std::string& eagle_d2t_path,
     const std::string& eagle_t2d_path,
-    const std::string& eagle_embed_path) {
+    const std::string& eagle_embed_path,
+    std::unique_ptr<executorch::extension::Module> dflash_draft_module,
+    const std::string& dflash_embed_path,
+    const std::string& dflash_lm_head_path) {
   bool use_tokenized_prompt =
       gflags::GetCommandLineFlagInfoOrDie("tokenized_prompt").is_default ? false
                                                                          : true;
@@ -279,7 +303,12 @@ void start_runner(
       FLAGS_tree_topk,
       eagle_d2t_path,
       eagle_t2d_path,
-      eagle_embed_path);
+      eagle_embed_path,
+      std::move(dflash_draft_module),
+      FLAGS_block_size,
+      FLAGS_dflash_max_context_len,
+      dflash_embed_path,
+      dflash_lm_head_path);
   auto decoder_model_version = runner.get_decoder_model_version();
   std::vector<char> buf;
   buf.reserve(5 * FLAGS_seq_len); // assume each token is around 5 char
@@ -370,6 +399,17 @@ int main(int argc, char** argv) {
   std::string embed_path = FLAGS_eagle_embed_path.empty()
       ? sibling_path(FLAGS_eagle_head_path, "embed.bin")
       : FLAGS_eagle_embed_path;
+
+  std::unique_ptr<executorch::extension::Module> dflash_draft_module;
+  if (!FLAGS_dflash_draft_path.empty()) {
+    dflash_draft_module = std::make_unique<executorch::extension::Module>(
+        FLAGS_dflash_draft_path.c_str(),
+        executorch::extension::Module::LoadMode::MmapUseMlockIgnoreErrors);
+  }
+  std::string dflash_embed_path = FLAGS_dflash_embed_path.empty()
+      ? sibling_path(FLAGS_dflash_draft_path, "embed.bin")
+      : FLAGS_dflash_embed_path;
+
   start_runner(
       std::move(module),
       prompts,
@@ -377,7 +417,10 @@ int main(int argc, char** argv) {
       std::move(eagle_head_module),
       d2t_path,
       t2d_path,
-      embed_path);
+      embed_path,
+      std::move(dflash_draft_module),
+      dflash_embed_path,
+      FLAGS_dflash_lm_head_path);
 
   return 0;
 }

@@ -26,6 +26,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
     ATTENTION_SINK_EVICTOR,
     AUDIO_ENCODER,
     DECODER_MODEL_VERSION,
+    DFLASH_DRAFT,
     EAGLE_HEAD,
     EVAL_MODE,
     MODALITY_INPUT_FLAG_MAP,
@@ -327,6 +328,33 @@ class DefaultEval(EvalBase):
                     f"--eagle_embed_path {eagle_embed_arg}",
                 ]
             )
+        dflash_args = ""
+        self.dflash_bin_files = []
+        if args.model_mode == "dflash":
+            draft_basename = os.path.basename(self.pte_paths.get(DFLASH_DRAFT, ""))
+            dflash_sidecar_dir = os.path.dirname(self.pte_paths.get(DFLASH_DRAFT, ""))
+            if not dflash_sidecar_dir:
+                dflash_sidecar_dir = (
+                    args.pre_gen_pte if args.pre_gen_pte else args.artifact
+                )
+            draft_path = (
+                draft_basename
+                if not args.enable_x86_64
+                else self.pte_paths.get(DFLASH_DRAFT, "")
+            )
+            dflash_embed_path = os.path.join(dflash_sidecar_dir, "embed.bin")
+            if args.enable_x86_64:
+                dflash_embed_arg = dflash_embed_path
+            else:
+                dflash_embed_arg = os.path.basename(dflash_embed_path)
+                self.dflash_bin_files = [dflash_embed_path]
+            dflash_args = " ".join(
+                [
+                    f"--dflash_draft_path {draft_path}",
+                    f"--block_size {args.block_size}",
+                    f"--dflash_embed_path {dflash_embed_arg}",
+                ]
+            )
         runner_args = " ".join(
             [
                 f"--eval_mode {EVAL_MODE[args.model_mode]}",
@@ -334,6 +362,7 @@ class DefaultEval(EvalBase):
                 f"--system_prompt '{args.system_prompt}'",
                 lookahead_args if args.model_mode == "lookahead" else "",
                 eagle_args,
+                dflash_args,
             ]
         )
         self.runner_cmd = " ".join(
@@ -392,6 +421,8 @@ class DefaultEval(EvalBase):
                 extra_files.extend(self.modality_input_files)
             if self.eagle_bin_files:
                 extra_files.extend(self.eagle_bin_files)
+            if getattr(self, "dflash_bin_files", None):
+                extra_files.extend(self.dflash_bin_files)
             self.adb.push(inputs=[], files=extra_files)
             # 加上LD_LIBRARY_PATH和ADSP_LIBRARY_PATH
             lib_path_cmd = f"export LD_LIBRARY_PATH={self.device_workspace} && export ADSP_LIBRARY_PATH={self.device_workspace};"

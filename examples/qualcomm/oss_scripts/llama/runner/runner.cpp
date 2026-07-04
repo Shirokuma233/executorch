@@ -13,6 +13,7 @@
 #include <executorch/examples/models/llama/runner/runner.h>
 #include <executorch/examples/models/llama/tokenizer/llama_tiktoken.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/client_mem.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/dflash_token_generator.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/eagle_token_generator.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/lhd_token_generator.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/rpc_mem.h>
@@ -108,7 +109,12 @@ Runner::Runner(
     int tree_topk,
     const std::string& eagle_d2t_path,
     const std::string& eagle_t2d_path,
-    const std::string& eagle_embed_path)
+    const std::string& eagle_embed_path,
+    std::unique_ptr<executorch::extension::Module> dflash_draft_module,
+    int block_size,
+    int dflash_max_context_len,
+    const std::string& dflash_embed_path,
+    const std::string& dflash_lm_head_path)
     : module_(std::move(module)),
       attention_sink_rope_module_(std::move(attention_sink_rope_module)),
       eagle_head_module_(std::move(eagle_head_module)),
@@ -119,6 +125,11 @@ Runner::Runner(
       eagle_d2t_path_(eagle_d2t_path),
       eagle_t2d_path_(eagle_t2d_path),
       eagle_embed_path_(eagle_embed_path),
+      dflash_draft_module_(std::move(dflash_draft_module)),
+      block_size_(block_size),
+      dflash_max_context_len_(dflash_max_context_len),
+      dflash_embed_path_(dflash_embed_path),
+      dflash_lm_head_path_(dflash_lm_head_path),
       ngram_(ngram),
       window_(window),
       gcap_(gcap),
@@ -189,6 +200,7 @@ Error Runner::load() {
     case EvalMode::kHybrid:
     case EvalMode::kLookaheadDecoding:
     case EvalMode::kEagleDecoding:
+    case EvalMode::kDFlashDecoding:
       prompt_processor_method_name = "prefill_forward";
       token_generator_method_name = "kv_forward";
       method_names.emplace_back(prompt_processor_method_name);
@@ -519,6 +531,101 @@ Error Runner::load() {
           head_hidden_size);
     }
     token_generator_ = std::move(eagle_gen);
+  } else if (eval_mode_ == EvalMode::kDFlashDecoding) {
+    ET_CHECK_MSG(
+        dflash_draft_module_ != nullptr,
+        "DFlash mode requires --dflash_draft_path to be set.");
+    ET_CHECK_OK_OR_RETURN_ERROR(
+        dflash_draft_module_->load_method("dflash_block"));
+    auto draft_meta =
+        ET_UNWRAP(dflash_draft_module_->method_meta("dflash_block"));
+
+    auto read_int_meta = [&](const std::string& name, int32_t fb) -> int32_t {
+      if (dflash_draft_module_->method_names()->count(name) > 0) {
+        auto res = dflash_draft_module_->get(name);
+        if (res.ok() && res.get().isInt()) {
+          return static_cast<int32_t>(res.get().toInt());
+        }
+      }
+      return fb;
+    };
+    int32_t block_size = read_int_meta("get_dflash_block_size", block_size_);
+    int32_t hidden_dim = read_int_meta("get_dflash_hidden_size", 0);
+    int32_t num_ctx_layers = read_int_meta("get_dflash_num_ctx_layers", 0);
+    int32_t max_ctx = read_int_meta("get_dflash_max_context_len", context_len_);
+    int64_t mask_token_id = read_int_meta("get_dflash_mask_token_id", 0);
+    ET_LOG(
+        Info,
+        "[DFlash] draft meta: block=%d hidden=%d ctx_layers=%d max_ctx=%d "
+        "mask=%lld target_ar=%d",
+        block_size,
+        hidden_dim,
+        num_ctx_layers,
+        max_ctx,
+        static_cast<long long>(mask_token_id),
+        token_generator_ar_len);
+
+    auto load_fp16_bin = [](const std::string& path) -> std::vector<uint16_t> {
+      std::vector<uint16_t> t;
+      if (path.empty()) {
+        return t;
+      }
+      std::ifstream f(path, std::ios::binary | std::ios::ate);
+      if (f.is_open()) {
+        auto sz = f.tellg();
+        f.seekg(0);
+        t.resize(static_cast<size_t>(sz) / sizeof(uint16_t));
+        f.read(reinterpret_cast<char*>(t.data()), sz);
+      } else {
+        ET_LOG(Error, "[DFlash] cannot open %s", path.c_str());
+      }
+      return t;
+    };
+    std::vector<uint16_t> embed_table = load_fp16_bin(dflash_embed_path_);
+    std::vector<uint16_t> lm_head_table = load_fp16_bin(dflash_lm_head_path_);
+    ET_LOG(
+        Info,
+        "[DFlash] embed.bin=%zu lm_head.bin=%zu (tied=%s)",
+        embed_table.size(),
+        lm_head_table.size(),
+        lm_head_table.empty() ? "yes" : "no");
+
+    DFlashTokenGenerator::Metadata dflash_md{
+        /*target_context_len=*/context_len_,
+        /*target_num_heads=*/num_heads,
+        /*target_num_layers=*/num_layers,
+        /*target_ar_len=*/token_generator_ar_len,
+        /*target_vocab_size=*/vocab_size,
+        /*use_int64_token=*/use_int64_token,
+        /*target_sliding_window=*/sliding_window,
+        /*target_cache_mode=*/cache_mode_,
+        /*block_size=*/block_size,
+        /*hidden_dim=*/hidden_dim,
+        /*num_ctx_layers=*/num_ctx_layers,
+        /*max_context_len=*/max_ctx,
+        /*mask_token_id=*/mask_token_id,
+    };
+
+    auto dflash_gen = std::make_unique<DFlashTokenGenerator>(
+        tokenizer_.get(),
+        decoder_runner_.get(),
+        kv_manager_.get(),
+        dflash_draft_module_.get(),
+        token_generator_method_name,
+        std::move(eos_ids),
+        dflash_md,
+        &stats_,
+        std::make_unique<MethodMeta>(std::move(
+            module_->method_meta(token_generator_method_name).get())),
+        std::make_unique<MethodMeta>(std::move(draft_meta)));
+    if (!embed_table.empty()) {
+      dflash_gen->set_embed_table(
+          std::move(embed_table), vocab_size, hidden_dim);
+    }
+    if (!lm_head_table.empty()) {
+      dflash_gen->set_lm_head_table(std::move(lm_head_table));
+    }
+    token_generator_ = std::move(dflash_gen);
   } else {
     token_generator_ = std::make_unique<TokenGenerator>(
         tokenizer_.get(),
@@ -676,6 +783,12 @@ Error Runner::generate_from_prompt_or_file(
     if (auto* eagle_generator =
             dynamic_cast<EagleTokenGenerator*>(token_generator_.get())) {
       eagle_generator->set_prompt_prefill_hidden(
+          prompt_processor_->get_extra_outputs(), num_prompt_tokens);
+    }
+  } else if (eval_mode_ == EvalMode::kDFlashDecoding) {
+    if (auto* dflash_generator =
+            dynamic_cast<DFlashTokenGenerator*>(token_generator_.get())) {
+      dflash_generator->set_prompt_prefill_hidden(
           prompt_processor_->get_extra_outputs(), num_prompt_tokens);
     }
   }

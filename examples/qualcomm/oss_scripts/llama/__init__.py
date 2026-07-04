@@ -524,6 +524,29 @@ class Qwen3_1_7B(LLMModelConfig):
     quant_recipe = Qwen3_1_7BQuantRecipe
 
 
+@register_llm_model("qwen3-4b")
+@dataclass(init=False, frozen=True)
+class Qwen3_4B(LLMModelConfig):
+    repo_id: str = "Qwen/Qwen3-4B"
+    params_path: str = os.path.join(
+        BASE_DIR, "../../../models/qwen3/config/4b_config.json"
+    )
+    convert_weights = convert_qwen3_weights
+    transform_weight = False
+    instruct_model = True
+    # 4B is ~2.3x the 1.7B params; split the graph so each HTP context binary
+    # fits. Tune if compilation/loading hits HTP size limits.
+    num_sharding = 4
+    masked_softmax = True
+    seq_mse_candidates = 0
+    r1 = False
+    r2 = False
+    r3 = True
+    # The 16a4w recipe is regex/op-target based (not per-layer), so it is
+    # size-agnostic and shared with the 1.7B config.
+    quant_recipe = Qwen3_1_7BQuantRecipe
+
+
 @register_llm_model("smollm2_135m")
 @dataclass(init=False, frozen=True)
 class Smollm2_135M(LLMModelConfig):

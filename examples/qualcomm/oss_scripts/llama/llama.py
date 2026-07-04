@@ -36,6 +36,8 @@ from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
     AUDIO_ENCODER,
     DECODE_QDQ_FILENAME,
     DECODER_GRAPH_NAMES,
+    DFLASH_DRAFT,
+    DFLASH_TARGET,
     EAGLE_HEAD,
     EAGLE_TARGET,
     EVAL_MODE,
@@ -117,6 +119,52 @@ def compile_eagle_head(
             EAGLE_HEAD: os.path.splitext(os.path.basename(eagle_head_pte_path))[0],
         },
         skip_quantize_target=False,
+    )
+
+
+def compile_dflash(
+    args,
+    decoder_model_config: LLMModelConfig,
+    text_decoder_pte_path: str,
+    dflash_draft_pte_path: str,
+    tokenizer,
+    calibration_data,
+):
+    """[DFlash mode] Drive DFlashManager to compile target + draft pte's."""
+    from executorch.examples.qualcomm.oss_scripts.llama.wrappers import DFlashManager
+
+    dflash_mgr = DFlashManager(control_args=args, config=decoder_model_config)
+
+    backend_options = generate_htp_compiler_spec(
+        use_fp16=args.use_fp16,  # --use_fp16: target runs fp16 (draft is always fp16)
+        use_multi_contexts=decoder_model_config.num_sharding > 1,
+        use_weight_sharing=not args.enable_x86_64,
+    )
+    compile_spec_list = [
+        generate_qnn_executorch_compiler_spec(
+            soc_model=get_soc_to_chipset_map()[args.soc_model],
+            backend_options=backend_options,
+            shared_buffer=not args.enable_x86_64,
+            use_mha2sha=True,
+            online_prepare=args.online_prepare,
+        )
+    ] * len(DECODER_GRAPH_NAMES)
+    backend_type = get_backend_type("htp")
+
+    dflash_mgr.quantize(
+        calibration_data=calibration_data,
+        skip_quantize_target=args.use_fp16,
+        tokenizer=tokenizer,
+        backend=backend_type,
+        soc_model=args.soc_model,
+    )
+    dflash_mgr.compile(
+        compile_spec=compile_spec_list,
+        pte_filenames={
+            DFLASH_TARGET: os.path.splitext(os.path.basename(text_decoder_pte_path))[0],
+            DFLASH_DRAFT: os.path.splitext(os.path.basename(dflash_draft_pte_path))[0],
+        },
+        skip_quantize_target=args.use_fp16,
     )
 
 
@@ -639,6 +687,41 @@ def _build_parser():
         "This setting is for compilation. Once you compile with a chosen <sink_size> and <batch_eviction_size>, they cannot be changed at runtime. If you need to update them, you can recompile the attention sink module along with llama.py.",
     )
 
+    # ---- DFlash block-diffusion speculative decoding (model_mode == "dflash") ----
+    parser.add_argument(
+        "--dflash_draft_checkpoint",
+        default=None,
+        type=str,
+        help="[DFlash mode] Path to the DFlash draft checkpoint dir (config.json + model.safetensors).",
+    )
+    parser.add_argument(
+        "--block_size",
+        default=16,
+        type=int,
+        help="[DFlash mode] Draft block size (drafts block_size-1 tokens per step). Must match the draft ckpt.",
+    )
+    parser.add_argument(
+        "--dflash_max_context_len",
+        default=0,
+        type=int,
+        help="[DFlash mode] Fixed context length the draft attends to (0 => max_context_len). "
+        "Larger = more history but bigger/slower draft graph (no-KV-cache first version).",
+    )
+    parser.add_argument(
+        "--dflash_draft_backend",
+        default="htp",
+        choices=["htp", "cpu"],
+        type=str,
+        help="[DFlash mode] Backend the draft graph runs on.",
+    )
+    parser.add_argument(
+        "--enable_thinking",
+        action="store_true",
+        default=False,
+        help="Enable Qwen3 thinking mode in the chat template. Default off "
+        "(DFlash Qwen3-4B draft is trained on the non-thinking distribution).",
+    )
+
     parser.add_argument(
         "--audio_path",
         help="Path to the audio file for multimodal language models (MLLM). If not specified, the default audio from encoder/encoder_config.py will be used. The audio should be preprocessed and saved in raw binary format.",
@@ -789,6 +872,17 @@ def export_llama(args) -> None:
             )
             args.prefill_ar_len = verify_ar
         pte_filename = "eagle_target_qnn"
+    elif args.model_mode == "dflash":
+        assert (
+            args.max_context_len >= args.prefill_ar_len
+        ), "Please ensure max_context_len is >= prefill_ar_len"
+        assert (
+            args.use_attention_sink is None
+        ), "DFlash mode is not compatible with attention sink."
+        assert (
+            args.dflash_draft_checkpoint is not None or args.pre_gen_pte
+        ), "DFlash mode requires --dflash_draft_checkpoint or --pre_gen_pte."
+        pte_filename = "dflash_target_qnn"
     else:
         raise RuntimeError(f"Unknown model_mode: {args.model_mode}.")
 
@@ -806,6 +900,7 @@ def export_llama(args) -> None:
         VISION_ENCODER: f"{VISION_ENCODER}_qnn",
         TOK_EMBEDDING: f"{TOK_EMBEDDING}_qnn",
         EAGLE_HEAD: f"eagle_head_{args.eagle_draft_backend}",
+        DFLASH_DRAFT: f"dflash_draft_{args.dflash_draft_backend}",
     }
     # Prepare tokenizer
     tokenizer_wrapper = TokenizerWrapper(
@@ -829,6 +924,11 @@ def export_llama(args) -> None:
     eagle_head_pte_path = (
         f"{args.artifact}/{pte_filenames[EAGLE_HEAD]}.pte"
         if args.model_mode == "eagle"
+        else None
+    )
+    dflash_draft_pte_path = (
+        f"{args.artifact}/{pte_filenames[DFLASH_DRAFT]}.pte"
+        if args.model_mode == "dflash"
         else None
     )
     encoder_pte_paths = {}
@@ -859,6 +959,10 @@ def export_llama(args) -> None:
         )
         if args.model_mode == "eagle":
             eagle_head_pte_path = f"{args.pre_gen_pte}/{pte_filenames[EAGLE_HEAD]}.pte"
+        if args.model_mode == "dflash":
+            dflash_draft_pte_path = (
+                f"{args.pre_gen_pte}/{pte_filenames[DFLASH_DRAFT]}.pte"
+            )
         encoder_pte_paths = {}
         for modality in [AUDIO_ENCODER, VISION_ENCODER]:
             if hasattr(decoder_model_config, modality):
@@ -898,6 +1002,17 @@ def export_llama(args) -> None:
             decoder_model_config,
             text_decoder_pte_path,
             eagle_head_pte_path,
+            tokenizer,
+            calibration_data,
+        )
+    elif args.model_mode == "dflash":
+        # DFlash bypasses MultiModalManager: DFlashManager compiles the target
+        # (with selected-layer hidden export) + the block-diffusion draft pte.
+        compile_dflash(
+            args,
+            decoder_model_config,
+            text_decoder_pte_path,
+            dflash_draft_pte_path,
             tokenizer,
             calibration_data,
         )

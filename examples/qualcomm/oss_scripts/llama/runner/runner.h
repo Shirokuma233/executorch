@@ -72,7 +72,13 @@ class Runner : public executorch::extension::llm::IRunner {
       int tree_topk = 4,
       const std::string& eagle_d2t_path = "",
       const std::string& eagle_t2d_path = "",
-      const std::string& eagle_embed_path = "");
+      const std::string& eagle_embed_path = "",
+      std::unique_ptr<executorch::extension::Module> dflash_draft_module =
+          nullptr,
+      int block_size = 16,
+      int dflash_max_context_len = 0,
+      const std::string& dflash_embed_path = "",
+      const std::string& dflash_lm_head_path = "");
 
   bool is_loaded() const override;
   executorch::runtime::Error load() override;
@@ -100,6 +106,7 @@ class Runner : public executorch::extension::llm::IRunner {
     kHybrid,
     kLookaheadDecoding,
     kEagleDecoding,
+    kDFlashDecoding,
     kUnsupported,
   };
 
@@ -115,6 +122,13 @@ class Runner : public executorch::extension::llm::IRunner {
   std::string eagle_t2d_path_;
   std::string eagle_embed_path_;
   int32_t context_len_{0};
+
+  // DFlash
+  std::unique_ptr<executorch::extension::Module> dflash_draft_module_;
+  int block_size_{16};
+  int dflash_max_context_len_{0};
+  std::string dflash_embed_path_;
+  std::string dflash_lm_head_path_;
 
   int ngram_{0};
   int window_{0};
