@@ -41,13 +41,31 @@ from torch import nn
 
 
 class RMSNorm(nn.Module):
-    """Qwen3-equivalent RMSNorm. Kept as decomposed primitives (weight.float()
-    hides gamma behind a cast) so the QNN RecomposeRmsNorm pass does not fuse it
-    into an aten.rms_norm the HTP backend rejects.
+    """Qwen3-equivalent RMSNorm, written exactly as HF's Qwen2RMSNorm so that
+    RecomposeRmsNorm fuses it into the QNN native OpRmsNorm.
 
-    The output dtype must be pinned to the input's: `x * rsqrt(fp32)` promotes to
-    fp32, and HTP rejects a conv2d whose activation is fp32 against fp16 weights
-    (validateOpConfig 3110), which silently pushes every linear onto CPU."""
+    Two things must hold, and each one alone is enough to break it.
+
+    `self.weight` must reach the final mul as a bare parameter: the pass wants a
+    get_attr/placeholder/dq there (recompose_rms_norm.py:122) and silently gives up
+    otherwise, so a `weight.float()` is enough to hide it.
+
+    And there must be no dtype cast anywhere. An `x.float()` on the input does get
+    folded into the fused node, but it lands as an OpRmsNorm with a FLOAT_32 input
+    and an fp16 output, and HTP has no op config for that shape -- all 54 norms come
+    back `Failed to validate op ... error 0xc26` (3110) and fall out of the delegate.
+    (RecomposeRmsNorm._get_input_node would step over the cast, except its skip list
+    names aten.to.dtype while export now emits dim_order_ops._to_dim_order_copy.)
+
+    Fusing is the whole ballgame on HTP. The native op holds the sum of squares at
+    fp32 range -- device-verified clean at |x| = 65504, the fp16 ceiling -- while the
+    unfused primitives square in fp16 and blow up past sqrt(65504) ~= 256, which the
+    draft's residual stream clears immediately. Writing `x.float().pow(2)` does not
+    save those either: the cast is declared FLOAT_32 in the QNN graph and overflows
+    on device anyway. See dflash/tools/probe_rmsnorm_accum.py.
+
+    The price is that eager fp16 now overflows where the device does not, so parity
+    must be checked fp32-host against fp16-device, never fp16-host."""
 
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -55,10 +73,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype = x.dtype
-        var = x.float().pow(2).mean(-1, keepdim=True)
-        x = x.float() * torch.rsqrt(var + self.eps)
-        return (x * self.weight.float()).to(dtype)
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
 
 
 class MLP(nn.Module):
@@ -70,11 +85,6 @@ class MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
-
-
-# Folded into fc.weight so the fc's fp16 conv output stays in range. Exact, because
-# the RMSNorm that consumes it is scale-invariant. See load_dflash_state_dict.
-FC_OUTPUT_SCALE = 256.0
 
 
 # ---------------------------------------------------------------------------
@@ -94,16 +104,29 @@ class DFlashConfig:
         self.num_hidden_layers: int = raw["num_hidden_layers"]
         self.num_target_layers: int = raw["num_target_layers"]
         self.vocab_size: int = raw["vocab_size"]
-        self.rope_theta: float = float(raw.get("rope_theta", 1000000.0))
+        # Newer checkpoints nest rope under rope_parameters and hoist the dflash
+        # fields to the top level; older ones keep rope_theta flat and the dflash
+        # fields under dflash_config.
+        rope = raw.get("rope_parameters", raw)
+        self.rope_theta: float = float(rope.get("rope_theta", 1000000.0))
         self.rms_norm_eps: float = float(raw.get("rms_norm_eps", 1e-6))
         self.block_size: int = raw["block_size"]
         self.attention_bias: bool = raw.get("attention_bias", False)
-        dflash_cfg = raw.get("dflash_config", {})
+        dflash_cfg = raw.get("dflash_config", raw)
         self.mask_token_id: Optional[int] = dflash_cfg.get("mask_token_id", None)
         self.target_layer_ids: List[int] = dflash_cfg.get(
             "target_layer_ids",
             build_target_layer_ids(self.num_target_layers, self.num_hidden_layers),
         )
+        # fc sums 12800 target-hidden values, and the target's attention-sink token
+        # carries massive activations (absmax ~16000), so the fc output can land far
+        # outside fp16. hidden_norm right after it is an RMSNorm and therefore
+        # scale-invariant, which makes folding a constant into fc.weight exactly --
+        # not approximately -- a no-op:
+        #     hidden_norm(fc(x) / S) == hidden_norm(fc(x))
+        # Measured peak |fc(x)| on a real prompt: 281074 for Qwen3-4B-DFlash-b16
+        # (needs S=256), 25188 for dflash_qwen3_4b_block7 (fits fp16, S=1).
+        self.fc_output_scale: float = float(raw.get("fc_output_scale", 1.0))
         # transformers HF-style Qwen3MLP expects these attribute names.
         self.hidden_act = raw.get("hidden_act", "silu")
         self.mlp_bias = raw.get("mlp_bias", False)
@@ -356,17 +379,15 @@ class DFlashDraftModel(nn.Module):
 
     # -- weight loading ---------------------------------------------------
     def load_dflash_state_dict(self, sd: dict):
-        """Map the DFlash checkpoint keys into this module (float upcast)."""
+        """Map the DFlash checkpoint keys into this module (float upcast).
+
+        Checkpoints that ship their own lm_head / embed_tokens carry those keys too;
+        the draft graph does not use them, so they are simply not read here.
+        """
         with torch.no_grad():
-            # convert_linear_to_conv2d turns fc into a conv, and HTP runs convs in
-            # fp16 whatever the graph dtype says. Real target hidden peaks near 16000
-            # (massive-activation outliers) and fc sums 12800 of them, so its output
-            # lands around 1e6 and saturates to Inf. hidden_norm right after it is an
-            # RMSNorm and therefore scale-invariant, so folding a constant into the
-            # weight is exactly -- not approximately -- a no-op:
-            #     hidden_norm(fc(x) / S) == hidden_norm(fc(x))
-            # 1/256 brings the fc output to ~4e3, leaving ~16x headroom in fp16.
-            self.fc.weight.copy_(sd["fc.weight"].float() / FC_OUTPUT_SCALE)
+            # See DFlashConfig.fc_output_scale: exact, because hidden_norm is an
+            # RMSNorm and RMSNorm is scale-invariant.
+            self.fc.weight.copy_(sd["fc.weight"].float() / self.cfg.fc_output_scale)
             self.hidden_norm.weight.copy_(sd["hidden_norm.weight"].float())
             self.norm.weight.copy_(sd["norm.weight"].float())
             for i, layer in enumerate(self.layers):
@@ -497,14 +518,12 @@ class DFlashDraftCompiler(Component):
         self.prefill_ar = prefill_ar
 
         self.backend = getattr(control_args, "dflash_draft_backend", "htp")
-        # fp32, not fp16: RMSNorm squares its input, so anything above sqrt(65504)
-        # ~= 256 saturates to Inf and then NaNs out through the norm. The draft's own
-        # residual stream already reaches ~9000 by the first layer, and the fc is far
-        # worse -- real target hidden peaks near 16000 (massive-activation outliers)
-        # and the fc sums 12800 of them, landing around 1e6. In fp16 every drafted
-        # token came back NaN and the accept rate was exactly 0. The EAGLE head runs
-        # fp32 for the same reason.
-        dtype = torch.float32
+        # fp16 is safe once RMSNorm fuses into the QNN native OpRmsNorm (see RMSNorm)
+        # and fc_output_scale keeps the fc conv in range. Declaring the graph fp32
+        # buys nothing anyway: HTP has no fp32 precision mode (only kHtpQuantized and
+        # kHtpFp16), and conv runs on HMX, which has no fp32 datapath at all -- an
+        # fp32 fc produced byte-identical device output to the fp16 one.
+        dtype = torch.float16
 
         def build(ar_len):
             m = DFlashDraftModel(cfg, max_context_len, ar_len)
@@ -519,7 +538,7 @@ class DFlashDraftCompiler(Component):
                 )
 
                 m = convert_linear_to_conv2d(m)
-            return m
+            return m.to(dtype)
 
         # kv_forward appends the accepted rows (<= block_size) of one round.
         self.decode = build(cfg.block_size)
