@@ -37,6 +37,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
     DECODE_QDQ_FILENAME,
     DECODER_GRAPH_NAMES,
     DFLASH_DRAFT,
+    DFLASH_GRAPH_NAMES,
     DFLASH_TARGET,
     EAGLE_HEAD,
     EAGLE_TARGET,
@@ -149,6 +150,20 @@ def compile_dflash(
             online_prepare=args.online_prepare,
         )
     ] * len(DECODER_GRAPH_NAMES)
+    # ConvertMhaToSha pattern-matches the standard causal attention that
+    # static_llama emits. DFlash's block attention is non-causal and builds K/V by
+    # concatenating [cache | new_context | block], so the pass rewrites it into a
+    # graph that aborts the HTP skel at execution (QNN 1003). The target still
+    # wants the pass; the draft must not have it.
+    draft_compile_spec_list = [
+        generate_qnn_executorch_compiler_spec(
+            soc_model=get_soc_to_chipset_map()[args.soc_model],
+            backend_options=backend_options,
+            shared_buffer=not args.enable_x86_64,
+            use_mha2sha=False,
+            online_prepare=args.online_prepare,
+        )
+    ] * len(DFLASH_GRAPH_NAMES)
     backend_type = get_backend_type("htp")
 
     dflash_mgr.quantize(
@@ -160,6 +175,7 @@ def compile_dflash(
     )
     dflash_mgr.compile(
         compile_spec=compile_spec_list,
+        draft_compile_spec=draft_compile_spec_list,
         pte_filenames={
             DFLASH_TARGET: os.path.splitext(os.path.basename(text_decoder_pte_path))[0],
             DFLASH_DRAFT: os.path.splitext(os.path.basename(dflash_draft_pte_path))[0],
@@ -311,6 +327,7 @@ def inference(
     calibration_data,
     is_multimodal,
     eagle_head_pte_path: str = None,
+    dflash_draft_pte_path: str = None,
 ):
 
     assert args.model_mode in EVAL_MODE, f"Unknown model_mode: {args.model_mode}."
@@ -327,6 +344,18 @@ def inference(
         pte_paths.update({EAGLE_HEAD: eagle_head_pte_path})
         eval_results.update(
             {"eagle_head_pte_size": os.path.getsize(eagle_head_pte_path)}
+        )
+
+    if args.model_mode == "dflash":
+        # Without this the draft never reaches pte_paths: it is neither pushed to
+        # the device nor given to --dflash_draft_path, and gflags then swallows
+        # the next token as the (empty) path's value.
+        assert dflash_draft_pte_path is not None and os.path.exists(
+            dflash_draft_pte_path
+        ), f"DFlash mode requires compiled draft at {dflash_draft_pte_path}"
+        pte_paths.update({DFLASH_DRAFT: dflash_draft_pte_path})
+        eval_results.update(
+            {"dflash_draft_pte_size": os.path.getsize(dflash_draft_pte_path)}
         )
 
     if args.use_attention_sink:
@@ -701,11 +730,23 @@ def _build_parser():
         help="[DFlash mode] Draft block size (drafts block_size-1 tokens per step). Must match the draft ckpt.",
     )
     parser.add_argument(
+        "--num_sharding",
+        default=0,
+        type=int,
+        help="Override the model's graph-sharding count (0 => the model default).",
+    )
+    parser.add_argument(
         "--dflash_max_context_len",
         default=0,
         type=int,
-        help="[DFlash mode] Fixed context length the draft attends to (0 => max_context_len). "
-        "Larger = more history but bigger/slower draft graph (no-KV-cache first version).",
+        help="[DFlash mode] Context length of the draft KV cache (0 => max_context_len).",
+    )
+    parser.add_argument(
+        "--dflash_prefill_ar_len",
+        default=0,
+        type=int,
+        help="[DFlash mode] Context rows the draft's prefill_forward appends per call "
+        "(0 => prefill_ar_len). Bounded by HTP TCM: 128 is safe for Qwen3-4B.",
     )
     parser.add_argument(
         "--dflash_draft_backend",
@@ -816,6 +857,10 @@ def export_llama(args) -> None:
         args.decoder_model in SUPPORTED_LLM_MODELS
     ), f"Unknown decoder_model: {args.decoder_model}."
     decoder_model_config = SUPPORTED_LLM_MODELS[args.decoder_model]
+    if args.num_sharding:
+        # The model configs are frozen dataclass instances (registered as cls()),
+        # so a plain attribute assignment raises FrozenInstanceError.
+        object.__setattr__(decoder_model_config, "num_sharding", args.num_sharding)
     logging.info(f"*** {args.decoder_model} ***\n%s", str(decoder_model_config))
 
     if args.max_context_len is None:
@@ -990,6 +1035,7 @@ def export_llama(args) -> None:
             calibration_data,
             is_multimodal,
             eagle_head_pte_path=eagle_head_pte_path,
+            dflash_draft_pte_path=dflash_draft_pte_path,
         )
         print(f"Finish the running pre_gen_pte from {args.pre_gen_pte}")
         return
@@ -1076,6 +1122,7 @@ def export_llama(args) -> None:
         calibration_data,
         is_multimodal,
         eagle_head_pte_path=eagle_head_pte_path,
+        dflash_draft_pte_path=dflash_draft_pte_path,
     )
 
 

@@ -10,7 +10,38 @@
 #include <executorch/runtime/core/exec_aten/exec_aten.h>
 #include <executorch/runtime/core/exec_aten/util/scalar_type_util.h>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <memory>
+
+// Widen an IEEE binary16 bit pattern. __fp16 is an ARM extension and does not
+// exist under gcc/x86_64, which is how the host leg of build.sh compiles this.
+inline float fp16_to_fp32(uint16_t h) {
+  uint32_t sign = (h >> 15) & 0x1u;
+  uint32_t exp = (h >> 10) & 0x1fu;
+  uint32_t mant = h & 0x3ffu;
+  uint32_t f;
+  if (exp == 0) {
+    if (mant == 0) {
+      f = sign << 31;
+    } else {
+      exp = 1;
+      while (!(mant & 0x400)) {
+        mant <<= 1;
+        exp--;
+      }
+      mant &= 0x3ff;
+      f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+    }
+  } else if (exp == 31) {
+    f = (sign << 31) | 0x7f800000u | (mant << 13);
+  } else {
+    f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+  }
+  float result;
+  std::memcpy(&result, &f, sizeof(result));
+  return result;
+}
 
 // Template struct to hold tensor data and tensor
 

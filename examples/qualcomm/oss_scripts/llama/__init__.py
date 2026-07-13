@@ -83,6 +83,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.static_llm_quant_recipe impo
     Qwen2_5_1_5BQuantRecipe,
     Qwen3_0_6BQuantRecipe,
     Qwen3_1_7BQuantRecipe,
+    Qwen3_4BQuantRecipe,
     Smollm2QuantRecipe,
     Smollm3QuantRecipe,
     SmolVLMQuantRecipe,
@@ -542,9 +543,9 @@ class Qwen3_4B(LLMModelConfig):
     r1 = False
     r2 = False
     r3 = True
-    # The 16a4w recipe is regex/op-target based (not per-layer), so it is
-    # size-agnostic and shared with the 1.7B config.
-    quant_recipe = Qwen3_1_7BQuantRecipe
+    # Dedicated 4B 16a4w recipe: protects lm_head + MLP down_proj at 16a8w to
+    # preserve the residual-stream hidden states DFlash's draft consumes.
+    quant_recipe = Qwen3_4BQuantRecipe
 
 
 @register_llm_model("smollm2_135m")

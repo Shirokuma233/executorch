@@ -393,6 +393,9 @@ Result<uint64_t> PromptProcessor::prefill(
     if (i == num_iters - 1) {
       n_update = 1 + ((num_prompt_tokens - 1) % metadata_.ar_len);
     }
+    if (extra_output_observer_) {
+      extra_output_observer_(extra_outputs_, n_update, shifted_pos);
+    }
     // Update KV Cache with the output results
     kv_manager_->update_cache(metadata_.ar_len, shifted_pos, n_update, {});
 

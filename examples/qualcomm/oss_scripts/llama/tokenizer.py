@@ -381,8 +381,16 @@ class TokenizerWrapper:
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
 
+        template_kwargs = {}
+        # Qwen3 is a hybrid thinking/non-thinking model; the mode is a chat
+        # template choice. Default to non-thinking (DFlash Qwen3-4B draft and
+        # constrained on-device seq_len both want it); --enable_thinking flips it.
+        if self.decoder_model.startswith("qwen3"):
+            template_kwargs["enable_thinking"] = getattr(
+                self.control_args, "enable_thinking", False
+            )
         template_prompt = chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages, tokenize=False, add_generation_prompt=True, **template_kwargs
         )
 
         # edge cases handling:

@@ -114,6 +114,9 @@ class Runner : public executorch::extension::llm::IRunner {
   std::unique_ptr<executorch::extension::Module> attention_sink_rope_module_;
   std::unique_ptr<executorch::extension::Module> eagle_head_module_;
   std::unique_ptr<KVManager> eagle_kv_manager_;
+  std::unique_ptr<KVManager> dflash_kv_manager_;
+  // Draft non-K/V IO bytes to reserve in the shared buffer (see RpcMem).
+  size_t dflash_draft_io_size_ = 0;
   int max_tree_size_{0};
   int draft_len_{0};
   int tree_depth_{4};

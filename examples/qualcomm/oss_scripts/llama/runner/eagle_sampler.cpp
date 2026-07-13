@@ -7,6 +7,7 @@
  */
 
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/eagle_sampler.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/utils.h>
 
 #include <executorch/runtime/platform/log.h>
 
@@ -38,17 +39,16 @@ EagleSampler::EagleSampler(
 
 uint64_t EagleSampler::argmax_draft(const std::byte* logits_buf) const {
   if (dtype_ == Dtype::kFp16) {
-    // __fp16 may not be portable across all compilers; we use uint16 + manual
-    // bitcast guarded by sizeof check. On clang/gcc on aarch64/x86_64 with the
-    // -mfp16-format=ieee flag, __fp16 is the IEEE binary16. Our QNN runtime
-    // is built that way.
-    static_assert(sizeof(__fp16) == 2, "expected __fp16 to be 2 bytes");
-    const __fp16* p = reinterpret_cast<const __fp16*>(logits_buf);
+    // __fp16 is an ARM extension: it does not exist under gcc/x86_64, which is
+    // how the host leg of build.sh compiles this. Read the IEEE binary16 bits and
+    // widen them by hand instead.
+    const uint16_t* p = reinterpret_cast<const uint16_t*>(logits_buf);
     int best = 0;
-    __fp16 best_val = p[0];
+    float best_val = fp16_to_fp32(p[0]);
     for (int i = 1; i < draft_vocab_size_; ++i) {
-      if (p[i] > best_val) {
-        best_val = p[i];
+      float val = fp16_to_fp32(p[i]);
+      if (val > best_val) {
+        best_val = val;
         best = i;
       }
     }

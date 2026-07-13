@@ -283,7 +283,8 @@ Error Runner::load() {
   } else if (
       eval_mode_ == EvalMode::kHybrid ||
       eval_mode_ == EvalMode::kLookaheadDecoding ||
-      eval_mode_ == EvalMode::kEagleDecoding) {
+      eval_mode_ == EvalMode::kEagleDecoding ||
+      eval_mode_ == EvalMode::kDFlashDecoding) {
     auto atten_mask_meta_prompt =
         module_->method_meta(prompt_processor_method_name)
             ->input_tensor_meta(1);
@@ -535,10 +536,14 @@ Error Runner::load() {
     ET_CHECK_MSG(
         dflash_draft_module_ != nullptr,
         "DFlash mode requires --dflash_draft_path to be set.");
+    ET_CHECK_OK_OR_RETURN_ERROR(dflash_draft_module_->load_method("kv_forward"));
     ET_CHECK_OK_OR_RETURN_ERROR(
-        dflash_draft_module_->load_method("dflash_block"));
-    auto draft_meta =
-        ET_UNWRAP(dflash_draft_module_->method_meta("dflash_block"));
+        dflash_draft_module_->load_method("prefill_forward"));
+    auto draft_kv_meta = ET_UNWRAP(dflash_draft_module_->method_meta("kv_forward"));
+    auto draft_prefill_meta =
+        ET_UNWRAP(dflash_draft_module_->method_meta("prefill_forward"));
+    dflash_draft_io_size_ = DFlashTokenGenerator::draft_io_size_in_bytes(
+        draft_kv_meta, draft_prefill_meta);
 
     auto read_int_meta = [&](const std::string& name, int32_t fb) -> int32_t {
       if (dflash_draft_module_->method_names()->count(name) > 0) {
@@ -552,18 +557,46 @@ Error Runner::load() {
     int32_t block_size = read_int_meta("get_dflash_block_size", block_size_);
     int32_t hidden_dim = read_int_meta("get_dflash_hidden_size", 0);
     int32_t num_ctx_layers = read_int_meta("get_dflash_num_ctx_layers", 0);
+    int32_t num_draft_layers = read_int_meta(
+        "get_dflash_num_draft_layers",
+        static_cast<int32_t>((draft_kv_meta.num_outputs() - 1) / 2));
     int32_t max_ctx = read_int_meta("get_dflash_max_context_len", context_len_);
+    int32_t dflash_prefill_ar =
+        read_int_meta("get_dflash_prefill_ar_len", prompt_processor_ar_len);
     int64_t mask_token_id = read_int_meta("get_dflash_mask_token_id", 0);
+
+    // Cache B: the draft's own K/V, one row per committed token. Its geometry
+    // comes from kv_forward's first cache input [1, nKV, head_dim, ctx - block].
+    auto draft_k_shape = draft_kv_meta.input_tensor_meta(5)->sizes();
+    int64_t draft_n_kv = draft_k_shape[1];
+    int64_t draft_head_dim = draft_k_shape[2];
+    int32_t draft_max_cache_len = static_cast<int32_t>(draft_k_shape[3]);
     ET_LOG(
         Info,
-        "[DFlash] draft meta: block=%d hidden=%d ctx_layers=%d max_ctx=%d "
-        "mask=%lld target_ar=%d",
+        "[DFlash] draft meta: block=%d hidden=%d ctx_layers=%d draft_layers=%d "
+        "max_ctx=%d prefill_ar=%d mask=%lld | kv cache %lldx%lldx%d",
         block_size,
         hidden_dim,
         num_ctx_layers,
+        num_draft_layers,
         max_ctx,
+        dflash_prefill_ar,
         static_cast<long long>(mask_token_id),
-        token_generator_ar_len);
+        static_cast<long long>(draft_n_kv),
+        static_cast<long long>(draft_head_dim),
+        draft_max_cache_len);
+
+    dflash_kv_manager_ = std::make_unique<KVManager>(
+        KVManager::Metadata{
+            max_ctx,
+            draft_head_dim,
+            /*max_ar_len=*/std::max(dflash_prefill_ar, block_size),
+            draft_max_cache_len,
+            draft_n_kv,
+            num_draft_layers},
+        std::make_unique<MethodMeta>(std::move(draft_kv_meta)));
+    // The MethodMeta above was consumed; fetch a fresh one for the generator.
+    auto draft_kv_meta2 = ET_UNWRAP(dflash_draft_module_->method_meta("kv_forward"));
 
     auto load_fp16_bin = [](const std::string& path) -> std::vector<uint16_t> {
       std::vector<uint16_t> t;
@@ -602,7 +635,9 @@ Error Runner::load() {
         /*block_size=*/block_size,
         /*hidden_dim=*/hidden_dim,
         /*num_ctx_layers=*/num_ctx_layers,
+        /*num_draft_layers=*/num_draft_layers,
         /*max_context_len=*/max_ctx,
+        /*prefill_ar_len=*/dflash_prefill_ar,
         /*mask_token_id=*/mask_token_id,
     };
 
@@ -611,13 +646,15 @@ Error Runner::load() {
         decoder_runner_.get(),
         kv_manager_.get(),
         dflash_draft_module_.get(),
+        dflash_kv_manager_.get(),
         token_generator_method_name,
         std::move(eos_ids),
         dflash_md,
         &stats_,
         std::make_unique<MethodMeta>(std::move(
             module_->method_meta(token_generator_method_name).get())),
-        std::make_unique<MethodMeta>(std::move(draft_meta)));
+        std::make_unique<MethodMeta>(std::move(draft_kv_meta2)),
+        std::make_unique<MethodMeta>(std::move(draft_prefill_meta)));
     if (!embed_table.empty()) {
       dflash_gen->set_embed_table(
           std::move(embed_table), vocab_size, hidden_dim);
@@ -649,9 +686,16 @@ Error Runner::load() {
 
   buffer_manager_ = std::make_unique<ClientMem>();
   if (shared_buffer_) {
+    // RpcMem is a bump allocator with no bounds check: every cache that draws
+    // from buffer_manager must be counted here, or its buffers land outside the
+    // ION region and the DSP fails the DMA (QNN 6002).
     size_t cache_size = kv_manager_->total_cache_size_in_bytes();
     if (eagle_kv_manager_ != nullptr) {
       cache_size += eagle_kv_manager_->total_cache_size_in_bytes();
+    }
+    if (dflash_kv_manager_ != nullptr) {
+      cache_size += dflash_kv_manager_->total_cache_size_in_bytes() +
+          dflash_draft_io_size_;
     }
     buffer_manager_ = std::make_unique<RpcMem>(
         cache_size,
@@ -760,6 +804,22 @@ Error Runner::generate_from_prompt_or_file(
     token_callback(prompt);
   }
   bool dump_logits = dump_logits_path_.empty() ? false : true;
+  // The prefill graph's hidden outputs live in one ar_len-row buffer that each
+  // iteration overwrites, so DFlash must drain them per chunk to seed its draft
+  // KV cache with the whole prompt rather than just the last chunk.
+  DFlashTokenGenerator* dflash_generator =
+      eval_mode_ == EvalMode::kDFlashDecoding
+      ? dynamic_cast<DFlashTokenGenerator*>(token_generator_.get())
+      : nullptr;
+  if (dflash_generator != nullptr) {
+    prompt_processor_->set_extra_output_observer(
+        [dflash_generator](
+            const std::vector<TensorStructRaw>& extra_outputs,
+            int32_t n_valid,
+            int64_t pos_base) {
+          dflash_generator->stage_prompt_hidden(extra_outputs, n_valid, pos_base);
+        });
+  }
   auto prefill_res = prompt_processor_->prefill(
       prompt_tokens, cur_pos_, dump_logits, attention_sink_rope_runner_.get());
   ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
@@ -785,12 +845,8 @@ Error Runner::generate_from_prompt_or_file(
       eagle_generator->set_prompt_prefill_hidden(
           prompt_processor_->get_extra_outputs(), num_prompt_tokens);
     }
-  } else if (eval_mode_ == EvalMode::kDFlashDecoding) {
-    if (auto* dflash_generator =
-            dynamic_cast<DFlashTokenGenerator*>(token_generator_.get())) {
-      dflash_generator->set_prompt_prefill_hidden(
-          prompt_processor_->get_extra_outputs(), num_prompt_tokens);
-    }
+  } else if (dflash_generator != nullptr) {
+    dflash_generator->finish_prompt_seeding();
   }
 
   // start the main loop

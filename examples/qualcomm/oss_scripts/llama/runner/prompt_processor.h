@@ -13,6 +13,7 @@
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/imem_alloc.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/kv_manager.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/utils.h>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -62,6 +63,16 @@ class PromptProcessor {
 
   const std::vector<TensorStructRaw>& get_extra_outputs() const {
     return extra_outputs_;
+  }
+
+  // `extra_outputs_` is a single ar_len-row buffer that every prefill iteration
+  // overwrites, so a consumer that needs the whole prompt's hidden states must
+  // drain it per chunk. The observer runs right after each graph step with the
+  // number of meaningful rows and the absolute position of row 0.
+  using ExtraOutputObserver = std::function<
+      void(const std::vector<TensorStructRaw>&, int32_t n_valid, int64_t pos_base)>;
+  void set_extra_output_observer(ExtraOutputObserver observer) {
+    extra_output_observer_ = std::move(observer);
   }
 
   /**
@@ -127,6 +138,7 @@ class PromptProcessor {
   TensorStructRaw logits_;
   std::vector<TensorStructRaw> extra_outputs_;
   size_t extra_outputs_size_{0};
+  ExtraOutputObserver extra_output_observer_;
 
   // layer -> TensorImpl
   std::vector<std::unique_ptr<executorch::aten::TensorImpl>> k_cache_in_;

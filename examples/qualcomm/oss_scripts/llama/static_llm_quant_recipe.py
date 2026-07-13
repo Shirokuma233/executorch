@@ -643,6 +643,56 @@ class Qwen3_1_7BQuantRecipe(StaticLLMQuantRecipe):
         self.recipe.custom_quant_annotations.append(annotate_kv_8bit)
 
 
+class Qwen3_4BQuantRecipe(StaticLLMQuantRecipe):
+    """16a4w recipe for Qwen3-4B (36 layers, hidden 2560).
+
+    Based on the 1.7B recipe (16a4w default, per-block conv2d, 16a8w KV) but,
+    for the larger model, additionally keeps the MLP down_proj (feed_forward.w2)
+    at 16a8w per-channel. down_proj writes into the residual stream, so this both
+    improves general 4B accuracy (it is the classic outlier-heavy PTQ layer) and
+    preserves the residual-stream hidden states that the DFlash draft consumes
+    (layers 1/9/17/25/33) — those hidden states directly drive draft accept.
+    If accept is still low, next levers: protect attention.wo, or shrink the
+    conv2d block_size (finer per-block scales).
+    """
+
+    default_quant_dtype = QuantDtype.use_16a4w
+
+    def __init__(self, verbose: bool = False):
+        super().__init__()
+
+        self.recipe = (
+            QuantRecipe(
+                self.default_quant_dtype,
+                False,
+                act_observer=MinMaxObserver,
+                granularity=QuantGranularity.PER_TENSOR,
+                verbose=verbose,
+            )
+            .add_node_target(
+                {
+                    torch.ops.aten.conv2d.default,
+                },
+                QuantDtype.use_16a4w_block,
+                False,
+                act_observer=MinMaxObserver,
+                granularity=QuantGranularity.PER_BLOCK,
+                extra_kwargs={"block_size": (1, 16, 1, 1)},
+            )
+            .add_regex(
+                {
+                    r"output\.conv",
+                    r"layers\..*\.feed_forward\.w2_conv",
+                },
+                QuantDtype.use_16a8w,
+                False,
+                act_observer=MinMaxObserver,
+                granularity=QuantGranularity.PER_CHANNEL,
+            )
+        )
+        self.recipe.custom_quant_annotations.append(annotate_kv_8bit)
+
+
 class Smollm2QuantRecipe(StaticLLMQuantRecipe):
     default_quant_dtype = QuantDtype.use_16a8w
 

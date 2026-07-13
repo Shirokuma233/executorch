@@ -404,8 +404,15 @@ if [ "$BUILD_X86_64" = true ]; then
 
     cmake --build $BUILD_ROOT -j$BUILD_JOB_NUMBER --target install
 
-    rm -f $PRJ_ROOT/backends/qualcomm/python/*
+    # Only refresh the compiled .so's. `rm -f python/*` used to also match the
+    # __pycache__ dir (rm -f fails on a dir -> with `set -e` the whole script
+    # aborts before the cp below, leaving python/ without its .so AND without
+    # __init__.py). Removing only *.so avoids that and preserves the marker.
+    rm -f $PRJ_ROOT/backends/qualcomm/python/*.so
     cp -fv $BUILD_ROOT/backends/qualcomm/Py* "$PRJ_ROOT/backends/qualcomm/python"
+    # Ensure the package marker exists (fresh checkouts have none) so
+    # `backends.qualcomm.python` stays importable for llama.py compiles.
+    touch "$PRJ_ROOT/backends/qualcomm/python/__init__.py"
     cp -fv $BUILD_ROOT/kernels/quantized/libquantized_ops_aot_lib.so "$PRJ_ROOT/kernels/quantized"
     cp -fv "$PRJ_ROOT/schema/program.fbs" "$PRJ_ROOT/exir/_serialize/program.fbs"
     cp -fv "$PRJ_ROOT/schema/scalar_type.fbs" "$PRJ_ROOT/exir/_serialize/scalar_type.fbs"

@@ -28,7 +28,7 @@ EAGLE_HEAD = "eagle_head"
 DFLASH_TARGET = "dflash_target"
 DFLASH_DRAFT = "dflash_draft"
 # DFlash draft is a single block-diffusion graph (no prefill/decode split).
-DFLASH_GRAPH_NAMES = ["dflash_block"]
+DFLASH_GRAPH_NAMES = ["kv_forward", "prefill_forward"]
 
 # Mapping of input flags for the runner
 MODALITY_INPUT_FLAG_MAP = {
