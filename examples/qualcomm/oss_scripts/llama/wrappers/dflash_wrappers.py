@@ -127,6 +127,21 @@ class DFlashConfig:
         # Measured peak |fc(x)| on a real prompt: 281074 for Qwen3-4B-DFlash-b16
         # (needs S=256), 25188 for dflash_qwen3_4b_block7 (fits fp16, S=1).
         self.fc_output_scale: float = float(raw.get("fc_output_scale", 1.0))
+        # Two decode conventions, and they are off by one from each other:
+        #
+        #   aligned (DFlashDraftModel, e.g. Qwen3-4B-DFlash-b16)
+        #       row k of the block fills slot k, row 0 is discarded.
+        #       -> B-1 tokens from hidden[1:], verify [confirmed, d1..d_{B-1}] (B)
+        #
+        #   shifted (Qwen3DSparkModel / DeepSpec, e.g. dflash_qwen3_4b_block7)
+        #       row k predicts the NEXT token, row 0 included.
+        #       -> B tokens from hidden[:B], verify [confirmed, s0..s_{B-1}] (B+1)
+        #
+        # Run a shifted checkpoint under the aligned convention and every drafted
+        # token lands one slot early: acceptance collapses to zero.
+        # See DeepSpec/deepspec/eval/dspark/draft_ops.py:build_dspark_proposal.
+        arch = (raw.get("architectures") or [""])[0]
+        self.shifted_decode: bool = "DSpark" in arch
         # transformers HF-style Qwen3MLP expects these attribute names.
         self.hidden_act = raw.get("hidden_act", "silu")
         self.mlp_bias = raw.get("mlp_bias", False)
@@ -294,7 +309,13 @@ class DFlashDraftModel(nn.Module):
       block hidden [1, B, H]; then per layer k_new [1,nKV,D,AR], v_new [1,nKV,AR,D]
     """
 
-    def __init__(self, cfg: DFlashConfig, max_context_len: int, ar_len: int):
+    def __init__(
+        self,
+        cfg: DFlashConfig,
+        max_context_len: int,
+        ar_len: int,
+        with_lm_head: bool = False,
+    ):
         super().__init__()
         self.cfg = cfg
         self.H = cfg.hidden_size
@@ -306,6 +327,12 @@ class DFlashDraftModel(nn.Module):
         self.max_context_len = max_context_len
         self.cache_len = max_context_len - self.AR  # Cc
         self.num_ctx_layers = len(cfg.target_layer_ids)
+        # Checkpoints that ship an lm_head can do the vocab projection and the argmax
+        # on HTP, turning a 2.3 GMAC host scan of a 743 MB table (1.3 s/block, 94% of
+        # runtime) into B-1 token ids coming straight out of the graph.
+        self.lm_head = (
+            nn.Linear(self.H, cfg.vocab_size, bias=False) if with_lm_head else None
+        )
         self.fc = nn.Linear(self.num_ctx_layers * self.H, self.H, bias=False)
         self.hidden_norm = RMSNorm(self.H, eps=cfg.rms_norm_eps)
         self.layers = nn.ModuleList(
@@ -345,7 +372,19 @@ class DFlashDraftModel(nn.Module):
             )
             k_outs.append(k_new)
             v_outs.append(v_new)
-        return (self.norm(block_h), *k_outs, *v_outs)
+        h = self.norm(block_h)
+        if self.lm_head is None:
+            return (h, *k_outs, *v_outs)
+        # Which rows carry a prediction depends on the checkpoint's convention; see
+        # DFlashConfig.shifted_decode. Appended last so the runner's existing output
+        # indices do not shift.
+        #
+        # Logits, not the argmax: QNN's OpArgmax gets the index wrong by +/-65536 on
+        # an axis this wide (device-verified, deterministic, and it happily reports
+        # aten.argmax.default as supported). The runner takes the max instead -- a few
+        # x 151936 compares next to the 2.3 GMAC projection that just moved to HTP.
+        rows = h if self.cfg.shifted_decode else h[:, 1:, :]
+        return (h, *k_outs, *v_outs, self.lm_head(rows))
 
     # -- export helpers ---------------------------------------------------
     def get_example_inputs(self, dtype=torch.float32):
@@ -375,6 +414,7 @@ class DFlashDraftModel(nn.Module):
             "get_dflash_max_context_len": self.max_context_len,
             "get_dflash_prefill_ar_len": prefill_ar,
             "get_dflash_mask_token_id": int(self.cfg.mask_token_id or 0),
+            "get_dflash_shifted_decode": int(self.cfg.shifted_decode),
         }
 
     # -- weight loading ---------------------------------------------------
@@ -388,6 +428,8 @@ class DFlashDraftModel(nn.Module):
             # See DFlashConfig.fc_output_scale: exact, because hidden_norm is an
             # RMSNorm and RMSNorm is scale-invariant.
             self.fc.weight.copy_(sd["fc.weight"].float() / self.cfg.fc_output_scale)
+            if self.lm_head is not None:
+                self.lm_head.weight.copy_(sd["lm_head.weight"].float())
             self.hidden_norm.weight.copy_(sd["hidden_norm.weight"].float())
             self.norm.weight.copy_(sd["norm.weight"].float())
             for i, layer in enumerate(self.layers):
@@ -525,8 +567,15 @@ class DFlashDraftCompiler(Component):
         # fp32 fc produced byte-identical device output to the fp16 one.
         dtype = torch.float16
 
+        # Only checkpoints that carry lm_head.weight can host the vocab projection.
+        # Older ones (Qwen3-4B-DFlash-b16) leave it to the runner, which scans the
+        # target's embedding table for it.
+        self.with_lm_head = "lm_head.weight" in sd
+        log_msg = "in-graph (HTP)" if self.with_lm_head else "host (runner scan)"
+        logging.info("DFlash draft lm_head: %s", log_msg)
+
         def build(ar_len):
-            m = DFlashDraftModel(cfg, max_context_len, ar_len)
+            m = DFlashDraftModel(cfg, max_context_len, ar_len, self.with_lm_head)
             m.load_dflash_state_dict(sd)
             m.eval()
             if self.backend == "htp":
@@ -540,8 +589,13 @@ class DFlashDraftCompiler(Component):
                 m = convert_linear_to_conv2d(m)
             return m.to(dtype)
 
-        # kv_forward appends the accepted rows (<= block_size) of one round.
-        self.decode = build(cfg.block_size)
+        # kv_forward's AR is how many context rows one round can append, which is
+        # how many tokens that round commits: accepted + 1. The shifted convention
+        # can accept all B drafted tokens, so it commits up to B+1; the aligned one
+        # drafts B-1 and commits at most B. Size the graph for the worst case or the
+        # extra row is silently dropped and the draft's cache desyncs for good.
+        decode_ar = cfg.block_size + 1 if cfg.shifted_decode else cfg.block_size
+        self.decode = build(decode_ar)
         self.prefill = build(prefill_ar)
         self.decode_input = self.decode.get_example_inputs(dtype=dtype)
         self.prefill_input = self.prefill.get_example_inputs(dtype=dtype)

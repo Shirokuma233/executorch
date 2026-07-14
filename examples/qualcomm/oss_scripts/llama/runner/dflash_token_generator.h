@@ -81,6 +81,12 @@ class DFlashTokenGenerator : public TokenGenerator {
     int32_t max_context_len; // draft KV cache context length
     int32_t prefill_ar_len; // context rows prefill_forward appends per call
     int64_t mask_token_id; // 151669
+    // Shifted (DSpark/DeepSpec): block row k predicts the NEXT token, so all B rows
+    // carry one and the verify block is [confirmed | B drafted] = B+1 tokens.
+    // Aligned (DFlash b16): row k fills slot k, row 0 is discarded -> B-1 drafted,
+    // verify block = B. Reading a shifted draft with the aligned rule puts every
+    // token one slot early and acceptance collapses to zero.
+    bool shifted_decode;
   };
 
   DFlashTokenGenerator(
@@ -158,7 +164,9 @@ class DFlashTokenGenerator : public TokenGenerator {
  private:
   // One draft graph call. Appends `n_new` context rows (read from `stage_buf_`,
   // RoPE positions `ctx_pos_base + j`) to the KV cache and drafts the block.
-  // `out_hidden` may be null when only the cache write matters.
+  // `out_hidden` may be null when only the cache write matters. `out_tokens` is
+  // filled only when the graph carries an lm_head; otherwise it is left alone and
+  // the caller falls back to lm_head_argmax.
   void run_draft(
       const std::string& method,
       const executorch::runtime::MethodMeta& meta,
@@ -167,7 +175,8 @@ class DFlashTokenGenerator : public TokenGenerator {
       int64_t ctx_pos_base,
       const std::vector<uint64_t>& block_tokens,
       int64_t block_pos_base,
-      std::vector<float>* out_hidden);
+      std::vector<float>* out_hidden,
+      std::vector<uint64_t>* out_tokens = nullptr);
 
   // Run one prefill_forward over the staged rows, then reset the staging count.
   void flush_stage();
@@ -206,6 +215,18 @@ class DFlashTokenGenerator : public TokenGenerator {
   // Sized for the wider of the two graphs and reused across calls.
   std::array<std::byte*, kNumDraftNonKvInputs> draft_in_bufs_{};
   std::array<size_t, kNumDraftNonKvInputs> draft_in_nbytes_{};
+
+  // Set when the draft pte carries an lm_head, i.e. when its output count exceeds
+  // hidden + 2*num_draft_layers. Then the graph returns the block's logits and the
+  // host never scans the 743 MB vocab table -- only the argmax stays here, because
+  // QNN's own is off by +/-65536 on an axis this wide.
+  // kv_forward's context-append length (new_context's middle dim). Equals
+  // block_size + 1 for shifted checkpoints, block_size for aligned ones.
+  int32_t draft_decode_ar_ = 0;
+  bool draft_has_lm_head_ = false;
+  std::byte* draft_logits_buf_ = nullptr;
+  size_t draft_logits_nbytes_ = 0;
+  size_t draft_vocab_size_ = 0;
   std::byte* draft_hidden_buf_ = nullptr;
   size_t draft_hidden_nbytes_ = 0;
 

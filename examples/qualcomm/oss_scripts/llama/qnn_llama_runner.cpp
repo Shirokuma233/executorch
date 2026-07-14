@@ -73,6 +73,10 @@ DEFINE_bool(
     shared_buffer,
     false,
     "Specifies to use shared buffers for zero-copy use case between the application and device/co-processor associated with the backend.");
+DEFINE_bool(
+    enable_thinking,
+    false,
+    "Qwen3 only: let the model emit its own <think> block. Off by default, matching llama.py, which pre-fills an empty one to skip reasoning.");
 DEFINE_int32(num_iters, 1, "total num of iterations to run.");
 DEFINE_int32(
     ngram,
@@ -218,15 +222,23 @@ std::string get_formatted_prompt(
       formatted_prompt.append("<|end|><|assistant|>");
       break;
     case example::DecoderModelVersion::kQwen3:
-      formatted_prompt.append("<|im_start|>user\n");
-      formatted_prompt.append(prompt);
-      formatted_prompt.append("<|im_end|>\n");
       if (!system_prompt.empty()) {
         formatted_prompt.append("<|im_start|>system\n");
         formatted_prompt.append(system_prompt);
         formatted_prompt.append("<|im_end|>\n");
       }
-      formatted_prompt.append("<|im_start|>assistant");
+      formatted_prompt.append("<|im_start|>user\n");
+      formatted_prompt.append(prompt);
+      formatted_prompt.append("<|im_end|>\n");
+      formatted_prompt.append("<|im_start|>assistant\n");
+      // Qwen3 is a hybrid model: thinking is not a weight, it is a chat-template
+      // choice. Non-thinking works by pre-filling an EMPTY think block, which the
+      // model reads as "reasoning is already done". Leaving it out is the *thinking*
+      // template, and the model duly writes its own <think> essay before answering.
+      // Byte-for-byte the same as HF's apply_chat_template(enable_thinking=...).
+      if (!FLAGS_enable_thinking) {
+        formatted_prompt.append("<think>\n\n</think>\n\n");
+      }
       break;
     case example::DecoderModelVersion::kSmollm2_135m:
       if (!system_prompt.empty()) {

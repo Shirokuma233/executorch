@@ -221,6 +221,14 @@ size_t DFlashTokenGenerator::draft_io_size_in_bytes(
   total += std::max(
       tensor_nbytes(kv_meta.output_tensor_meta(0).get()),
       tensor_nbytes(prefill_meta.output_tensor_meta(0).get()));
+  // The in-graph lm_head's token ids, when present. Small, but RpcMem is a bump
+  // allocator with no bounds check: anything init_io allocates and this function
+  // forgets lands outside the ION region and the DSP fails the DMA (QNN 6002).
+  const size_t Ld = (kv_meta.num_inputs() - kNumDraftNonKvInputs) / 2;
+  const size_t kv_outs = 1 + 2 * Ld;
+  if (kv_meta.num_outputs() > kv_outs) {
+    total += tensor_nbytes(kv_meta.output_tensor_meta(kv_outs).get());
+  }
   return total;
 }
 
@@ -237,12 +245,17 @@ void DFlashTokenGenerator::init_io(
       L,
       num_outputs,
       expected_kv + static_cast<size_t>(L));
+  // hidden + K/V, plus one optional logits output when the draft owns an lm_head.
+  const size_t draft_kv_outs =
+      1 + 2 * static_cast<size_t>(dflash_meta_.num_draft_layers);
   ET_CHECK_MSG(
-      draft_kv_meta_->num_outputs() ==
-          1 + 2 * static_cast<size_t>(dflash_meta_.num_draft_layers),
-      "[DFlash] draft kv_forward has %zu outputs, expected %d",
+      draft_kv_meta_->num_outputs() == draft_kv_outs ||
+          draft_kv_meta_->num_outputs() == draft_kv_outs + 1,
+      "[DFlash] draft kv_forward has %zu outputs, expected %zu (or %zu with an "
+      "in-graph lm_head)",
       draft_kv_meta_->num_outputs(),
-      1 + 2 * dflash_meta_.num_draft_layers);
+      draft_kv_outs,
+      draft_kv_outs + 1);
 
   // Capture the L extra hidden output metas (order = ascending layer index).
   std::array<size_t, kMaxCtxLayers> hidden_nbytes{};
@@ -276,10 +289,18 @@ void DFlashTokenGenerator::init_io(
   // The attention mask is additive, so it cannot neutralize a NaN read out of an
   // uninitialized fp16 cache slot. The target gets away with it because its cache
   // is quantized; this one is not.
-  const size_t cache_bytes =
-      tensor_nbytes(draft_kv_meta_->input_tensor_meta(kNumDraftNonKvInputs).get());
-  const size_t cache_out_bytes =
-      tensor_nbytes(draft_kv_meta_->output_tensor_meta(1).get());
+  // Both graphs share these buffers, so each must be sized and registered for the
+  // wider of the two views. k_new/v_new are [1, nKV, D, AR], and AR differs:
+  // block_size for kv_forward, prefill_ar_len for prefill_forward. Registering only
+  // kv_forward's view leaves the DSP writing prefill's larger tensor into a region
+  // QNN was told is smaller -- a DMA overrun that surfaces as skelExecute 1003.
+  const size_t cache_bytes = std::max(
+      tensor_nbytes(draft_kv_meta_->input_tensor_meta(kNumDraftNonKvInputs).get()),
+      tensor_nbytes(
+          draft_prefill_meta_->input_tensor_meta(kNumDraftNonKvInputs).get()));
+  const size_t cache_out_bytes = std::max(
+      tensor_nbytes(draft_kv_meta_->output_tensor_meta(1).get()),
+      tensor_nbytes(draft_prefill_meta_->output_tensor_meta(1).get()));
   const int Ld = dflash_meta_.num_draft_layers;
   for (int l = 0; l < Ld; ++l) {
     std::memset(draft_kv_manager_->get_k_cache_()[l].buffer, 0, cache_bytes);
@@ -292,17 +313,26 @@ void DFlashTokenGenerator::init_io(
   // every cache tensor, and the draft's ~21MB overruns the transport (QNN 1003).
   const std::vector<KVCache>& kc = draft_kv_manager_->get_k_cache_();
   const std::vector<KVCache>& vc = draft_kv_manager_->get_v_cache_();
+  // Register each buffer under its widest view: the cache inputs are widest in
+  // kv_forward (Cc = context_len - block_size), the cache outputs in
+  // prefill_forward (AR = prefill_ar_len). Same rule as the non-K/V IO below.
   for (int l = 0; l < Ld; ++l) {
     auto k_in = draft_kv_meta_->input_tensor_meta(kNumDraftNonKvInputs + l).get();
     auto v_in =
         draft_kv_meta_->input_tensor_meta(kNumDraftNonKvInputs + Ld + l).get();
-    auto k_out = draft_kv_meta_->output_tensor_meta(1 + l).get();
-    auto v_out = draft_kv_meta_->output_tensor_meta(1 + Ld + l).get();
+    auto k_out = draft_prefill_meta_->output_tensor_meta(1 + l).get();
+    auto v_out = draft_prefill_meta_->output_tensor_meta(1 + Ld + l).get();
     buffer_manager->add_memory_info(kc[l].buffer, cache_bytes, k_in);
     buffer_manager->add_memory_info(vc[l].buffer, cache_bytes, v_in);
     buffer_manager->add_memory_info(kc[l].output_buffer, cache_out_bytes, k_out);
     buffer_manager->add_memory_info(vc[l].output_buffer, cache_out_bytes, v_out);
   }
+
+  // kv_forward's append length, read off new_context [1, AR, L*H]. It is B+1 under
+  // the shifted convention and B under the aligned one, so it cannot be derived
+  // from block_size alone.
+  draft_decode_ar_ =
+      static_cast<int32_t>(draft_kv_meta_->input_tensor_meta(2)->sizes()[1]);
 
   // The draft's non-K/V IO, likewise shared + registered. Each buffer takes the
   // wider of the two graphs' views so both can bind it.
@@ -324,6 +354,26 @@ void DFlashTokenGenerator::init_io(
       draft_hidden_buf_,
       draft_hidden_nbytes_,
       draft_prefill_meta_->output_tensor_meta(0).get());
+
+  // A draft built from a checkpoint with an lm_head appends the block's logits as
+  // one extra output, so the vocab projection runs on HTP instead of scanning the
+  // 743 MB embedding table on the CPU.
+  const size_t kv_outs = 1 + 2 * static_cast<size_t>(Ld);
+  draft_has_lm_head_ = draft_kv_meta_->num_outputs() > kv_outs;
+  if (draft_has_lm_head_) {
+    auto l_meta = draft_kv_meta_->output_tensor_meta(kv_outs).get();
+    draft_logits_nbytes_ = tensor_nbytes(l_meta);
+    auto l_sizes = l_meta.sizes();
+    draft_vocab_size_ = static_cast<size_t>(l_sizes[l_sizes.size() - 1]);
+    draft_logits_buf_ = buffer_manager->allocate(draft_logits_nbytes_);
+    buffer_manager->add_memory_info(
+        draft_logits_buf_, draft_logits_nbytes_, l_meta);
+  }
+  ET_LOG(
+      Info,
+      "[DFlash] lm_head: %s (vocab %zu)",
+      draft_has_lm_head_ ? "in-graph (HTP)" : "host scan of the embedding table",
+      draft_vocab_size_);
 
   // Cache A: one draft-graph call's worth of fused 5H rows.
   const size_t LH = static_cast<size_t>(L) * dflash_meta_.hidden_dim;
@@ -451,7 +501,8 @@ void DFlashTokenGenerator::run_draft(
     int64_t ctx_pos_base,
     const std::vector<uint64_t>& block_tokens,
     int64_t block_pos_base,
-    std::vector<float>* out_hidden) {
+    std::vector<float>* out_hidden,
+    std::vector<uint64_t>* out_tokens) {
   const int B = dflash_meta_.block_size;
   const int H = dflash_meta_.hidden_dim;
   const int Ld = dflash_meta_.num_draft_layers;
@@ -469,6 +520,16 @@ void DFlashTokenGenerator::run_draft(
       n_past,
       n_new,
       Cc,
+      ar);
+  // new_context is [1, ar, L*H]. Rows past `ar` would be written into the host
+  // staging buffer (sized for the wider graph) and then silently dropped by the
+  // bind, leaving draft_ctx_len_ ahead of what the cache actually holds -- a
+  // desync the draft never recovers from.
+  ET_CHECK_MSG(
+      n_new <= ar,
+      "[DFlash] %s appends %d context rows but its graph takes only %d",
+      method.c_str(),
+      n_new,
       ar);
 
   auto n_meta = meta.input_tensor_meta(0).get();
@@ -593,6 +654,15 @@ void DFlashTokenGenerator::run_draft(
   for (auto& impl : kv_out_impls) {
     outputs.emplace_back(EValue(Tensor(&impl)));
   }
+  // TensorImpl is neither default-constructible nor assignable, so it has to be
+  // built in place; the vector just gives it a stable address to hand to EValue.
+  std::vector<TensorImpl> logits_impl;
+  if (draft_has_lm_head_) {
+    logits_impl.reserve(1);
+    logits_impl.emplace_back(
+        make_impl(meta.output_tensor_meta(1 + 2 * Ld).get(), draft_logits_buf_));
+    outputs.emplace_back(EValue(Tensor(&logits_impl[0])));
+  }
 
   ET_CHECK_MSG(
       draft_module_->set_outputs(method, outputs) == Error::Ok,
@@ -624,6 +694,28 @@ void DFlashTokenGenerator::run_draft(
       for (int i = 0; i < H; ++i) {
         (*out_hidden)[static_cast<size_t>(k) * H + i] = read_scalar(
             hidden_buf, h_meta.scalar_type(), static_cast<size_t>(k) * H + i);
+      }
+    }
+  }
+
+  // The graph did the 2.3 GMAC vocab projection; all that is left is picking the max
+  // of each row. QNN's own argmax is off by +/-65536 on an axis this wide, so it
+  // stays here.
+  if (out_tokens != nullptr && draft_has_lm_head_) {
+    const size_t V = draft_vocab_size_;
+    auto logits = meta.output_tensor_meta(1 + 2 * Ld).get();
+    // Rows, not B-1: the shifted convention predicts from every block row.
+    const int rows = static_cast<int>(logits.sizes()[1]);
+    out_tokens->assign(static_cast<size_t>(rows), 0);
+    for (int k = 0; k < rows; ++k) {
+      float best = -std::numeric_limits<float>::infinity();
+      for (size_t v = 0; v < V; ++v) {
+        const float x = read_scalar(
+            draft_logits_buf_, logits.scalar_type(), static_cast<size_t>(k) * V + v);
+        if (x > best) {
+          best = x;
+          (*out_tokens)[k] = static_cast<uint64_t>(v);
+        }
       }
     }
   }
@@ -770,37 +862,57 @@ Result<int64_t> DFlashTokenGenerator::generate(
   std::vector<uint64_t> drafted;
   std::vector<uint64_t> target_sampled;
 
+  // See Metadata::shifted_decode. Shifted draws a prediction from every block row
+  // and hands the target one more token to check; aligned throws row 0 away.
+  const bool shifted = dflash_meta_.shifted_decode;
+  const int n_draft = shifted ? B : B - 1;
+  const int hidden_row0 = shifted ? 0 : H; // first hidden row that predicts
+  ET_CHECK_MSG(
+      draft_decode_ar_ >= n_draft + 1,
+      "[DFlash] kv_forward appends %d rows/call but a round commits up to %d",
+      draft_decode_ar_,
+      n_draft + 1);
+
   while (cur_pos < static_cast<int64_t>(seq_len) - 1) {
     // --- DRAFT: append last round's accepted hidden, then denoise the block ---
-    std::vector<uint64_t> block(static_cast<size_t>(B), mask_tok);
-    block[0] = last_committed;
+    // The draft always sees B slots: the confirmed token, then masks.
+    std::vector<uint64_t> noise(static_cast<size_t>(B), mask_tok);
+    noise[0] = last_committed;
     run_draft(
         "kv_forward",
         *draft_kv_meta_,
-        B,
+        draft_decode_ar_,
         pending_rows,
         pending_pos_base,
-        block,
+        noise,
         cur_pos,
-        &block_hidden);
+        &block_hidden,
+        &drafted);
 
-    // Rows 1..B-1 only: the denoiser is non-causal, so row k predicts slot k
-    // (not slot k+1) and row 0's output is discarded, as in the reference's
-    // draft_out[:, -block_size+1:, :].
-    const long lm_start_ms = time_in_ms();
-    lm_head_argmax(block_hidden.data() + H, B - 1, &drafted);
-    lm_head_time_ms_ += static_cast<double>(time_in_ms() - lm_start_ms);
-    for (int k = 1; k < B; ++k) {
-      block[k] = drafted[k - 1];
+    // With an in-graph lm_head the logits already came back from HTP; otherwise
+    // scan the embedding table here.
+    if (!draft_has_lm_head_) {
+      const long lm_start_ms = time_in_ms();
+      lm_head_argmax(block_hidden.data() + hidden_row0, n_draft, &drafted);
+      lm_head_time_ms_ += static_cast<double>(time_in_ms() - lm_start_ms);
     }
-    total_drafted_ += static_cast<uint64_t>(B - 1);
+
+    // What the target checks: the confirmed token followed by the draft's guesses.
+    std::vector<uint64_t> verify(static_cast<size_t>(n_draft) + 1);
+    verify[0] = last_committed;
+    for (int k = 0; k < n_draft; ++k) {
+      verify[k + 1] = drafted[k];
+    }
+    total_drafted_ += static_cast<uint64_t>(n_draft);
 
     // --- VERIFY: target runs the whole block causally ---
-    target_verify_block(block, cur_pos, &target_sampled);
+    target_verify_block(verify, cur_pos, &target_sampled);
 
+    // Verify slot k predicts slot k+1, so target_sampled[k] is what the target
+    // would have put where the draft put verify[k+1].
     int accepted = 0;
-    for (int k = 1; k < B; ++k) {
-      if (block[k] == target_sampled[k - 1]) {
+    for (int k = 0; k < n_draft; ++k) {
+      if (verify[k + 1] == target_sampled[k]) {
         ++accepted;
       } else {
         break;
@@ -845,18 +957,26 @@ Result<int64_t> DFlashTokenGenerator::generate(
         "[DFlash] cur_pos=%lld accepted=%d/%d bonus=%llu draft_ctx=%d",
         static_cast<long long>(cur_pos),
         accepted,
-        B - 1,
+        n_draft,
         static_cast<unsigned long long>(bonus),
         draft_ctx_len_);
 
     // --- emit accepted draft tokens + bonus ---
+    // An EOS among the accepted tokens ends generation at that token, but must not
+    // skip the summary below, so it leaves through the same exit as everything else.
     uint64_t prev = last_committed;
+    bool hit_eos = false;
     for (int k = 1; k <= accepted; ++k) {
-      token_callback(ET_UNWRAP_TOKENIZER(tokenizer_->decode(prev, block[k])));
-      if (eos_ids_->count(block[k]) > 0) {
-        return static_cast<int64_t>(cur_pos + k - start_pos);
+      token_callback(ET_UNWRAP_TOKENIZER(tokenizer_->decode(prev, verify[k])));
+      if (eos_ids_->count(verify[k]) > 0) {
+        cur_pos += k;
+        hit_eos = true;
+        break;
       }
-      prev = block[k];
+      prev = verify[k];
+    }
+    if (hit_eos) {
+      break;
     }
     token_callback(ET_UNWRAP_TOKENIZER(tokenizer_->decode(prev, bonus)));
 

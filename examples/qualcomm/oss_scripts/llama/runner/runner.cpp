@@ -211,37 +211,64 @@ Error Runner::load() {
       break;
   }
   auto eos_ids = std::make_unique<std::unordered_set<uint64_t>>();
-  if (tokenizer_ != nullptr) {
-    eos_ids->insert(tokenizer_->encode("<|eot_id|>", 0, 0).get()[0]);
-    eos_ids->insert(tokenizer_->encode("<|eot|>", 0, 0).get()[0]);
-    eos_ids->insert(tokenizer_->encode("<|end_of_text|>", 0, 0).get()[0]);
-  } else {
+  if (tokenizer_ == nullptr) {
     tokenizer_ = llm::load_tokenizer(tokenizer_path_);
     if (tokenizer_ == nullptr) {
       ET_LOG(
           Error, "Failed to load tokenizer with %s", tokenizer_path_.c_str());
       return Error::Internal;
     }
+  }
+  // A marker this tokenizer really knows encodes to exactly one id. One it does not
+  // know gets BPE'd into pieces, and taking [0] of that hands back an unrelated
+  // ordinary token -- Qwen has no <|eot_id|>, and the first piece it fell apart into
+  // was '!', so every exclamation mark silently ended generation.
+  auto add_eos = [&](const char* marker) {
+    auto r = tokenizer_->encode(marker, 0, 0);
+    if (r.ok() && r.get().size() == 1) {
+      eos_ids->insert(r.get()[0]);
+    }
+  };
+  switch (decoder_model_version_) {
+    case DecoderModelVersion::kLlama3:
+      add_eos("<|eot_id|>");
+      add_eos("<|eot|>");
+      add_eos("<|end_of_text|>");
+      break;
+    case DecoderModelVersion::kPhi4:
+      add_eos("<|end|>");
+      break;
+    case DecoderModelVersion::kQwen3:
+    case DecoderModelVersion::kSmollm2_135m:
+    case DecoderModelVersion::kSmollm3:
+      add_eos("<|im_end|>");
+      add_eos("<|endoftext|>");
+      break;
+    case DecoderModelVersion::kGemma:
+    case DecoderModelVersion::kGemma2:
+    case DecoderModelVersion::kGemma3:
+      add_eos("<end_of_turn>");
+      break;
+    case DecoderModelVersion::kCodegen:
+      add_eos("<|endoftext|>");
+      break;
+    case DecoderModelVersion::kGlm:
+      add_eos("<|user|>");
+      break;
+    default:
+      break;
+  }
+  // eos_tok() only as a last resort: it reads tokenizer.json, and Qwen declares its
+  // eos in tokenizer_config.json instead, so it hands back an unset 0 -- i.e. '!'.
+  if (eos_ids->empty()) {
     eos_ids->insert(tokenizer_->eos_tok());
   }
-  if (decoder_model_version_ == DecoderModelVersion::kLlama3) {
-    eos_ids->insert(tokenizer_->encode("<|eot_id|>", 0, 0).get()[0]);
-  } else if (decoder_model_version_ == DecoderModelVersion::kPhi4) {
-    eos_ids->insert(tokenizer_->encode("<|end|>", 0, 0).get()[0]);
-  } else if (
-      decoder_model_version_ == DecoderModelVersion::kQwen3 ||
-      decoder_model_version_ == DecoderModelVersion::kSmollm2_135m ||
-      decoder_model_version_ == DecoderModelVersion::kSmollm3) {
-    eos_ids->insert(tokenizer_->encode("<|im_end|>", 0, 0).get()[0]);
-  } else if (
-      decoder_model_version_ == DecoderModelVersion::kGemma ||
-      decoder_model_version_ == DecoderModelVersion::kGemma2 ||
-      decoder_model_version_ == DecoderModelVersion::kGemma3) {
-    eos_ids->insert(tokenizer_->encode("<end_of_turn>", 0, 0).get()[0]);
-  } else if (decoder_model_version_ == DecoderModelVersion::kCodegen) {
-    eos_ids->insert(tokenizer_->encode("<|endoftext|>", 0, 0).get()[0]);
-  } else if (decoder_model_version_ == DecoderModelVersion::kGlm) {
-    eos_ids->insert(tokenizer_->encode("<|user|>", 0, 0).get()[0]);
+  {
+    std::string s;
+    for (uint64_t e : *eos_ids) {
+      s += std::to_string(e) + " ";
+    }
+    ET_LOG(Info, "eos ids: %s", s.c_str());
   }
 
   Result<MethodMeta> method_meta =
@@ -555,6 +582,7 @@ Error Runner::load() {
       return fb;
     };
     int32_t block_size = read_int_meta("get_dflash_block_size", block_size_);
+    bool shifted_decode = read_int_meta("get_dflash_shifted_decode", 0) != 0;
     int32_t hidden_dim = read_int_meta("get_dflash_hidden_size", 0);
     int32_t num_ctx_layers = read_int_meta("get_dflash_num_ctx_layers", 0);
     int32_t num_draft_layers = read_int_meta(
@@ -639,6 +667,7 @@ Error Runner::load() {
         /*max_context_len=*/max_ctx,
         /*prefill_ar_len=*/dflash_prefill_ar,
         /*mask_token_id=*/mask_token_id,
+        /*shifted_decode=*/shifted_decode,
     };
 
     auto dflash_gen = std::make_unique<DFlashTokenGenerator>(
