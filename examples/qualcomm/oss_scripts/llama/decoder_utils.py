@@ -729,12 +729,10 @@ def kv_inference(  # noqa: C901
     lookahead_config=None,
 ):
     input_samples = []  # Record input sample for quantization error analysis
-    is_multimodal = all(
-        [
-            tok_embedding,
-            audio_token_id or image_token_id,
-        ]
-    )
+    # external embedding: the decoder takes inputs_embeds instead of token ids —
+    # multimodal (image/audio) OR the text emb-split (tok_embedding in its own pte).
+    # The actual multimodal merge below is separately gated on `hidden_states`.
+    use_external_embedding = tok_embedding is not None
 
     _, atten_mask, _, k_caches, v_caches = get_example_inputs()
 
@@ -759,7 +757,7 @@ def kv_inference(  # noqa: C901
         prompt_token_list = prompt.flatten().tolist()
 
     # 2. process embedding
-    if is_multimodal:
+    if use_external_embedding:
         # 2.1 forward text embedding
         input_ids = torch.tensor([prompt_token_list])
         input_ids = (
@@ -819,9 +817,9 @@ def kv_inference(  # noqa: C901
     inputs = DecoderInputs(
         all_pos,
         atten_mask,
-        input_ids=prompt_token_list if not is_multimodal else None,
+        input_ids=prompt_token_list if not use_external_embedding else None,
         input_ids_dtype=torch.int64 if use_i64_token else torch.int32,
-        embedding=multimodal_embedding if is_multimodal else None,
+        embedding=multimodal_embedding if use_external_embedding else None,
     )
 
     # 4. decoder forward

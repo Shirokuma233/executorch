@@ -42,6 +42,8 @@ from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
     EAGLE_HEAD,
     EAGLE_TARGET,
     EVAL_MODE,
+    LM_HEAD,
+    LM_HEAD_GRAPH_NAMES,
     PROMPT_EVAL,
     SQNR_EVAL,
     TASKS_EVAL,
@@ -225,6 +227,7 @@ def compile(
         TEXT_ENCODER: None,
         VISION_ENCODER: None,
         TOK_EMBEDDING: None,
+        LM_HEAD: None,
         TEXT_DECODER: None,
     }
     for modality in compile_specs:
@@ -251,7 +254,9 @@ def compile(
             )
             skip_quantize[modality] = to_skip
             compile_specs[modality] = encoder_compile_specs
-        elif is_multimodal and modality == TOK_EMBEDDING:
+        elif modality == TOK_EMBEDDING and (
+            is_multimodal or getattr(args, "split_embedding", False)
+        ):
             if args.backend == "htp":
                 backend_options = generate_htp_compiler_spec(
                     use_fp16=False,
@@ -272,6 +277,29 @@ def compile(
                     online_prepare=args.online_prepare,
                 )
             ] * len(TOK_EMBEDDING_GRAPH_NAMES)
+        elif modality == LM_HEAD and getattr(args, "headless_decoder", False):
+            # headless decoder: standalone lm_head lowered to its own shared pte
+            # (weight-shared across its kv/prefill AR graphs, like tok_embedding).
+            if args.backend == "htp":
+                backend_options = generate_htp_compiler_spec(
+                    use_fp16=False,
+                    # x86 emulator does not support weight sharing
+                    use_weight_sharing=not args.enable_x86_64,
+                )
+            elif args.backend == "gpu":
+                backend_options = generate_gpu_compiler_spec()
+            else:
+                raise ValueError(f"Unsupported backend {args.backend}")
+
+            compile_specs[modality] = [
+                generate_qnn_executorch_compiler_spec(
+                    soc_model=get_soc_to_chipset_map()[args.soc_model],
+                    backend_options=backend_options,
+                    # x86 emulator does not support shared buffer
+                    shared_buffer=not args.enable_x86_64,
+                    online_prepare=args.online_prepare,
+                )
+            ] * len(LM_HEAD_GRAPH_NAMES)
         elif modality == TEXT_DECODER:
             # compile spec for text decoder
             if args.backend == "htp":
@@ -614,6 +642,27 @@ def _build_parser():
     )
 
     parser.add_argument(
+        "--headless_decoder",
+        action="store_true",
+        help="Drop the in-graph lm_head; the decoder outputs the final hidden "
+        "(lm_head moves to a separate shared pte). Dev/test hook for the vocab-split work.",
+    )
+
+    parser.add_argument(
+        "--verify_split",
+        action="store_true",
+        help="Host numerical check of each split-out structure (e.g. lm_head): "
+        "compare fp32 vs deployed QDQ (argmax agreement) on a real hidden during compile.",
+    )
+
+    parser.add_argument(
+        "--split_embedding",
+        action="store_true",
+        help="Move the token embedding to a separate shared pte; the decoder takes "
+        "inputs_embeds (LlamaModelWithoutEmbedding). Dev/test hook for the vocab-split work.",
+    )
+
+    parser.add_argument(
         "--ngram",
         help="Represents the size of the n-grams used in the lookahead process.",
         default=5,
@@ -722,6 +771,12 @@ def _build_parser():
         default=None,
         type=str,
         help="[DFlash mode] Path to the DFlash draft checkpoint dir (config.json + model.safetensors).",
+    )
+    parser.add_argument(
+        "--dflash_draft_no_ptq",
+        action="store_true",
+        help="[DFlash mode] Skip draft PTQ (run the draft in fp16). By default the "
+        "draft is quantized to 16a4w, calibrated on the quantized target's hidden.",
     )
     parser.add_argument(
         "--block_size",
@@ -944,6 +999,7 @@ def export_llama(args) -> None:
         TEXT_ENCODER: f"{TEXT_ENCODER}_qnn",
         VISION_ENCODER: f"{VISION_ENCODER}_qnn",
         TOK_EMBEDDING: f"{TOK_EMBEDDING}_qnn",
+        LM_HEAD: f"{LM_HEAD}_qnn",
         EAGLE_HEAD: f"eagle_head_{args.eagle_draft_backend}",
         DFLASH_DRAFT: f"dflash_draft_{args.dflash_draft_backend}",
     }

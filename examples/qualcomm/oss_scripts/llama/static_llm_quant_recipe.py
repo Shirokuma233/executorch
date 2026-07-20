@@ -693,6 +693,55 @@ class Qwen3_4BQuantRecipe(StaticLLMQuantRecipe):
         self.recipe.custom_quant_annotations.append(annotate_kv_8bit)
 
 
+class DFlashDraftQuantRecipe(StaticLLMQuantRecipe):
+    """16a4w recipe for the DFlash draft (block-speculative head).
+
+    Mirrors Qwen3_4BQuantRecipe (16a4w default, per-block conv2d) and protects the
+    two outlier-heavy projections at 16a8w per-channel:
+      - fc: sums num_ctx_layers*H target-hidden values including the attention-sink
+        outlier (host measured peak |fc(x)| up to ~281k).
+      - mlp.down_proj: writes into the residual stream (classic PTQ outlier layer).
+    The draft shares the target's emb/lm_head (has neither in-graph), so there is
+    nothing else to protect. convert_linear_to_conv2d turns each nn.Linear into a
+    Conv2D wrapper whose inner conv is `<name>.conv`, hence the regex names.
+    """
+
+    default_quant_dtype = QuantDtype.use_16a4w
+
+    def __init__(self, verbose: bool = False):
+        super().__init__()
+        self.recipe = (
+            QuantRecipe(
+                self.default_quant_dtype,
+                False,
+                act_observer=MinMaxObserver,
+                granularity=QuantGranularity.PER_TENSOR,
+                verbose=verbose,
+            )
+            .add_node_target(
+                {
+                    torch.ops.aten.conv2d.default,
+                },
+                QuantDtype.use_16a4w_block,
+                False,
+                act_observer=MinMaxObserver,
+                granularity=QuantGranularity.PER_BLOCK,
+                extra_kwargs={"block_size": (1, 16, 1, 1)},
+            )
+            .add_regex(
+                {
+                    r"fc\.conv",
+                    r"layers\..*\.mlp\.down_proj\.conv",
+                    r"lm_head\.conv",  # only present when the draft keeps an in-graph
+                },                     # lm_head; harmless (no match) when it shares the
+                QuantDtype.use_16a8w,  # target's lm_head.pte.
+                False,
+                act_observer=MinMaxObserver,
+                granularity=QuantGranularity.PER_CHANNEL,
+            )
+        )
+
+
 class Smollm2QuantRecipe(StaticLLMQuantRecipe):
     default_quant_dtype = QuantDtype.use_16a8w
 

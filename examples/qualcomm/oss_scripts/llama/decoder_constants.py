@@ -17,6 +17,7 @@ AUDIO_ENCODER = "audio_encoder"
 VISION_ENCODER = "vision_encoder"
 TEXT_ENCODER = "text_encoder"
 TOK_EMBEDDING = "tok_embedding"
+LM_HEAD = "lm_head"
 TEXT_DECODER = "text_decoder"
 ATTENTION_SINK_EVICTOR = "attention_sink_evictor"
 
@@ -40,6 +41,12 @@ MODALITY_INPUT_FLAG_MAP = {
 TOK_EMBEDDING_GRAPH_NAMES = [
     "tok_embedding_kv_forward",
     "tok_embedding_prefill_forward",
+]
+# Standalone lm_head graph names (headless decoder: vocab projection in its own
+# shared pte). Same decode/prefill (AR8/AR32) split as the decoder.
+LM_HEAD_GRAPH_NAMES = [
+    "lm_head_kv_forward",
+    "lm_head_prefill_forward",
 ]
 # Decoder graph names
 DECODER_GRAPH_NAMES = ["kv_forward", "prefill_forward"]

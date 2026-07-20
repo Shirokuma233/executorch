@@ -15,6 +15,7 @@ import torch
 from executorch.examples.qualcomm.oss_scripts.llama import LLMModelConfig
 from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
     AUDIO_ENCODER,
+    LM_HEAD,
     TEXT_DECODER,
     TEXT_ENCODER,
     TOK_EMBEDDING,
@@ -182,6 +183,8 @@ class DatasetBuilder:
             TEXT_ENCODER: [[] for _ in range(len(prompts))],
             VISION_ENCODER: [[] for _ in range(len(prompts))],
             TOK_EMBEDDING: [[] for _ in range(len(prompts))],
+            # lm_head is calibrated internally on the decoder's output-hidden.
+            LM_HEAD: [[] for _ in range(len(prompts))],
             # Decoder targets: one string per prompt.
             TEXT_DECODER: ["" for _ in range(len(prompts))],
         }

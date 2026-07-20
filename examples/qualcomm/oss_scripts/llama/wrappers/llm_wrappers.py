@@ -54,6 +54,8 @@ from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
     AUDIO_ENCODER,
     DECODE_QDQ_FILENAME,
     DECODER_GRAPH_NAMES,
+    LM_HEAD,
+    LM_HEAD_GRAPH_NAMES,
     TEXT_DECODER,
     TEXT_ENCODER,
     TOK_EMBEDDING,
@@ -74,10 +76,12 @@ from executorch.examples.qualcomm.oss_scripts.llama.mix_precision_analyzer impor
     save_suggest_recipes,
 )
 from executorch.examples.qualcomm.oss_scripts.llama.model.embedding import (
+    LmHead,
     TokenEmbedding,
 )
 from executorch.examples.qualcomm.oss_scripts.llama.model.static_llama import (
     LlamaModel,
+    LlamaModelWithoutEmbedding,
     ModelArgs,
 )
 from executorch.examples.qualcomm.oss_scripts.llama.static_llm_quant_recipe import (
@@ -104,6 +108,26 @@ from torchao.quantization.pt2e.quantize_pt2e import convert_pt2e, prepare_pt2e
 from transformers import AutoModel, AutoModelForSpeechSeq2Seq
 
 
+class _SplitEval(torch.nn.Module):
+    """Runs the full split path (tokens -> [emb] -> decoder -> [lm_head] -> logits)
+    as one token-in/logits-out module, so a real KV generation can verify the split
+    end-to-end (coherent text == split preserves the model). tok_embedding/lm_head are
+    None when that piece is still in-graph."""
+
+    def __init__(self, tok_embedding, decoder, lm_head):
+        super().__init__()
+        self.tok_embedding = tok_embedding
+        self.decoder = decoder
+        self.lm_head = lm_head
+
+    def forward(self, x, *rest):
+        if self.tok_embedding is not None:
+            x = self.tok_embedding(x)
+        out = self.decoder(x, *rest)
+        logits = self.lm_head(out[0]) if self.lm_head is not None else out[0]
+        return (logits, *out[1:])
+
+
 class TextDecoder(Component):
 
     def __init__(
@@ -113,6 +137,7 @@ class TextDecoder(Component):
         mode: Mode,
         apply_embedding: bool = False,
         output_hidden_layers: Optional[List[int]] = None,
+        apply_output: bool = True,
     ):
         self.control_args = control_args
         self.config = config
@@ -121,6 +146,16 @@ class TextDecoder(Component):
         self.dep_table = get_passes_dependency_for_capture_program()
         self.meta = {}
         self.output_hidden_layers = output_hidden_layers
+        # apply_output=False -> headless decoder (no lm_head, output = final hidden);
+        # lm_head lives in a separate shared pte. Flips the IO tagging to hidden-shaped.
+        self.apply_output = apply_output
+        self.lm_head = None  # built in _get_model_instance when headless
+        self.lm_head_passes_job = (
+            get_capture_program_passes() if not apply_output else None
+        )
+        self.lm_head_dep_table = (
+            get_passes_dependency_for_capture_program() if not apply_output else None
+        )
         self.quant_recipe: StaticLLMQuantRecipe = (
             self.config.quant_recipe(True) if self.config.quant_recipe else None
         )
@@ -251,6 +286,13 @@ class TextDecoder(Component):
 
         decoder = convert_linear_to_conv2d(decoder)
 
+        # convert_linear_to_conv2d replaces decoder.output in place with a new
+        # Conv2D; the LmHead built earlier still references the old nn.Linear, so
+        # re-point it at the converted module for op/quant parity with the in-graph
+        # lm_head.
+        if self.lm_head is not None:
+            self.lm_head.output = decoder.output
+
         # check dtype override
         if self.control_args.dtype_override is not None:
             dtype_override = DType[self.control_args.dtype_override]
@@ -281,10 +323,14 @@ class TextDecoder(Component):
         if self.mode == Mode.PREFILL and self.control_args.model_mode == "kv":
             return None
         use_i64_token = self.control_args.embedding_quantize is not None
+        self.is_multimodal = hasattr(self.config, AUDIO_ENCODER) or hasattr(
+            self.config, VISION_ENCODER
+        )
 
-        # get embedding model
+        # get embedding model (multimodal: from the HF encoder model). Text
+        # emb-split builds its TokenEmbedding from the decoder's own table below.
         tok_embedding = None
-        if self.apply_embedding:
+        if self.apply_embedding and self.is_multimodal:
             if hasattr(self.config, AUDIO_ENCODER):
                 auto_model = AutoModelForSpeechSeq2Seq.from_pretrained(
                     self.config.repo_id, _attn_implementation="eager"
@@ -306,17 +352,36 @@ class TextDecoder(Component):
             # For gemma, we have preprocessed the weight of rmsnorm
             self.model_args.norm_type = "rmsnorm"
 
-        decoder: LlamaModel = LLM_VARIANT_ARCHS.get(
-            self.control_args.decoder_model, LlamaModel
-        )(
+        # emb-split text decoder takes inputs_embeds (LlamaModelWithoutEmbedding) so
+        # the embedding table can move to a separate shared pte. Multimodal models are
+        # already mapped to WithoutEmbedding in LLM_VARIANT_ARCHS.
+        arch = LLM_VARIANT_ARCHS.get(self.control_args.decoder_model, LlamaModel)
+        if self.apply_embedding and not self.is_multimodal:
+            arch = LlamaModelWithoutEmbedding
+        decoder: LlamaModel = arch(
             self.model_args,
             ar_len=self.model_args.ar_len,
             output_new_cache_only=True,
             output_cache=True,
             use_i64_token=use_i64_token,
             output_hidden_layers=self.output_hidden_layers,
+            apply_output=self.apply_output,
             **get_model_specific_kwargs(self.control_args, self.config),
         )
+
+        # text emb-split: build a standalone TokenEmbedding from the decoder's own
+        # embedding table (mirrors LmHead). It references decoder.tok_embeddings, which
+        # load_state_dict populates later; nn.Embedding is untouched by
+        # convert_linear_to_conv2d so no re-point is needed.
+        if self.apply_embedding and not self.is_multimodal:
+            tok_embedding = TokenEmbedding(
+                decoder.tok_embeddings,
+                self.model_args.max_batch_size,
+                self.model_args.ar_len,
+                self.model_args.vocab_size,
+                self.model_args.dim,
+                use_i64_token,
+            )
 
         self.meta = decoder.get_metadata()
         # get example input
@@ -330,11 +395,12 @@ class TextDecoder(Component):
             *(self.example_input[4] if decoder.use_kv_cache else []),  # v_caches
         )
         self.io_shape = {
-            # logit output
+            # graph output: logits (vocab) normally, or the final hidden (dim) when
+            # headless (apply_output=False) — lm_head then lives in a separate pte.
             (
                 decoder.max_batch_size,
                 decoder.ar_len,
-                decoder.vocab_size,
+                decoder.vocab_size if self.apply_output else decoder.dim,
             ),
         }
         # shape of k caches and v caches
@@ -351,6 +417,26 @@ class TextDecoder(Component):
             self.tok_embedding_export_input = (
                 tok_embedding.get_example_input()
             )  # tokens
+
+        # headless: build a standalone lm_head (hidden -> logits) so the vocab
+        # projection can be lowered to a separate shared pte. Quantize/lower are
+        # wired in quantize()/compile(); here we just construct it + its export input.
+        self.lm_head = None
+        if not self.apply_output:
+            self.lm_head = LmHead(
+                decoder.output,
+                decoder.max_batch_size,
+                decoder.ar_len,
+                decoder.vocab_size,
+                decoder.dim,
+            ).eval()
+            self.lm_head_export_input = self.lm_head.get_example_input()
+            # input = final hidden [b, ar, dim]; output = logits [b, ar, vocab] —
+            # both quantized uint16 at the pte boundary.
+            self.lm_head_io_shape = {
+                (decoder.max_batch_size, decoder.ar_len, decoder.dim),
+                (decoder.max_batch_size, decoder.ar_len, decoder.vocab_size),
+            }
 
         return tok_embedding, decoder
 
@@ -410,7 +496,10 @@ class TextDecoder(Component):
                 and users[0].meta["val"].size()[-2:] in self.kv_cache_shape
             ):
                 quant_io_type = fixed_point_type["kv_type"]
-            elif node.meta["val"].size() in self.io_shape:
+            elif node.meta["val"].size() in self.io_shape and not self.apply_embedding:
+                # emb-split (apply_embedding) decoder takes inputs_embeds (same [b,ar,
+                # dim] shape as the headless hidden output); keep that input fp32 — the
+                # emb.pte -> decoder boundary is fp32 (its output isn't tagged either).
                 quant_io_type = fixed_point_type["io_type"]
             elif node.meta["val"].size() in atten_mask_shape:
                 quant_io_type = fixed_point_type["io_type"]
@@ -431,6 +520,16 @@ class TextDecoder(Component):
         if node.target in freq_op and node.meta["val"].size() in freq_shape:
             quant_io_type = fixed_point_type["io_type"]
 
+        return quant_io_type
+
+    def _tag_lm_head_ios(self, node, fixed_point_type):
+        # standalone lm_head graph: input hidden [b, ar, dim] and output logits
+        # [b, ar, vocab] are both quantized uint16 at the pte boundary.
+        quant_io_type = None
+        if node.op == "placeholder" and node.meta["val"].size() in self.lm_head_io_shape:
+            quant_io_type = fixed_point_type["io_type"]
+        if is_graph_output(node) and node.meta["val"].size() in self.lm_head_io_shape:
+            quant_io_type = fixed_point_type["io_type"]
         return quant_io_type
 
     def _quant_recipe_suggestion(
@@ -601,6 +700,68 @@ class TextDecoder(Component):
             input_samples.extend(input_sample)
         return input_samples
 
+    def _override_lm_head_input_scale(self, scale, zero_point):
+        # Force the lm_head input-activation quant params to the decoder's
+        # output-hidden encoding so decoder(uint16 hidden) -> lm_head(uint16
+        # hidden) requant is lossless across the pte boundary.
+        q_op = torch.ops.quantized_decomposed.quantize_per_tensor.default
+        dq_op = torch.ops.quantized_decomposed.dequantize_per_tensor.default
+        patched = 0
+        for node in self.lm_head.graph.nodes:
+            if node.op != "placeholder":
+                continue
+            for user in list(node.users):
+                if user.target is q_op:
+                    user.args = (user.args[0], scale, zero_point, *user.args[3:])
+                    patched += 1
+                    for dq in list(user.users):
+                        if dq.target is dq_op:
+                            dq.args = (dq.args[0], scale, zero_point, *dq.args[3:])
+        self.lm_head.recompile()
+        logging.info(
+            "lm_head input scale injected: patched=%d scale=%s zp=%s",
+            patched,
+            scale,
+            zero_point,
+        )
+        if patched == 0:
+            raise RuntimeError(
+                "lm_head input quantize node not found; boundary scale not injected"
+            )
+
+    def _verify_generate(self):
+        # Verify the split end-to-end with a REAL KV generation on the calibration
+        # prompt: build the full split path (tokens -> [emb] -> decoder -> [lm_head])
+        # as one module and run it through kv_inference, which logs the decoded text.
+        # Coherent text (matching the monolithic run) == the split preserves the model.
+        # (A single-token / no-context dump is useless here: headless decoders output
+        # hidden, and gibberish tokens saturate the logits.)
+        # no .eval() — submodules are exported QDQ GraphModules (already eval);
+        # torchao forbids train()/eval() on exported models.
+        combined = _SplitEval(
+            self.tok_embedding if self.apply_embedding else None,
+            self.decoder,
+            self.lm_head if not self.apply_output else None,
+        )
+        # run a few diverse prompts so the mono-vs-split comparison isn't a single point
+        prompts = [
+            self._verify_prompt,
+            "The capital of France is",
+        ]
+        for i, p in enumerate(prompts):
+            graph_module_inference(
+                use_kv_cache=self.meta["get_use_kv_cache"],
+                get_example_inputs=self.get_example_inputs,
+                module=combined,
+                tokenizer=self._verify_tokenizer,
+                ar_len=self.meta["get_ar_len"],
+                # cap generation so a broken split doesn't emit a full context of garbage
+                max_seq_len=min(self.meta["get_max_context_len"], 64),
+                prompt=p,
+                use_i64_token=self.control_args.embedding_quantize is not None,
+                event_name=f"verify_split_{i}",
+            )
+
     @log_info
     def quantize(self, request: Request):  # noqa: C901
         if self.quant_recipe is None:
@@ -678,6 +839,10 @@ class TextDecoder(Component):
             if self.control_args.quant_recipe_suggestion:
                 graph_module = copy.deepcopy(self.decoder)
 
+            # real decoder inputs collected during calibration (used by
+            # quant_recipe_suggestion below).
+            input_samples = None
+
             # Auto-tune thread count BEFORE prepare_pt2e so the benchmark
             # runs on the exported model without observers — no risk of
             # polluting observer state with synthetic inputs.
@@ -692,6 +857,34 @@ class TextDecoder(Component):
                     self.tok_embedding, tok_embedding_quantizer
                 )
 
+            # 路B (joint calibration): when the lm_head is split out, calibrate the
+            # WHOLE chain together on the REAL trajectory. A headless decoder alone
+            # argmaxes its hidden output -> garbage tokens -> garbage-trajectory
+            # calibration (transformer + scales polluted). Preparing the lm_head now
+            # and generating through the combined module makes argmax use the real
+            # lm_head logits -> real tokens -> real hidden, so every observer sees the
+            # real distribution. = "一起量化，切分pte的时候分开".
+            split_lm_head = not self.apply_output and self.lm_head is not None
+            calib_model = self.decoder
+            if split_lm_head:
+                lm_head_quantizer = make_quantizer(
+                    quant_dtype=QuantDtype.use_16a8w,
+                    per_channel_conv=True,
+                    per_channel_linear=True,
+                    act_observer=MinMaxObserver,
+                    backend=data.backend,
+                    soc_model=data.soc_model,
+                )
+                self.lm_head = torch.export.export(
+                    self.lm_head, self.lm_head_export_input, strict=True
+                ).module()
+                self.lm_head = prepare_pt2e(self.lm_head, lm_head_quantizer)
+                calib_model = _SplitEval(
+                    self.tok_embedding if self.apply_embedding else None,
+                    self.decoder,
+                    self.lm_head,
+                )
+
             # start calibration (only for kv mode or prefill mode without kv cache)
             if self.mode == Mode.DECODE or not self.model_args.use_kv_cache:
                 original_threads = torch.get_num_threads()
@@ -703,11 +896,12 @@ class TextDecoder(Component):
                 )
                 try:
                     input_samples = self._calibrate(
-                        model=self.decoder,
+                        model=calib_model,
                         tokenizer=data.tokenizer,
                         event="prepare_pt2e",
                         user_calibration_data=data.calibration_data.datasets,
-                        tok_embedding=self.tok_embedding,
+                        # combined model embeds internally -> feed tokens (None)
+                        tok_embedding=None if split_lm_head else self.tok_embedding,
                         intermediate_outputs=intermediate_outputs,
                     )
                 finally:
@@ -716,6 +910,8 @@ class TextDecoder(Component):
                 # one dummy inference to remove affine observer
                 # error happened in convert_pt2e
                 self.decoder(*self.export_input)
+                if split_lm_head:
+                    self.lm_head(*self.lm_head_export_input)
 
             self.decoder = convert_pt2e(self.decoder)
 
@@ -738,6 +934,9 @@ class TextDecoder(Component):
 
             if self.apply_embedding:
                 self.tok_embedding = convert_pt2e(self.tok_embedding)
+
+            if split_lm_head:
+                self.lm_head = convert_pt2e(self.lm_head)
 
             if self.control_args.verbose and self.mode == Mode.DECODE:
                 audio_turns = request.method_data[
@@ -770,6 +969,19 @@ class TextDecoder(Component):
         # save logit's quantization attributes to meta
         self._save_logits_quant_attrs()
 
+        # lm_head is now quantized jointly with the decoder above (real-trajectory
+        # calibration via the combined module); the boundary scale is injected in compile.
+
+        # split verification: stash the real calibration prompt/tokenizer (compile has
+        # no calibration data). apply_output=True paths (monolithic, emb-only split)
+        # run the generation here; headless (apply_output=False) runs it in compile
+        # after the lm_head scale injection.
+        if getattr(self.control_args, "verify_split", False):
+            self._verify_tokenizer = data.tokenizer
+            self._verify_prompt = data.calibration_data.datasets[0]
+            if self.apply_output:
+                self._verify_generate()
+
         # save output KV cache's quantization attributes to meta for attention sink
         self._save_output_kv_cache_quant_attrs()
 
@@ -778,12 +990,24 @@ class TextDecoder(Component):
         self.passes_job[TagQuantIO][QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY][
             "get_quant_io_dtype_fn"
         ] = partial(self._tag_ios, fixed_point_type=fixed_point_type)
-        if self.tok_embedding_passes_job is not None:
+        # Activate the emb-pte IO tagging only when the decoder still outputs logits
+        # (apply_output=True: multimodal, or emb-split-only). When the decoder is
+        # also headless (apply_output=False) io_shape is dim-width and would wrongly
+        # tag the emb output uint16 — the emb->decoder boundary is fp32 (option a).
+        if self.tok_embedding_passes_job is not None and self.apply_output:
             self.tok_embedding_passes_job[TagQuantIO][QCOM_PASS_ACTIVATE_KEY] = True
             self.tok_embedding_passes_job[TagQuantIO][
                 QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY
             ]["get_quant_io_dtype_fn"] = partial(
                 self._tag_ios, fixed_point_type=fixed_point_type
+            )
+        if self.lm_head_passes_job is not None:
+            self.lm_head_passes_job[TagQuantIO][QCOM_PASS_ACTIVATE_KEY] = True
+            self.lm_head_passes_job[TagQuantIO][QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY][
+                "get_quant_io_dtype_fn"
+            ] = partial(
+                self._tag_lm_head_ios,
+                fixed_point_type={"io_type": fixed_point_type["io_type"]},
             )
 
 
@@ -795,6 +1019,7 @@ class HybridTextDecoder(Component):
         config: LLMModelConfig,
         apply_embedding: bool = False,
         output_hidden_layers: Optional[List[int]] = None,
+        apply_output: bool = True,
     ):
         self.decode = TextDecoder(
             control_args,
@@ -802,6 +1027,7 @@ class HybridTextDecoder(Component):
             Mode.DECODE,
             apply_embedding=apply_embedding,
             output_hidden_layers=output_hidden_layers,
+            apply_output=apply_output,
         )
         self.prefill = TextDecoder(
             control_args,
@@ -809,12 +1035,14 @@ class HybridTextDecoder(Component):
             Mode.PREFILL,
             apply_embedding=apply_embedding,
             output_hidden_layers=output_hidden_layers,
+            apply_output=apply_output,
         )
         self.control_args = control_args
         self.config = config
         self.set_next(self.decode).set_next(self.prefill)
 
         self.apply_embedding = apply_embedding
+        self.apply_output = apply_output
 
     def _encoding_override(self, decode_model, prefill_model):  # noqa: C901
         pbq_target = {
@@ -1000,7 +1228,69 @@ class HybridTextDecoder(Component):
             ) as file:
                 tok_embedding_exec_prog_mgr.write_to_file(file)
 
+        # prepare lowering lm_head (headless: vocab projection in a separate shared
+        # pte). Force its input-activation scale to the decoder's output-hidden
+        # scale so the decoder -> lm_head pte boundary is lossless (both uint16).
+        # DFlash headless targets don't pass LM_HEAD (the runner projects via the
+        # embed table / a shared lm_head.pte), so skip the split there.
+        if not self.apply_output and LM_HEAD in request.method_data:
+            lm_head_data = request.method_data[LM_HEAD]
+            lm_head_models = [
+                d for d in [self.decode, self.prefill] if d.lm_head is not None
+            ]
+            hidden_scale = self.decode.meta["get_logits_scale"]
+            hidden_zp = self.decode.meta["get_logits_zero_point"]
+            lm_head_example_inputs = [m.lm_head_export_input for m in lm_head_models]
+            lm_head_graph_names = LM_HEAD_GRAPH_NAMES[: len(lm_head_models)]
+            for m in lm_head_models:
+                m._override_lm_head_input_scale(hidden_scale, hidden_zp)
+            if getattr(self.control_args, "verify_split", False):
+                # headless split path: real generation tokens -> [emb] -> decoder ->
+                # lm_head -> logits, logging the decoded text for coherence check.
+                self.decode._verify_generate()
+
+            lm_head_edge_prog_mgr = to_edge_transform_and_lower_to_qnn(
+                module=dict(
+                    zip(lm_head_graph_names, [m.lm_head for m in lm_head_models])
+                ),
+                inputs=dict(zip(lm_head_graph_names, lm_head_example_inputs)),
+                compiler_specs=dict(
+                    zip(lm_head_graph_names, lm_head_data.compile_spec)
+                ),
+                dep_table=dict(
+                    zip(
+                        lm_head_graph_names,
+                        [m.lm_head_dep_table for m in lm_head_models],
+                    )
+                ),
+                passes_job=dict(
+                    zip(
+                        lm_head_graph_names,
+                        [m.lm_head_passes_job for m in lm_head_models],
+                    )
+                ),
+            )
+            if self.control_args.verbose:
+                for ep in lm_head_edge_prog_mgr._edge_programs.values():
+                    print_delegation_info(ep.graph_module)
+
+            executorch_config = ExecutorchBackendConfig(
+                memory_planning_pass=MemoryPlanningPass(
+                    alloc_graph_input=False,
+                    alloc_graph_output=False,
+                ),
+                passes=[BuildQuantIo()],
+            )
+            lm_head_exec_prog_mgr = lm_head_edge_prog_mgr.to_executorch(
+                executorch_config
+            )
+            with open(
+                f"{self.control_args.artifact}/{lm_head_data.pte_filename}.pte", "wb"
+            ) as file:
+                lm_head_exec_prog_mgr.write_to_file(file)
+
         # decoder lowering
+        data = request.method_data[TEXT_DECODER]
         edge_prog_mgr = to_edge_transform_and_lower_to_qnn(
             module=dict(zip(graph_names, [model.decoder for model in models])),
             inputs=dict(zip(graph_names, example_inputs)),
@@ -1221,13 +1511,20 @@ class MultiModalManager(Component):
         self.text_decoder = HybridTextDecoder(
             control_args,
             config,
-            apply_embedding=self.audio_encoder.model or self.vision_encoder.model,
+            # multimodal always splits the embedding; --split_embedding is the text
+            # dev/test hook that moves the embedding to a separate shared pte.
+            apply_embedding=bool(self.audio_encoder.model or self.vision_encoder.model)
+            or getattr(control_args, "split_embedding", False),
+            # dev/test hook: --headless_decoder makes a plain text compile drop the
+            # in-graph lm_head (output = final hidden) to exercise the headless path.
+            apply_output=not getattr(control_args, "headless_decoder", False),
         )
         self._modalities = [
             AUDIO_ENCODER,
             TEXT_ENCODER,
             VISION_ENCODER,
             TOK_EMBEDDING,
+            LM_HEAD,
             TEXT_DECODER,
         ]
         # build dependency chain

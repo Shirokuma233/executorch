@@ -671,6 +671,10 @@ class LlamaModel(nn.Module):
         self.kv_io_bit_width = config.kv_io_bit_width
         self.logits_scaling = config.logits_scaling
         self.output_hidden_layers = kwargs.get("output_hidden_layers", None)
+        # apply_output=False -> "headless": skip lm_head (self.output), return the
+        # final normed hidden instead of logits, so lm_head can live in a separate
+        # shared pte. The returned hidden is exactly what self.output consumes.
+        self.apply_output = kwargs.get("apply_output", True)
 
         self.layers = nn.ModuleList(
             [
@@ -762,10 +766,14 @@ class LlamaModel(nn.Module):
             output_v_cache.extend(v)
 
         hidden_states = self.norm(hidden_states)
-        logits = self.output(hidden_states)
-
-        if self.logits_scaling:
-            logits = logits / self.logits_scaling
+        if self.apply_output:
+            logits = self.output(hidden_states)
+            if self.logits_scaling:
+                logits = logits / self.logits_scaling
+        else:
+            # headless: the first output slot carries the final normed hidden;
+            # lm_head runs in a separate shared pte that consumes exactly this.
+            logits = hidden_states
 
         if self.output_cache:
             if captured_hiddens is not None:
@@ -903,10 +911,14 @@ class LlamaModelWithoutEmbedding(LlamaModel):
             output_v_cache.extend(v)
 
         hidden_states = self.norm(hidden_states)
-        logits = self.output(hidden_states)
-
-        if self.logits_scaling:
-            logits = logits / self.logits_scaling
+        if self.apply_output:
+            logits = self.output(hidden_states)
+            if self.logits_scaling:
+                logits = logits / self.logits_scaling
+        else:
+            # headless: the first output slot carries the final normed hidden;
+            # lm_head runs in a separate shared pte that consumes exactly this.
+            logits = hidden_states
 
         if self.output_cache:
             if captured_hiddens is not None:
