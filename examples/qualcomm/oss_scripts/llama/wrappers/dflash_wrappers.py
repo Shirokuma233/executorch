@@ -581,6 +581,7 @@ class DFlashDraftCompiler(Component):
         ckpt_dir: str,
         max_context_len: int,
         prefill_ar: int,
+        share_lm_head: bool = False,
     ):
         self.control_args = control_args
         self.config = config
@@ -596,11 +597,17 @@ class DFlashDraftCompiler(Component):
         # and fc_output_scale keeps the fc conv in range.
         dtype = torch.float32
 
-        # Only checkpoints that carry lm_head.weight can host the vocab projection.
-        # Older ones (Qwen3-4B-DFlash-b16) leave it to the runner, which scans the
-        # target's embedding table for it.
-        self.with_lm_head = "lm_head.weight" in sd
-        log_msg = "in-graph (HTP)" if self.with_lm_head else "host (runner scan)"
+        # Shared architecture: the draft drops any in-graph lm_head and shares the
+        # target's lm_head.pte, outputting hidden only. Even checkpoints that ship
+        # lm_head.weight (block7) get it stripped here. Without sharing, a checkpoint
+        # that carries lm_head.weight keeps the vocab projection in-graph (HTP) and
+        # older ones leave it to the runner's host scan of the target embedding table.
+        self.with_lm_head = (not share_lm_head) and "lm_head.weight" in sd
+        log_msg = (
+            "in-graph (HTP)"
+            if self.with_lm_head
+            else ("shared lm_head.pte" if share_lm_head else "host (runner scan)")
+        )
         logging.info("DFlash draft lm_head: %s", log_msg)
 
         def build(ar_len):
@@ -694,6 +701,20 @@ class DFlashDraftCompiler(Component):
             "DFlash draft quantized (16a4w; fc/down_proj/lm_head 16a8w protected)"
         )
 
+        # Dump the decode (block) QDQ graph so the host accept loop can drive the
+        # draft on CPU (QDQ == pte). Same op namespace as the decoder QDQ; load with
+        # `import torch.ao.quantization.fx._decomposed` first.
+        if getattr(self.control_args, "dump_qdq", False):
+            ep = torch.export.export(self.decode, self.decode_input, strict=True)
+            path = f"{self.control_args.artifact}/qdq_draft.pt2"
+            torch.export.save(ep, path)
+            # new_context AR dim (self.decode is now a GraphModule, no .AR attribute)
+            logging.info(
+                "dumped QDQ qdq_draft (ar=%d) -> %s",
+                self.decode_input[2].shape[1],
+                path,
+            )
+
         # Verify the EXACT QDQ decode graph (the one lowered into the pte) against
         # the fp32 draft on the real dumped target hidden: same drafted tokens =>
         # no accept loss from draft quantization. QDQ == the device pte numerically.
@@ -711,10 +732,14 @@ class DFlashDraftCompiler(Component):
         committed-token sequences."""
         prefill = self.target.prefill  # quantized TextDecoder (prefill graph)
         decoder = prefill.decoder  # QDQ GraphModule -> (hidden, k, v, *captured)
-        ex = list(prefill.export_input)  # (tokens, mask, pos, *caches), export format
-        pref_ar = ex[0].shape[-1]
+        # emb-split target: the decoder takes inputs_embeds, so ex[0] is [1, ar, H].
+        # Embed the calibration tokens with the raw (tied) target table — the
+        # emb.pte -> decoder boundary is fp32, and the decoder applies its own
+        # embedding_scale_factor, so the raw fp32 lookup is exactly the decoder input.
+        ex = list(prefill.export_input)  # (inputs_embeds, mask, pos, *caches)
+        pref_ar = ex[0].shape[1]
+        H = self.dflash_cfg.hidden_size
         Lc = len(self.dflash_cfg.target_layer_ids)
-        tok_dtype = ex[0].dtype
         hidden_seqs, token_seqs = [], []
         with torch.no_grad():
             for prompt in data.calibration_data.datasets:
@@ -722,9 +747,9 @@ class DFlashDraftCompiler(Component):
                 if not ids:
                     continue
                 T = len(ids)
-                tokens = torch.zeros_like(ex[0])  # pad past T with token 0 (masked out)
-                tokens[0, :T] = torch.tensor(ids, dtype=tok_dtype)
-                out = decoder(tokens, *ex[1:])
+                embeds = torch.zeros(1, pref_ar, H)  # pad past T (rows masked out)
+                embeds[0, :T] = self.embed_weight[torch.tensor(ids, dtype=torch.long)]
+                out = decoder(embeds, *ex[1:])
                 captured = out[-Lc:]  # selected layers, [1, pref_ar, H] each
                 new_context = torch.cat([c[:, :T] for c in captured], dim=-1)
                 hidden_seqs.append(new_context)  # [1, T, Lc*H]
@@ -913,16 +938,18 @@ class DFlashManager(Component):
             capture_ids, cfg.num_target_layers, config.num_sharding
         )
 
-        # Target exports the DFlash context layers as extra hidden outputs.
+        # Target is split into three shared pte's: token embedding (emb.pte), the
+        # headless decoder (embeds -> final hidden + selected-layer hiddens), and the
+        # vocab projection (lm_head.pte). The draft reuses emb.pte and lm_head.pte.
         self.target = HybridTextDecoder(
             control_args,
             config,
-            apply_embedding=False,
+            apply_embedding=True,  # split token embedding into a shared emb.pte
             output_hidden_layers=capture_ids,
-            apply_output=False,  # headless: lm_head moves to a separate shared pte
+            apply_output=False,  # headless: lm_head moves to a shared lm_head.pte
         )
         self.draft_compiler = DFlashDraftCompiler(
-            control_args, config, ckpt, max_ctx, prefill_ar
+            control_args, config, ckpt, max_ctx, prefill_ar, share_lm_head=True
         )
 
         self.control_args = control_args
@@ -993,9 +1020,12 @@ class DFlashManager(Component):
         pte_filenames,
         skip_quantize_target=False,
         draft_compile_spec=None,
+        tok_embedding_compile_spec=None,
+        lm_head_compile_spec=None,
     ):
         from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
             AUDIO_ENCODER,
+            LM_HEAD,
             TEXT_DECODER,
             TEXT_ENCODER,
             TOK_EMBEDDING,
@@ -1005,6 +1035,10 @@ class DFlashManager(Component):
         # The draft needs its own spec: ConvertMhaToSha cannot handle its
         # non-causal block attention (see compile_dflash).
         draft_compile_spec = draft_compile_spec or compile_spec
+        # emb.pte / lm_head.pte are weight-shared across their kv/prefill AR graphs;
+        # HybridTextDecoder.compile lowers them when their spec + pte_filename are set.
+        tok_embedding_compile_spec = tok_embedding_compile_spec or compile_spec
+        lm_head_compile_spec = lm_head_compile_spec or compile_spec
         method_data = {
             TEXT_DECODER: Request.Data(
                 compile_spec=compile_spec,
@@ -1019,7 +1053,14 @@ class DFlashManager(Component):
             AUDIO_ENCODER: Request.Data(compile_spec=compile_spec, pte_filename="unused"),
             VISION_ENCODER: Request.Data(compile_spec=compile_spec, pte_filename="unused"),
             TEXT_ENCODER: Request.Data(compile_spec=compile_spec, pte_filename="unused"),
-            TOK_EMBEDDING: Request.Data(compile_spec=compile_spec, pte_filename="unused"),
+            TOK_EMBEDDING: Request.Data(
+                compile_spec=tok_embedding_compile_spec,
+                pte_filename=pte_filenames[TOK_EMBEDDING],
+            ),
+            LM_HEAD: Request.Data(
+                compile_spec=lm_head_compile_spec,
+                pte_filename=pte_filenames[LM_HEAD],
+            ),
             DFLASH_TARGET: Request.Data(
                 compile_spec=compile_spec, pte_filename=pte_filenames[DFLASH_TARGET]
             ),

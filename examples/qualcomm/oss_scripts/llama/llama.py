@@ -166,6 +166,28 @@ def compile_dflash(
             online_prepare=args.online_prepare,
         )
     ] * len(DFLASH_GRAPH_NAMES)
+    # emb.pte / lm_head.pte are pure tables (no MHA); they weight-share across their
+    # kv/prefill AR graphs, so they get plain specs (no ConvertMhaToSha).
+    table_backend_options = generate_htp_compiler_spec(
+        use_fp16=False,
+        use_weight_sharing=not args.enable_x86_64,
+    )
+    tok_embedding_compile_spec = [
+        generate_qnn_executorch_compiler_spec(
+            soc_model=get_soc_to_chipset_map()[args.soc_model],
+            backend_options=table_backend_options,
+            shared_buffer=not args.enable_x86_64,
+            online_prepare=args.online_prepare,
+        )
+    ] * len(TOK_EMBEDDING_GRAPH_NAMES)
+    lm_head_compile_spec = [
+        generate_qnn_executorch_compiler_spec(
+            soc_model=get_soc_to_chipset_map()[args.soc_model],
+            backend_options=table_backend_options,
+            shared_buffer=not args.enable_x86_64,
+            online_prepare=args.online_prepare,
+        )
+    ] * len(LM_HEAD_GRAPH_NAMES)
     backend_type = get_backend_type("htp")
 
     dflash_mgr.quantize(
@@ -178,9 +200,13 @@ def compile_dflash(
     dflash_mgr.compile(
         compile_spec=compile_spec_list,
         draft_compile_spec=draft_compile_spec_list,
+        tok_embedding_compile_spec=tok_embedding_compile_spec,
+        lm_head_compile_spec=lm_head_compile_spec,
         pte_filenames={
             DFLASH_TARGET: os.path.splitext(os.path.basename(text_decoder_pte_path))[0],
             DFLASH_DRAFT: os.path.splitext(os.path.basename(dflash_draft_pte_path))[0],
+            TOK_EMBEDDING: f"{TOK_EMBEDDING}_qnn",
+            LM_HEAD: f"{LM_HEAD}_qnn",
         },
         skip_quantize_target=args.use_fp16,
     )
@@ -631,6 +657,15 @@ def _build_parser():
         help="The auto-regression (AR) length determines the number of tokens to consume and the number of logits to produce. Use this option to process the prompt and generate the key-value (kv) cache, which serves as a prompt processor for hybrid and lookahead mode.",
         default=32,
         type=int,
+    )
+
+    parser.add_argument(
+        "--dump_qdq",
+        action="store_true",
+        default=False,
+        help="[DFlash] Dump the decode (AR) QDQ GraphModules of the split modules "
+        "(tok_embedding / decoder / lm_head / draft) as .pt2 so a host script can "
+        "load them and run the full DFlash accept loop on CPU (QDQ == pte numerically).",
     )
 
     parser.add_argument(

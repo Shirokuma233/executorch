@@ -508,7 +508,13 @@ class TextDecoder(Component):
             if node.meta["val"].size()[-2:] in self.kv_cache_shape:
                 quant_io_type = fixed_point_type["kv_type"]
             elif node.meta["val"].size() in self.io_shape:
-                quant_io_type = fixed_point_type["io_type"]
+                # A headless decoder that also exports selected-layer hiddens (DFlash)
+                # emits captured hiddens at the SAME [b, ar, dim] shape as the final
+                # hidden. Only the final hidden (output position 0) feeds lm_head.pte
+                # and must be uint16; the captured hiddens go to the draft as fp, so
+                # leave them un-tagged (the runtime rejects quantized captured hiddens).
+                if self.output_hidden_layers is None or self._is_primary_output(node):
+                    quant_io_type = fixed_point_type["io_type"]
 
         # tag sharding io
         if exir_ops.edge.llama.fallback.default in [
@@ -521,6 +527,14 @@ class TextDecoder(Component):
             quant_io_type = fixed_point_type["io_type"]
 
         return quant_io_type
+
+    def _is_primary_output(self, node):
+        # forward returns (logits/hidden, k_caches..., v_caches..., *captured_hiddens),
+        # so the flattened graph output at position 0 is the primary hidden; the trailing
+        # captured hiddens share its [b, ar, dim] shape but must not be tagged.
+        out_node = next(n for n in node.graph.nodes if n.op == "output")
+        flat = list(out_node.args[0])
+        return node in flat and flat.index(node) == 0
 
     def _tag_lm_head_ios(self, node, fixed_point_type):
         # standalone lm_head graph: input hidden [b, ar, dim] and output logits
@@ -762,6 +776,28 @@ class TextDecoder(Component):
                 event_name=f"verify_split_{i}",
             )
 
+    def _dump_split_qdq(self, split_lm_head):
+        """Export + save the converted (QDQ) decode graphs of the split modules so a
+        host script can load them and run the DFlash accept loop on CPU. QDQ graphs
+        are fp32 weights + quantize/dequantize nodes, so they run on CPU and match the
+        pte numerically. Load them back with `import torch.ao.quantization.fx._decomposed`
+        first (registers the quantized_decomposed ops the graph references)."""
+        art = self.control_args.artifact
+
+        def save(module, example_input, name):
+            ep = torch.export.export(module, example_input, strict=True)
+            path = f"{art}/{name}.pt2"
+            torch.export.save(ep, path)
+            logging.info(
+                "dumped QDQ %s (ar=%d) -> %s", name, self.meta["get_ar_len"], path
+            )
+
+        save(self.decoder, self.export_input, "qdq_decoder")
+        if self.apply_embedding:
+            save(self.tok_embedding, self.tok_embedding_export_input, "qdq_tok_embedding")
+        if split_lm_head:
+            save(self.lm_head, self.lm_head_export_input, "qdq_lm_head")
+
     @log_info
     def quantize(self, request: Request):  # noqa: C901
         if self.quant_recipe is None:
@@ -937,6 +973,13 @@ class TextDecoder(Component):
 
             if split_lm_head:
                 self.lm_head = convert_pt2e(self.lm_head)
+
+            # Dump the decode (AR) QDQ graphs so a host script can run the full
+            # DFlash accept loop on CPU. Only the decode graphs carry the real
+            # joint-calibration encoding (prefill scales are copied in at compile),
+            # and the host loop runs entirely at decode AR, so one graph per module.
+            if getattr(self.control_args, "dump_qdq", False) and self.mode == Mode.DECODE:
+                self._dump_split_qdq(split_lm_head)
 
             if self.control_args.verbose and self.mode == Mode.DECODE:
                 audio_turns = request.method_data[
