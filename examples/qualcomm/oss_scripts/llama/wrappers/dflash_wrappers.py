@@ -624,6 +624,22 @@ class DFlashDraftCompiler(Component):
         modules = [self.decode, self.prefill]
         inputs = [self.decode_input, self.prefill_input]
 
+        # Save the fp16 draft's decode graph as fp32 (CPU-friendly) so a host script
+        # can run the DFlash accept loop: target decode_qdq.pt2 + this. The draft is
+        # unquantized, so fp32 host ~= fp16 device (RMSNorm parity note applies).
+        if getattr(self.control_args, "dump_qdq", False):
+            import copy
+
+            draft_fp32 = copy.deepcopy(self.decode).float()
+            ex = tuple(
+                x.to(torch.float32) if torch.is_floating_point(x) else x
+                for x in self.decode_input
+            )
+            ep = torch.export.export(draft_fp32, ex, strict=True)
+            dump_path = f"{self.control_args.artifact}/qdq_draft.pt2"
+            torch.export.save(ep, dump_path)
+            logging.info("dumped draft fp16(->fp32) decode graph -> %s", dump_path)
+
         if self.backend == "cpu":
             _export_dflash_cpu_pte(
                 dict(zip(graph_names, modules)), inputs, {**self.meta}, out_path

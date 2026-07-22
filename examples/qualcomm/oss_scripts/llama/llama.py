@@ -606,6 +606,15 @@ def _build_parser():
     )
 
     parser.add_argument(
+        "--dump_qdq",
+        action="store_true",
+        default=False,
+        help="[DFlash] Also save host-runnable graphs for CPU accept-loop verification: "
+        "the target's decode QDQ (decode_qdq.pt2, saved anyway) plus the fp16 draft's "
+        "decode graph (qdq_draft.pt2). Load them with torch.export.load on host.",
+    )
+
+    parser.add_argument(
         "-E",
         "--embedding-quantize",
         default=None,
