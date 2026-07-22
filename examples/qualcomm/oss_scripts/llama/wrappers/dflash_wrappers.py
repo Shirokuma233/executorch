@@ -184,12 +184,6 @@ def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.
     return x * cos + _rotate_half(x) * sin
 
 
-def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    if n_rep == 1:
-        return x
-    return x.repeat_interleave(n_rep, dim=1)
-
-
 # ---------------------------------------------------------------------------
 # Static bidirectional cross+self attention
 # ---------------------------------------------------------------------------
@@ -217,6 +211,15 @@ class DFlashAttention(nn.Module):
         self.o_proj = nn.Linear(self.nH * self.D, H, bias=cfg.attention_bias)
         self.q_norm = RMSNorm(self.D, eps=cfg.rms_norm_eps)
         self.k_norm = RMSNorm(self.D, eps=cfg.rms_norm_eps)
+        # GQA head-expansion index, precomputed as a constant buffer. Gathering K/V
+        # with index_select(1, this) == repeat_interleave(n_rep, dim=1) but stays 4D
+        # (repeat_interleave's 5D expand/view won't delegate once quantized). Storing
+        # the index as a buffer keeps arange/div out of the graph, which also removes
+        # the "inDims is NULL" warnings from the .tensor-variant dequant they cause.
+        n_rep = self.nH // self.nKV
+        self.register_buffer(
+            "kv_rep_idx", torch.arange(self.nKV * n_rep) // n_rep, persistent=False
+        )
 
     def forward(
         self,
@@ -250,8 +253,8 @@ class DFlashAttention(nn.Module):
         # assemble full K/V: [cached ctx ; new ctx ; block]
         k = torch.cat([past_k, k_new, kb], dim=3)   # [1,nKV,D, Cc+AR+B]
         v = torch.cat([past_v, v_new, vb], dim=2)   # [1,nKV, Cc+AR+B, D]
-        k = _repeat_kv(k, self.nH // self.nKV)
-        v = _repeat_kv(v, self.nH // self.nKV)
+        k = k.index_select(1, self.kv_rep_idx)
+        v = v.index_select(1, self.kv_rep_idx)
         scores = torch.matmul(q, k) * self.scaling  # q[1,nH,B,D] @ k[1,nH,D,T] -> [1,nH,B,T]
         scores = scores + atten_mask.unsqueeze(1)
         attn = torch.softmax(scores, dim=-1)
