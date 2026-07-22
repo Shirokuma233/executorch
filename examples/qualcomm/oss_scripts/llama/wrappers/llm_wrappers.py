@@ -417,6 +417,13 @@ class TextDecoder(Component):
             self.tok_embedding_export_input = (
                 tok_embedding.get_example_input()
             )  # tokens
+            # headless emb-split: the emb.pte output (embeds [b, ar, dim]) is tagged
+            # uint16 so the emb->decoder boundary is lossless uint16 (the emb-output
+            # scale is injected onto the decoder input in compile). tokens input stays
+            # int and is not tagged.
+            self.emb_io_shape = {
+                (decoder.max_batch_size, decoder.ar_len, decoder.dim)
+            }
 
         # headless: build a standalone lm_head (hidden -> logits) so the vocab
         # projection can be lowered to a separate shared pte. Quantize/lower are
@@ -452,6 +459,23 @@ class TextDecoder(Component):
                         if source_node.meta["val"].size() in self.io_shape:
                             self.meta["get_logits_scale"] = output_node.args[1]
                             self.meta["get_logits_zero_point"] = output_node.args[2]
+                            break
+
+    def _save_embeds_quant_attrs(self):
+        # headless emb-split: read the tok_embedding output (embeds) quant scale/zp so it
+        # can be injected onto the decoder's inputs_embeds input, making emb->decoder a
+        # lossless uint16 boundary. Mirror of _save_logits_quant_attrs, on tok_embedding.
+        for node in self.tok_embedding.graph.nodes:
+            if node.op == "output":
+                for output_node in node.args[0]:
+                    if (
+                        output_node.target
+                        == torch.ops.quantized_decomposed.dequantize_per_tensor.default
+                    ):
+                        source_node = output_node.args[0].args[0]
+                        if source_node.meta["val"].size() in self.emb_io_shape:
+                            self.meta["get_embeds_scale"] = output_node.args[1]
+                            self.meta["get_embeds_zero_point"] = output_node.args[2]
                             break
 
     def _save_output_kv_cache_quant_attrs(self):
@@ -496,10 +520,12 @@ class TextDecoder(Component):
                 and users[0].meta["val"].size()[-2:] in self.kv_cache_shape
             ):
                 quant_io_type = fixed_point_type["kv_type"]
-            elif node.meta["val"].size() in self.io_shape and not self.apply_embedding:
-                # emb-split (apply_embedding) decoder takes inputs_embeds (same [b,ar,
-                # dim] shape as the headless hidden output); keep that input fp32 — the
-                # emb.pte -> decoder boundary is fp32 (its output isn't tagged either).
+            elif node.meta["val"].size() in self.io_shape:
+                # Tag the [b, ar, dim] IO uint16. For headless emb-split this is the
+                # inputs_embeds placeholder — tagging it makes the emb->decoder boundary
+                # uint16 (the emb-output scale is injected onto it in compile). For
+                # emb-split-ONLY (apply_output=True) io_shape is vocab-width, so
+                # inputs_embeds (dim-width) never matches here and stays fp32 (unchanged).
                 quant_io_type = fixed_point_type["io_type"]
             elif node.meta["val"].size() in atten_mask_shape:
                 quant_io_type = fixed_point_type["io_type"]
@@ -543,6 +569,15 @@ class TextDecoder(Component):
         if node.op == "placeholder" and node.meta["val"].size() in self.lm_head_io_shape:
             quant_io_type = fixed_point_type["io_type"]
         if is_graph_output(node) and node.meta["val"].size() in self.lm_head_io_shape:
+            quant_io_type = fixed_point_type["io_type"]
+        return quant_io_type
+
+    def _tag_emb_ios(self, node, fixed_point_type):
+        # standalone tok_embedding graph: the tokens input stays int (untagged); only
+        # the embeds output [b, ar, dim] is quantized uint16 at the pte boundary, so
+        # emb->decoder is a lossless uint16 boundary (scale injected onto decoder input).
+        quant_io_type = None
+        if is_graph_output(node) and node.meta["val"].size() in self.emb_io_shape:
             quant_io_type = fixed_point_type["io_type"]
         return quant_io_type
 
@@ -741,6 +776,39 @@ class TextDecoder(Component):
         if patched == 0:
             raise RuntimeError(
                 "lm_head input quantize node not found; boundary scale not injected"
+            )
+
+    def _override_decoder_input_scale(self, scale, zero_point):
+        # Force the decoder's inputs_embeds input-activation quant params to the emb
+        # output encoding so emb(uint16 embeds) -> decoder(uint16 inputs_embeds) requant
+        # is lossless across the pte boundary. Mirror of _override_lm_head_input_scale
+        # with the direction reversed (emb output is the source). Only the inputs_embeds
+        # placeholder matches io_shape (dim-width, headless); tokens/mask/pos/kv differ.
+        q_op = torch.ops.quantized_decomposed.quantize_per_tensor.default
+        dq_op = torch.ops.quantized_decomposed.dequantize_per_tensor.default
+        patched = 0
+        for node in self.decoder.graph.nodes:
+            if node.op != "placeholder":
+                continue
+            if node.meta["val"].size() not in self.io_shape:
+                continue
+            for user in list(node.users):
+                if user.target is q_op:
+                    user.args = (user.args[0], scale, zero_point, *user.args[3:])
+                    patched += 1
+                    for dq in list(user.users):
+                        if dq.target is dq_op:
+                            dq.args = (dq.args[0], scale, zero_point, *dq.args[3:])
+        self.decoder.recompile()
+        logging.info(
+            "decoder input scale injected: patched=%d scale=%s zp=%s",
+            patched,
+            scale,
+            zero_point,
+        )
+        if patched == 0:
+            raise RuntimeError(
+                "decoder inputs_embeds quantize node not found; boundary scale not injected"
             )
 
     def _verify_generate(self):
@@ -970,6 +1038,10 @@ class TextDecoder(Component):
 
             if self.apply_embedding:
                 self.tok_embedding = convert_pt2e(self.tok_embedding)
+                # headless emb-split: read emb output scale for the uint16 emb->decoder
+                # boundary (injected onto the decoder input in compile).
+                if not self.apply_output:
+                    self._save_embeds_quant_attrs()
 
             if split_lm_head:
                 self.lm_head = convert_pt2e(self.lm_head)
@@ -1033,17 +1105,23 @@ class TextDecoder(Component):
         self.passes_job[TagQuantIO][QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY][
             "get_quant_io_dtype_fn"
         ] = partial(self._tag_ios, fixed_point_type=fixed_point_type)
-        # Activate the emb-pte IO tagging only when the decoder still outputs logits
-        # (apply_output=True: multimodal, or emb-split-only). When the decoder is
-        # also headless (apply_output=False) io_shape is dim-width and would wrongly
-        # tag the emb output uint16 — the emb->decoder boundary is fp32 (option a).
-        if self.tok_embedding_passes_job is not None and self.apply_output:
+        # Activate the emb-pte IO tagging. apply_output=True (multimodal / emb-split-only):
+        # _tag_ios with vocab-width io_shape leaves the emb output (dim-width) fp32 —
+        # unchanged option-a. Headless DFlash (apply_output=False): _tag_emb_ios tags the
+        # emb output uint16 for a lossless uint16 emb->decoder boundary (the emb-output
+        # scale is injected onto the decoder input in compile).
+        if self.tok_embedding_passes_job is not None:
             self.tok_embedding_passes_job[TagQuantIO][QCOM_PASS_ACTIVATE_KEY] = True
+            if self.apply_output:
+                emb_tag_fn = partial(self._tag_ios, fixed_point_type=fixed_point_type)
+            else:
+                emb_tag_fn = partial(
+                    self._tag_emb_ios,
+                    fixed_point_type={"io_type": fixed_point_type["io_type"]},
+                )
             self.tok_embedding_passes_job[TagQuantIO][
                 QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY
-            ]["get_quant_io_dtype_fn"] = partial(
-                self._tag_ios, fixed_point_type=fixed_point_type
-            )
+            ]["get_quant_io_dtype_fn"] = emb_tag_fn
         if self.lm_head_passes_job is not None:
             self.lm_head_passes_job[TagQuantIO][QCOM_PASS_ACTIVATE_KEY] = True
             self.lm_head_passes_job[TagQuantIO][QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY][
@@ -1331,6 +1409,16 @@ class HybridTextDecoder(Component):
                 f"{self.control_args.artifact}/{lm_head_data.pte_filename}.pte", "wb"
             ) as file:
                 lm_head_exec_prog_mgr.write_to_file(file)
+
+        # emb -> decoder boundary: inject the emb-output scale onto both decoders'
+        # inputs_embeds so the uint16 boundary is lossless (mirror of the lm_head
+        # injection above, direction reversed: emb output is the source). Headless
+        # emb-split only; _encoding_override already ran, so patch decode + prefill.
+        if self.apply_embedding and not self.apply_output:
+            embeds_scale = self.decode.meta["get_embeds_scale"]
+            embeds_zp = self.decode.meta["get_embeds_zero_point"]
+            for m in models:
+                m._override_decoder_input_scale(embeds_scale, embeds_zp)
 
         # decoder lowering
         data = request.method_data[TEXT_DECODER]
