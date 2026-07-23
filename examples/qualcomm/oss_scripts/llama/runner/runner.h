@@ -77,8 +77,9 @@ class Runner : public executorch::extension::llm::IRunner {
           nullptr,
       int block_size = 16,
       int dflash_max_context_len = 0,
-      const std::string& dflash_embed_path = "",
-      const std::string& dflash_lm_head_path = "");
+      std::unique_ptr<executorch::extension::Module> dflash_emb_module = nullptr,
+      std::unique_ptr<executorch::extension::Module> dflash_lm_head_module =
+          nullptr);
 
   bool is_loaded() const override;
   executorch::runtime::Error load() override;
@@ -117,6 +118,9 @@ class Runner : public executorch::extension::llm::IRunner {
   std::unique_ptr<KVManager> dflash_kv_manager_;
   // Draft non-K/V IO bytes to reserve in the shared buffer (see RpcMem).
   size_t dflash_draft_io_size_ = 0;
+  // emb + lm_head pte IO bytes (both PromptProcessor and DFlashTokenGenerator
+  // carve their own copies from the shared buffer). Same RpcMem-budget rule.
+  size_t dflash_aux_io_size_ = 0;
   int max_tree_size_{0};
   int draft_len_{0};
   int tree_depth_{4};
@@ -128,10 +132,10 @@ class Runner : public executorch::extension::llm::IRunner {
 
   // DFlash
   std::unique_ptr<executorch::extension::Module> dflash_draft_module_;
+  std::unique_ptr<executorch::extension::Module> dflash_emb_module_;
+  std::unique_ptr<executorch::extension::Module> dflash_lm_head_module_;
   int block_size_{16};
   int dflash_max_context_len_{0};
-  std::string dflash_embed_path_;
-  std::string dflash_lm_head_path_;
 
   int ngram_{0};
   int window_{0};

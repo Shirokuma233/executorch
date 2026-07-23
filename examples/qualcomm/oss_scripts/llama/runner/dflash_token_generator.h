@@ -52,14 +52,16 @@ namespace example {
  *   out: hidden [1,B,H], k_new[Ld] [1,nKV,D,AR], v_new[Ld] [1,nKV,AR,D]
  * where Cc + AR == max_context_len for both graphs.
  *
- * The draft owns NO embed_tokens and NO lm_head:
- *   - input embedding: host gather from `embed_table_` (embed.bin).
- *   - output logits:   host matmul `lm_head_table_ @ hidden` then argmax over the
- *                      full target vocab. With tie_word_embeddings the two tables
- *                      are identical (one embed.bin serves both).
+ * The recompiled target decoder is HEADLESS: it consumes embeds (u16) and emits
+ * hidden (u16), not tokens/logits. The embedding and vocab projection are their
+ * own ptes, shared by the target (u16 side, host-quantized at the boundary) and
+ * the draft (f32 side, direct):
+ *   - input embedding: emb.pte kv_forward (tokens -> f32 embeds).
+ *   - output logits:   lm_head.pte kv_forward (u16 hidden -> f32 logits), argmax
+ *                      on the host (QNN's own is off by +/-65536 this wide).
  *
- * This generator owns neither the target nor the draft module nor either
- * KVManager; the parent Runner constructs them all.
+ * This generator owns neither the target nor the draft/emb/lm_head modules nor
+ * either KVManager; the parent Runner constructs them all.
  */
 class DFlashTokenGenerator : public TokenGenerator {
  public:
@@ -101,7 +103,15 @@ class DFlashTokenGenerator : public TokenGenerator {
       executorch::llm::Stats* stats,
       std::unique_ptr<executorch::runtime::MethodMeta> target_method_meta,
       std::unique_ptr<executorch::runtime::MethodMeta> draft_kv_meta,
-      std::unique_ptr<executorch::runtime::MethodMeta> draft_prefill_meta);
+      std::unique_ptr<executorch::runtime::MethodMeta> draft_prefill_meta,
+      executorch::extension::Module* emb_module,
+      executorch::extension::Module* lm_head_module,
+      std::unique_ptr<executorch::runtime::MethodMeta> emb_kv_meta,
+      std::unique_ptr<executorch::runtime::MethodMeta> lm_head_kv_meta,
+      float embeds_scale,
+      int32_t embeds_zero_point,
+      float logits_scale,
+      int32_t logits_zero_point);
 
   ~DFlashTokenGenerator() override = default;
 
@@ -114,10 +124,6 @@ class DFlashTokenGenerator : public TokenGenerator {
   // The draft's five non-K/V inputs: noise, mask, new_context, context_pos,
   // block_pos.
   static constexpr size_t kNumDraftNonKvInputs = 5;
-
-  // Capped at the big-core count: the lm_head sweep is DDR-bound on a 742 MiB
-  // table, so oversubscribing onto the little cores only adds contention.
-  static constexpr size_t kLmHeadMaxThreads = 8;
 
   // Bytes the draft's non-K/V IO needs from the shared buffer (widest of the two
   // graphs per tensor). Runner must reserve this in the RpcMem region, which is a
@@ -134,22 +140,6 @@ class DFlashTokenGenerator : public TokenGenerator {
       bool dump_logits,
       AttentionSinkRopeRunner* attention_sink_rope_runner) override;
 
-  // Target embedding table (fp16[vocab*hidden], row-major) for input embedding.
-  void set_embed_table(
-      std::vector<uint16_t> embed_table,
-      int32_t vocab_size,
-      int32_t hidden_size) {
-    embed_table_ = std::move(embed_table);
-    embed_vocab_size_ = vocab_size;
-    embed_hidden_size_ = hidden_size;
-  }
-
-  // lm_head table (fp16[vocab*hidden]) for the host logits matmul. If the target
-  // ties embed/lm_head, pass the same buffer as the embed table.
-  void set_lm_head_table(std::vector<uint16_t> lm_head_table) {
-    lm_head_table_ = std::move(lm_head_table);
-  }
-
   // PromptProcessor observer: drain one prefill chunk's hidden into the staging
   // buffer, running prefill_forward whenever `prefill_ar_len` rows accumulate.
   void stage_prompt_hidden(
@@ -164,9 +154,8 @@ class DFlashTokenGenerator : public TokenGenerator {
  private:
   // One draft graph call. Appends `n_new` context rows (read from `stage_buf_`,
   // RoPE positions `ctx_pos_base + j`) to the KV cache and drafts the block.
-  // `out_hidden` may be null when only the cache write matters. `out_tokens` is
-  // filled only when the graph carries an lm_head; otherwise it is left alone and
-  // the caller falls back to lm_head_argmax.
+  // `out_hidden` may be null when only the cache write matters. The noise
+  // embedding is produced on the fly by emb.pte over `block_tokens`.
   void run_draft(
       const std::string& method,
       const executorch::runtime::MethodMeta& meta,
@@ -175,20 +164,25 @@ class DFlashTokenGenerator : public TokenGenerator {
       int64_t ctx_pos_base,
       const std::vector<uint64_t>& block_tokens,
       int64_t block_pos_base,
-      std::vector<float>* out_hidden,
-      std::vector<uint64_t>* out_tokens = nullptr);
+      std::vector<float>* out_hidden);
 
   // Run one prefill_forward over the staged rows, then reset the staging count.
   void flush_stage();
 
-  // Host lm_head + argmax over the full target vocab for `count` hidden rows.
-  void lm_head_argmax(
+  // Run emb.pte kv over `n_tokens` ids (padded to the graph's AR). Output f32
+  // embeds land in `emb_out_buf_`.
+  void run_embedding(const uint64_t* tokens, int32_t n_tokens);
+
+  // Run lm_head.pte kv over the u16 hidden buffer. Logits land in
+  // `lm_head_logits_buf_`.
+  void run_lm_head(std::byte* hidden_u16);
+
+  // Quantize `count` hidden rows (logits scale/zp) -> u16 -> lm_head.pte kv ->
+  // host argmax over the full target vocab, filling `out_tokens`.
+  void decode_lm_head(
       const float* hidden,
       int32_t count,
-      std::vector<uint64_t>* out_tokens) const;
-
-  // Gather fp16 embedding row for token_id into dst[hidden_dim].
-  void lookup_embedding(uint64_t token_id, uint16_t* dst) const;
+      std::vector<uint64_t>* out_tokens);
 
   // Target verify: run target kv_forward over the packed block, read logits and
   // the L extra hidden outputs. Returns the target argmax per slot.
@@ -203,11 +197,37 @@ class DFlashTokenGenerator : public TokenGenerator {
   std::unique_ptr<executorch::runtime::MethodMeta> draft_prefill_meta_;
   Metadata dflash_meta_;
 
-  // Reused target embedding (input) + lm_head (output) tables (fp16).
-  std::vector<uint16_t> embed_table_;
-  std::vector<uint16_t> lm_head_table_;
-  int32_t embed_vocab_size_ = 0;
-  int32_t embed_hidden_size_ = 0;
+  // Headless-decoder companions. The decode path only ever touches the kv views
+  // (verify runs 8 tokens, draft runs block_size); the prompt processor owns the
+  // prefill views separately.
+  executorch::extension::Module* emb_module_;
+  executorch::extension::Module* lm_head_module_;
+  std::unique_ptr<executorch::runtime::MethodMeta> emb_kv_meta_;
+  std::unique_ptr<executorch::runtime::MethodMeta> lm_head_kv_meta_;
+  // Boundary QDQ, read off the decoder pte getters at load time.
+  float embeds_scale_;
+  int32_t embeds_zero_point_;
+  float logits_scale_;
+  int32_t logits_zero_point_;
+  int32_t lm_head_vocab_size_ = 0;
+
+  // emb/lm_head IO, carved from the shared (ION) region and registered with QNN.
+  std::byte* emb_tok_buf_ = nullptr; // i32 token ids into emb.pte
+  size_t emb_tok_nbytes_ = 0;
+  // TODO(dflash-uint16): 临时桥接。emb输出/draft-IO 目前是 f32(编译端边界没做成
+  // uint16),故此 buffer 是 f32、消费端 host quantize。日后编译端把 emb 输出 tag 成
+  // uint16 后,此 buffer 改 u16、可与 decoder embeds 直传。详见
+  // dflash/RUNNER_M5_PLAN.md "技术债" 节。
+  std::byte* emb_out_buf_ = nullptr; // f32 embeds out of emb.pte
+  size_t emb_out_nbytes_ = 0;
+  std::byte* lm_head_logits_buf_ = nullptr; // f32 logits out of lm_head.pte
+  size_t lm_head_logits_nbytes_ = 0;
+  // TODO(dflash-uint16): 临时桥接。draft block_hidden 目前是 f32(编译端边界没做成
+  // uint16),故先 host quantize 进此 u16 buffer 再喂 lm_head。日后编译端把 draft
+  // hidden tag 成 uint16 后,可删此 buffer、draft 输出直传 lm_head。详见
+  // dflash/RUNNER_M5_PLAN.md "技术债" 节。
+  std::byte* draft_hidden_u16_buf_ = nullptr; // quantized draft hidden -> lm_head
+  size_t draft_hidden_u16_nbytes_ = 0;
 
   // Draft IO, carved from the shared (ION) region and registered with QNN. An
   // unregistered pointer falls back to a raw FastRPC copy of the whole tensor;

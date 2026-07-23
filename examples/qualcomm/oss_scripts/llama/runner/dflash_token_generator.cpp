@@ -17,7 +17,6 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
-#include <thread>
 #include <vector>
 
 using executorch::aten::ScalarType;
@@ -160,7 +159,15 @@ DFlashTokenGenerator::DFlashTokenGenerator(
     executorch::llm::Stats* stats,
     std::unique_ptr<MethodMeta> target_method_meta,
     std::unique_ptr<MethodMeta> draft_kv_meta,
-    std::unique_ptr<MethodMeta> draft_prefill_meta)
+    std::unique_ptr<MethodMeta> draft_prefill_meta,
+    executorch::extension::Module* emb_module,
+    executorch::extension::Module* lm_head_module,
+    std::unique_ptr<MethodMeta> emb_kv_meta,
+    std::unique_ptr<MethodMeta> lm_head_kv_meta,
+    float embeds_scale,
+    int32_t embeds_zero_point,
+    float logits_scale,
+    int32_t logits_zero_point)
     : TokenGenerator(
           tokenizer,
           target_runner,
@@ -183,7 +190,18 @@ DFlashTokenGenerator::DFlashTokenGenerator(
       draft_kv_manager_(draft_kv_manager),
       draft_kv_meta_(std::move(draft_kv_meta)),
       draft_prefill_meta_(std::move(draft_prefill_meta)),
-      dflash_meta_(metadata) {
+      dflash_meta_(metadata),
+      emb_module_(emb_module),
+      lm_head_module_(lm_head_module),
+      emb_kv_meta_(std::move(emb_kv_meta)),
+      lm_head_kv_meta_(std::move(lm_head_kv_meta)),
+      embeds_scale_(embeds_scale),
+      embeds_zero_point_(embeds_zero_point),
+      logits_scale_(logits_scale),
+      logits_zero_point_(logits_zero_point) {
+  ET_CHECK_MSG(
+      emb_module_ != nullptr && lm_head_module_ != nullptr,
+      "[DFlash] headless decoder requires emb + lm_head modules");
   // The draft KVManager sizes its buffer as context_len - min(ar), and its
   // dtype scan matches kv_forward's cache length. Both assume kv_forward has
   // the shorter append length.
@@ -268,6 +286,16 @@ void DFlashTokenGenerator::init_io(
         hm->dim_order().begin(), hm->dim_order().end());
     hidden_nbytes[i] = tensor_nbytes(hm.get());
   }
+
+  // Headless technique. The base allocates input[0] with `input_toks_.size`
+  // bytes and output[0] with `logits_.size` bytes, but builds the TensorImpls
+  // from the decoder's method_meta. For this headless decoder input[0] is embeds
+  // (u16[1,ar,H]) and output[0] is hidden (u16[1,ar,H]), so overriding just the
+  // two byte counts makes the base carve correctly-sized embeds/hidden buffers:
+  // inputs_[0].data becomes the embeds-u16 buffer and output_tensors_[0].data the
+  // hidden-u16 buffer, with mask/pos/KV bound as usual.
+  input_toks_.size = method_meta->input_tensor_meta(0)->nbytes();
+  logits_.size = method_meta->output_tensor_meta(0)->nbytes();
 
   // Standard target IO.
   TokenGenerator::init_io(buffer_manager, std::move(method_meta));
@@ -371,9 +399,46 @@ void DFlashTokenGenerator::init_io(
   }
   ET_LOG(
       Info,
-      "[DFlash] lm_head: %s (vocab %zu)",
-      draft_has_lm_head_ ? "in-graph (HTP)" : "host scan of the embedding table",
-      draft_vocab_size_);
+      "[DFlash] draft lm_head: %s",
+      draft_has_lm_head_ ? "in-graph (HTP)" : "external lm_head.pte");
+
+  // Headless companions: emb.pte token input + f32 embeds output, lm_head.pte
+  // f32 logits output, and a u16 buffer for the draft's quantized hidden (the
+  // verify path feeds lm_head the decoder hidden buffer directly, so only the
+  // draft needs its own). All carved from the shared region + QNN-registered;
+  // sized for the kv views this generator binds (decode never runs prefill).
+  emb_tok_nbytes_ = emb_kv_meta_->input_tensor_meta(0)->nbytes();
+  emb_tok_buf_ = buffer_manager->allocate(emb_tok_nbytes_);
+  buffer_manager->add_memory_info(
+      emb_tok_buf_, emb_tok_nbytes_, emb_kv_meta_->input_tensor_meta(0).get());
+
+  emb_out_nbytes_ = emb_kv_meta_->output_tensor_meta(0)->nbytes();
+  emb_out_buf_ = buffer_manager->allocate(emb_out_nbytes_);
+  buffer_manager->add_memory_info(
+      emb_out_buf_, emb_out_nbytes_, emb_kv_meta_->output_tensor_meta(0).get());
+
+  lm_head_logits_nbytes_ = lm_head_kv_meta_->output_tensor_meta(0)->nbytes();
+  lm_head_logits_buf_ = buffer_manager->allocate(lm_head_logits_nbytes_);
+  buffer_manager->add_memory_info(
+      lm_head_logits_buf_,
+      lm_head_logits_nbytes_,
+      lm_head_kv_meta_->output_tensor_meta(0).get());
+
+  draft_hidden_u16_nbytes_ = lm_head_kv_meta_->input_tensor_meta(0)->nbytes();
+  draft_hidden_u16_buf_ = buffer_manager->allocate(draft_hidden_u16_nbytes_);
+  buffer_manager->add_memory_info(
+      draft_hidden_u16_buf_,
+      draft_hidden_u16_nbytes_,
+      lm_head_kv_meta_->input_tensor_meta(0).get());
+
+  lm_head_vocab_size_ =
+      static_cast<int32_t>(lm_head_kv_meta_->output_tensor_meta(0)->sizes()[2]);
+  ET_LOG(
+      Info,
+      "[DFlash] aux IO: emb_out %.2f MB, lm_head_logits %.2f MB (vocab %d)",
+      static_cast<double>(emb_out_nbytes_) / (1 << 20),
+      static_cast<double>(lm_head_logits_nbytes_) / (1 << 20),
+      lm_head_vocab_size_);
 
   // Cache A: one draft-graph call's worth of fused 5H rows.
   const size_t LH = static_cast<size_t>(L) * dflash_meta_.hidden_dim;
@@ -395,93 +460,89 @@ void DFlashTokenGenerator::init_io(
 }
 
 // ---------------------------------------------------------------------------
-// Embedding lookup (host gather)
+// emb.pte / lm_head.pte — the headless decoder's split-off projections.
+// Both are separate QNN contexts sharing the same ION region; their IO is
+// pre-registered in init_io, so a call just rebinds the TensorImpls and runs.
 // ---------------------------------------------------------------------------
-void DFlashTokenGenerator::lookup_embedding(uint64_t token_id, uint16_t* dst)
-    const {
-  const int H = embed_hidden_size_;
-  if (embed_table_.empty() ||
-      static_cast<int64_t>(token_id) >= embed_vocab_size_) {
-    memset(dst, 0, static_cast<size_t>(H) * sizeof(uint16_t));
-    return;
+void DFlashTokenGenerator::run_embedding(
+    const uint64_t* tokens,
+    int32_t n_tokens) {
+  auto tok_meta = emb_kv_meta_->input_tensor_meta(0).get();
+  auto out_meta = emb_kv_meta_->output_tensor_meta(0).get();
+  const int32_t ar = static_cast<int32_t>(tok_meta.sizes()[1]);
+  std::memset(emb_tok_buf_, 0, emb_tok_nbytes_);
+  const bool tok_i64 = tok_meta.scalar_type() == ScalarType::Long;
+  for (int32_t k = 0; k < n_tokens && k < ar; ++k) {
+    if (tok_i64) {
+      reinterpret_cast<int64_t*>(emb_tok_buf_)[k] =
+          static_cast<int64_t>(tokens[k]);
+    } else {
+      reinterpret_cast<int32_t*>(emb_tok_buf_)[k] =
+          static_cast<int32_t>(tokens[k]);
+    }
   }
-  const uint16_t* row = embed_table_.data() + static_cast<size_t>(token_id) * H;
-  memcpy(dst, row, static_cast<size_t>(H) * sizeof(uint16_t));
+  TensorImpl tok_impl = make_impl(tok_meta, emb_tok_buf_);
+  TensorImpl out_impl = make_impl(out_meta, emb_out_buf_);
+  std::vector<EValue> ins{EValue(Tensor(&tok_impl))};
+  std::vector<EValue> outs{EValue(Tensor(&out_impl))};
+  ET_CHECK_MSG(
+      emb_module_->set_outputs("tok_embedding_kv_forward", outs) == Error::Ok,
+      "[DFlash] emb set_outputs failed");
+  auto res = emb_module_->execute("tok_embedding_kv_forward", ins);
+  ET_CHECK_MSG(res.ok(), "[DFlash] emb execute failed");
 }
 
-// ---------------------------------------------------------------------------
-// Host lm_head + argmax over the full target vocab
-// ---------------------------------------------------------------------------
-// V*H*count is ~5.8 GMAC per block (151936 x 2560 x 15). Vocab is the outer loop
-// so the 742 MiB tied embed/lm_head table streams from DDR exactly once per block
-// instead of once per drafted row, and each fp16 row is widened once rather than
-// `count` times.
-//
-// Threads own contiguous, increasing vocab slices and the reduction walks them in
-// order under a strict `>`, so ties still resolve to the lowest token id — the
-// same answer the single-threaded loop gave.
-void DFlashTokenGenerator::lm_head_argmax(
+void DFlashTokenGenerator::run_lm_head(std::byte* hidden_u16) {
+  auto in_meta = lm_head_kv_meta_->input_tensor_meta(0).get();
+  auto out_meta = lm_head_kv_meta_->output_tensor_meta(0).get();
+  TensorImpl in_impl = make_impl(in_meta, hidden_u16);
+  TensorImpl out_impl = make_impl(out_meta, lm_head_logits_buf_);
+  std::vector<EValue> ins{EValue(Tensor(&in_impl))};
+  std::vector<EValue> outs{EValue(Tensor(&out_impl))};
+  ET_CHECK_MSG(
+      lm_head_module_->set_outputs("lm_head_kv_forward", outs) == Error::Ok,
+      "[DFlash] lm_head set_outputs failed");
+  auto res = lm_head_module_->execute("lm_head_kv_forward", ins);
+  ET_CHECK_MSG(res.ok(), "[DFlash] lm_head execute failed");
+}
+
+// Quantize `count` draft hidden rows to the lm_head's u16 input encoding, run
+// lm_head.pte, then argmax each row on the host (QNN's own argmax is off by
+// +/-65536 on an axis this wide). Ties resolve to the lowest id via strict `>`.
+void DFlashTokenGenerator::decode_lm_head(
     const float* hidden,
     int32_t count,
-    std::vector<uint64_t>* out_tokens) const {
+    std::vector<uint64_t>* out_tokens) {
   const int H = dflash_meta_.hidden_dim;
-  const int V = embed_vocab_size_;
-  const std::vector<uint16_t>& W =
-      lm_head_table_.empty() ? embed_table_ : lm_head_table_;
-  const size_t n = static_cast<size_t>(count);
-  out_tokens->assign(n, 0);
+  const long lm_start_ms = time_in_ms();
+  std::memset(draft_hidden_u16_buf_, 0, draft_hidden_u16_nbytes_);
+  // TODO(dflash-uint16): 临时桥接。emb输出/draft-IO 目前是 f32(编译端边界没做成
+  // uint16),故此处 host quantize。日后编译端把 emb 输出 + draft noise/hidden tag
+  // 成 uint16 后,此 quantize 可删、改 buffer 直传。详见 dflash/RUNNER_M5_PLAN.md
+  // "技术债" 节。
+  quantize_f32_to_u16(
+      hidden,
+      reinterpret_cast<uint16_t*>(draft_hidden_u16_buf_),
+      static_cast<size_t>(count) * H,
+      logits_scale_,
+      logits_zero_point_);
+  run_lm_head(draft_hidden_u16_buf_);
 
-  unsigned hw = std::thread::hardware_concurrency();
-  const size_t nthreads =
-      std::max<size_t>(1, std::min<size_t>(hw ? hw : 1, kLmHeadMaxThreads));
-
-  std::vector<float> best(nthreads * n, -std::numeric_limits<float>::infinity());
-  std::vector<uint64_t> arg(nthreads * n, 0);
-
-  auto slice = [&](size_t t) {
-    const int v0 = static_cast<int>((static_cast<int64_t>(V) * t) / nthreads);
-    const int v1 = static_cast<int>((static_cast<int64_t>(V) * (t + 1)) / nthreads);
-    float* tbest = best.data() + t * n;
-    uint64_t* targ = arg.data() + t * n;
-    std::vector<float> wrow(static_cast<size_t>(H));
-    for (int v = v0; v < v1; ++v) {
-      const uint16_t* src = W.data() + static_cast<size_t>(v) * H;
-      for (int i = 0; i < H; ++i) {
-        wrow[i] = fp16_to_fp32(src[i]);
-      }
-      for (size_t s = 0; s < n; ++s) {
-        const float* h = hidden + s * static_cast<size_t>(H);
-        float dot = 0.0f;
-        for (int i = 0; i < H; ++i) {
-          dot += wrow[i] * h[i];
-        }
-        if (dot > tbest[s]) {
-          tbest[s] = dot;
-          targ[s] = static_cast<uint64_t>(v);
-        }
-      }
-    }
-  };
-
-  std::vector<std::thread> pool;
-  pool.reserve(nthreads - 1);
-  for (size_t t = 1; t < nthreads; ++t) {
-    pool.emplace_back(slice, t);
-  }
-  slice(0);
-  for (auto& th : pool) {
-    th.join();
-  }
-
-  std::vector<float> gbest(n, -std::numeric_limits<float>::infinity());
-  for (size_t t = 0; t < nthreads; ++t) {
-    for (size_t s = 0; s < n; ++s) {
-      if (best[t * n + s] > gbest[s]) {
-        gbest[s] = best[t * n + s];
-        (*out_tokens)[s] = arg[t * n + s];
+  // uint16 logits (see target_verify_block); argmax directly on the raw codes.
+  const size_t V = static_cast<size_t>(lm_head_vocab_size_);
+  const uint16_t* lg = reinterpret_cast<const uint16_t*>(lm_head_logits_buf_);
+  out_tokens->assign(static_cast<size_t>(count), 0);
+  for (int k = 0; k < count; ++k) {
+    const uint16_t* row = lg + static_cast<size_t>(k) * V;
+    uint16_t best = 0;
+    for (size_t v = 0; v < V; ++v) {
+      if (row[v] > best) {
+        best = row[v];
+        (*out_tokens)[k] = static_cast<uint64_t>(v);
       }
     }
   }
+  lm_head_time_ms_ += static_cast<double>(time_in_ms() - lm_start_ms);
 }
 
 // ---------------------------------------------------------------------------
@@ -501,8 +562,7 @@ void DFlashTokenGenerator::run_draft(
     int64_t ctx_pos_base,
     const std::vector<uint64_t>& block_tokens,
     int64_t block_pos_base,
-    std::vector<float>* out_hidden,
-    std::vector<uint64_t>* out_tokens) {
+    std::vector<float>* out_hidden) {
   const int B = dflash_meta_.block_size;
   const int H = dflash_meta_.hidden_dim;
   const int Ld = dflash_meta_.num_draft_layers;
@@ -553,13 +613,21 @@ void DFlashTokenGenerator::run_draft(
   std::memset(cpos_buf, 0, draft_in_nbytes_[3]);
   std::memset(bpos_buf, 0, draft_in_nbytes_[4]);
 
-  // noise_embedding: host gather of the target's embedding table.
-  std::vector<uint16_t> emb(H);
-  for (size_t k = 0; k < block_tokens.size() && k < static_cast<size_t>(B); ++k) {
-    lookup_embedding(block_tokens[k], emb.data());
+  // noise_embedding: emb.pte over the block tokens (<= B <= emb kv AR).
+  // emb.pte emits uint16 in the decoder's embeds encoding (the program declares
+  // the output Float, but the payload is u16 -- see target_verify_block). The
+  // draft's IO is genuinely f32, so dequantize across this boundary.
+  const int32_t n_block =
+      std::min(static_cast<int32_t>(block_tokens.size()), B);
+  run_embedding(block_tokens.data(), n_block);
+  const uint16_t* emb_rows = reinterpret_cast<const uint16_t*>(emb_out_buf_);
+  for (int k = 0; k < n_block; ++k) {
     for (int i = 0; i < H; ++i) {
-      write_float(
-          noise_buf, n_meta.scalar_type(), k * H + i, fp16_to_fp32(emb[i]));
+      const size_t idx = static_cast<size_t>(k) * H + i;
+      const float v = (static_cast<float>(emb_rows[idx]) -
+                       static_cast<float>(embeds_zero_point_)) *
+          embeds_scale_;
+      write_float(noise_buf, n_meta.scalar_type(), idx, v);
     }
   }
 
@@ -697,28 +765,9 @@ void DFlashTokenGenerator::run_draft(
       }
     }
   }
-
-  // The graph did the 2.3 GMAC vocab projection; all that is left is picking the max
-  // of each row. QNN's own argmax is off by +/-65536 on an axis this wide, so it
-  // stays here.
-  if (out_tokens != nullptr && draft_has_lm_head_) {
-    const size_t V = draft_vocab_size_;
-    auto logits = meta.output_tensor_meta(1 + 2 * Ld).get();
-    // Rows, not B-1: the shifted convention predicts from every block row.
-    const int rows = static_cast<int>(logits.sizes()[1]);
-    out_tokens->assign(static_cast<size_t>(rows), 0);
-    for (int k = 0; k < rows; ++k) {
-      float best = -std::numeric_limits<float>::infinity();
-      for (size_t v = 0; v < V; ++v) {
-        const float x = read_scalar(
-            draft_logits_buf_, logits.scalar_type(), static_cast<size_t>(k) * V + v);
-        if (x > best) {
-          best = x;
-          (*out_tokens)[k] = static_cast<uint64_t>(v);
-        }
-      }
-    }
-  }
+  // The block's logits are no longer produced in-graph (this build's draft emits
+  // only hidden + K/V). The caller runs lm_head.pte over the returned hidden via
+  // decode_lm_head, which also handles the shifted/aligned row offset.
 }
 
 // ---------------------------------------------------------------------------
@@ -792,17 +841,19 @@ void DFlashTokenGenerator::target_verify_block(
     int64_t cur_pos,
     std::vector<uint64_t>* target_sampled) {
   const int ar = dflash_meta_.target_ar_len;
+  const int H = dflash_meta_.hidden_dim;
   const int n = static_cast<int>(packed_tokens.size());
 
-  for (int k = 0; k < ar; ++k) {
-    int64_t tok = (k < n) ? static_cast<int64_t>(packed_tokens[k]) : 0;
-    if (dflash_meta_.use_int64_token) {
-      input_toks_.data[k] = tok;
-    } else {
-      reinterpret_cast<int32_t*>(input_toks_.data)[k] =
-          static_cast<int32_t>(tok);
-    }
-  }
+  // Headless decoder input[0] is embeds (u16), not token ids. Run emb.pte over
+  // the packed block (padded rows read as token 0, exactly as the old raw-token
+  // path fed the decoder a 0), then quantize into inputs_[0].
+  run_embedding(packed_tokens.data(), n);
+  // emb.pte's output is ALREADY uint16 in the decoder's own embeds encoding
+  // (compile-time injected scale/zp), despite the program declaring it Float.
+  // Lossless hand-off: copy the bytes. Quantizing here would reinterpret the
+  // u16 payload as f32 and destroy it.
+  std::memcpy(input_toks_.data, emb_out_buf_, input_toks_.size);
+
   for (int k = 0; k < ar; ++k) {
     input_pos_.data[k] = static_cast<int32_t>(cur_pos) + std::min(k, n - 1);
   }
@@ -814,16 +865,34 @@ void DFlashTokenGenerator::target_verify_block(
       attention_mask_.data, attention_map, ar, static_cast<int32_t>(cur_pos));
 
   long start_ms = time_in_ms();
-  auto logits_res = decoder_runner_->step(method_name_, inputs_);
+  // Headless: step returns hidden in output_tensors_[0] (== logits_.data); the L
+  // captured layers land in target_hidden_bufs_. We ignore the return tensor and
+  // project the hidden through lm_head.pte to get the verify logits.
+  auto step_res = decoder_runner_->step(method_name_, inputs_);
+  ET_CHECK_MSG(step_res.ok(), "[DFlash] target verify step failed");
+  run_lm_head(logits_.data);
   target_verify_time_ms_ += static_cast<double>(time_in_ms() - start_ms);
   ++target_verify_calls_;
-  ET_CHECK_MSG(logits_res.ok(), "[DFlash] target verify step failed");
-  Tensor& logits = logits_res.get();
 
+  // lm_head.pte emits uint16 logits despite declaring the output Float; reading
+  // them as f32 gives all zeros. Bind UInt16 -- argmax is order-preserving so no
+  // dequantization is needed.
+  auto lm_out_meta = lm_head_kv_meta_->output_tensor_meta(0).get();
+  std::vector<TensorImpl::SizesType> lm_sizes(
+      lm_out_meta.sizes().begin(), lm_out_meta.sizes().end());
+  std::vector<TensorImpl::DimOrderType> lm_dimo(
+      lm_out_meta.dim_order().begin(), lm_out_meta.dim_order().end());
+  TensorImpl lm_impl(
+      ScalarType::UInt16,
+      lm_sizes.size(),
+      lm_sizes.data(),
+      lm_head_logits_buf_,
+      lm_dimo.data());
+  Tensor lm_logits(&lm_impl);
   target_sampled->resize(static_cast<size_t>(ar));
   for (int k = 0; k < ar; ++k) {
     (*target_sampled)[k] =
-        static_cast<uint64_t>(decoder_runner_->logits_to_token(logits, k));
+        static_cast<uint64_t>(decoder_runner_->logits_to_token(lm_logits, k));
   }
 }
 
@@ -886,16 +955,11 @@ Result<int64_t> DFlashTokenGenerator::generate(
         pending_pos_base,
         noise,
         cur_pos,
-        &block_hidden,
-        &drafted);
+        &block_hidden);
 
-    // With an in-graph lm_head the logits already came back from HTP; otherwise
-    // scan the embedding table here.
-    if (!draft_has_lm_head_) {
-      const long lm_start_ms = time_in_ms();
-      lm_head_argmax(block_hidden.data() + hidden_row0, n_draft, &drafted);
-      lm_head_time_ms_ += static_cast<double>(time_in_ms() - lm_start_ms);
-    }
+    // Project the drafted hidden through lm_head.pte. hidden_row0 selects the
+    // first predicting row (0 shifted, H aligned) and n_draft the count.
+    decode_lm_head(block_hidden.data() + hidden_row0, n_draft, &drafted);
 
     // What the target checks: the confirmed token followed by the draft's guesses.
     std::vector<uint64_t> verify(static_cast<size_t>(n_draft) + 1);

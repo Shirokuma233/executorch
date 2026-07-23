@@ -10,8 +10,10 @@
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/prompt_processor.h>
 #include <executorch/extension/llm/runner/util.h>
 #include <numeric>
+using executorch::aten::Tensor;
 using executorch::aten::TensorImpl;
 using executorch::extension::llm::time_in_ms;
+using executorch::runtime::Error;
 using executorch::runtime::EValue;
 using executorch::runtime::MethodMeta;
 using executorch::runtime::Result;
@@ -19,16 +21,44 @@ using executorch::runtime::Span;
 using executorch::runtime::TensorInfo;
 namespace example {
 
+namespace {
+// Wrap an externally owned buffer as a Tensor matching `info`.
+inline TensorImpl make_impl(const TensorInfo& info, void* data) {
+  return TensorImpl(
+      info.scalar_type(),
+      info.sizes().size(),
+      const_cast<TensorImpl::SizesType*>(info.sizes().data()),
+      data,
+      const_cast<TensorImpl::DimOrderType*>(info.dim_order().data()));
+}
+} // namespace
+
 PromptProcessor::PromptProcessor(
     DecoderRunner* decoder_runner,
     KVManager* kv_manager,
     const std::string& method_name,
     Metadata metadata,
-    std::unique_ptr<MethodMeta> method_meta)
+    std::unique_ptr<MethodMeta> method_meta,
+    executorch::extension::Module* emb_module,
+    executorch::extension::Module* lm_head_module,
+    std::unique_ptr<MethodMeta> emb_prefill_meta,
+    std::unique_ptr<MethodMeta> lm_head_prefill_meta,
+    float embeds_scale,
+    int32_t embeds_zero_point,
+    float logits_scale,
+    int32_t logits_zero_point)
     : decoder_runner_(decoder_runner),
       kv_manager_(kv_manager),
       method_name_(method_name),
-      metadata_(metadata) {
+      metadata_(metadata),
+      emb_module_(emb_module),
+      lm_head_module_(lm_head_module),
+      emb_prefill_meta_(std::move(emb_prefill_meta)),
+      lm_head_prefill_meta_(std::move(lm_head_prefill_meta)),
+      embeds_scale_(embeds_scale),
+      embeds_zero_point_(embeds_zero_point),
+      logits_scale_(logits_scale),
+      logits_zero_point_(logits_zero_point) {
   k_cache_in_.resize(metadata_.num_layers);
   v_cache_in_.resize(metadata_.num_layers);
   k_cache_out_.resize(metadata_.num_layers);
@@ -86,6 +116,17 @@ PromptProcessor::PromptProcessor(
     }
     extra_outputs_size_ += extra.size;
     extra_outputs_.emplace_back(std::move(extra));
+  }
+
+  // Headless technique. When the decoder is headless (DFlash), input[0] is embeds
+  // (u16) and output[0] is hidden (u16), not tokens/logits. init_io allocates
+  // input[0] with input_toks_.size bytes and output[0] with logits_.size bytes
+  // while taking dtype/shape from method_meta, so resizing just these two byte
+  // counts makes it carve correctly-sized embeds/hidden buffers. Doing it here
+  // (not in init_io) also keeps the RpcMem budget from over-reserving vocab-wide.
+  if (emb_module_ != nullptr) {
+    input_toks_.size = method_meta->input_tensor_meta(0)->nbytes();
+    logits_.size = method_meta->output_tensor_meta(0)->nbytes();
   }
 };
 
@@ -237,6 +278,41 @@ void PromptProcessor::init_io(
     buffer_manager->add_memory_info(
         extra_output.data, extra_output.size, extra_meta.get());
   }
+
+  // DFlash headless companions: emb.pte token input + f32 embeds output, lm_head
+  // f32 logits output. lm_head's input is the decoder hidden buffer (logits_.data)
+  // directly. All carved from the shared region + QNN-registered, sized for the
+  // prefill views this processor binds.
+  if (emb_module_ != nullptr) {
+    emb_tok_i64_ =
+        emb_prefill_meta_->input_tensor_meta(0)->scalar_type() ==
+        executorch::aten::ScalarType::Long;
+    emb_tok_nbytes_ = emb_prefill_meta_->input_tensor_meta(0)->nbytes();
+    emb_tok_buf_ = buffer_manager->allocate(emb_tok_nbytes_);
+    buffer_manager->add_memory_info(
+        emb_tok_buf_,
+        emb_tok_nbytes_,
+        emb_prefill_meta_->input_tensor_meta(0).get());
+
+    emb_out_nbytes_ = emb_prefill_meta_->output_tensor_meta(0)->nbytes();
+    emb_out_buf_ = buffer_manager->allocate(emb_out_nbytes_);
+    buffer_manager->add_memory_info(
+        emb_out_buf_,
+        emb_out_nbytes_,
+        emb_prefill_meta_->output_tensor_meta(0).get());
+
+    lm_head_logits_nbytes_ =
+        lm_head_prefill_meta_->output_tensor_meta(0)->nbytes();
+    lm_head_logits_buf_ = buffer_manager->allocate(lm_head_logits_nbytes_);
+    buffer_manager->add_memory_info(
+        lm_head_logits_buf_,
+        lm_head_logits_nbytes_,
+        lm_head_prefill_meta_->output_tensor_meta(0).get());
+
+    lm_head_vocab_size_ = static_cast<int32_t>(
+        lm_head_prefill_meta_->output_tensor_meta(0)->sizes()[2]);
+  }
+
   // Prepare the vector of EValue to run inference
   inputs_.reserve(input_tensors_.size());
   for (auto& input_tensor : input_tensors_) {
@@ -252,6 +328,11 @@ void PromptProcessor::prepare_io(
     const std::vector<uint64_t>& prompt_tokens,
     int64_t prompt_pos,
     int64_t start_pos) {
+  const bool dflash = emb_module_ != nullptr;
+  if (dflash) {
+    // Padded slots must embed token 0, so clear before writing the valid ids.
+    std::memset(emb_tok_buf_, 0, emb_tok_nbytes_);
+  }
   for (int i = 0; i < metadata_.ar_len; i++) {
     if (!is_bert()) {
       // Prepare pos data
@@ -260,14 +341,24 @@ void PromptProcessor::prepare_io(
 
     // Prepare input token data
     if (prompt_pos + i < prompt_tokens.size()) {
-      // Support CPU 4-bit embedding, which requires int64 input.
-      // However, for QNN embedding, only int32 input is needed.
-      // Therefore, we need to cast to the correct type to write the data.
-      if (metadata_.use_int64_token) {
-        input_toks_.data[i] = prompt_tokens[prompt_pos + i];
+      const uint64_t tok = prompt_tokens[prompt_pos + i];
+      if (dflash) {
+        // Headless decoder: token ids feed emb.pte, not the decoder directly.
+        if (emb_tok_i64_) {
+          reinterpret_cast<int64_t*>(emb_tok_buf_)[i] =
+              static_cast<int64_t>(tok);
+        } else {
+          reinterpret_cast<int32_t*>(emb_tok_buf_)[i] =
+              static_cast<int32_t>(tok);
+        }
+      } else if (metadata_.use_int64_token) {
+        // Support CPU 4-bit embedding, which requires int64 input.
+        // However, for QNN embedding, only int32 input is needed.
+        // Therefore, we need to cast to the correct type to write the data.
+        input_toks_.data[i] = tok;
       } else {
         int32_t* input_toks_ptr = reinterpret_cast<int32_t*>(input_toks_.data);
-        input_toks_ptr[i] = static_cast<int32_t>(prompt_tokens[prompt_pos + i]);
+        input_toks_ptr[i] = static_cast<int32_t>(tok);
       }
     }
   }
@@ -375,6 +466,12 @@ Result<uint64_t> PromptProcessor::prefill(
     // Fill in the token and position data
     prepare_io(prompt_tokens, prompt_pos, shifted_pos);
 
+    // Headless decoder: turn token ids into quantized embeds (inputs_[0]) via
+    // emb.pte before the decoder step. No-op for every other eval mode.
+    if (emb_module_ != nullptr) {
+      run_embedding_prefill();
+    }
+
     // Run inference
     const uint64_t graph_start_ms = time_in_ms();
     decoder_runner_->step(method_name_, inputs_);
@@ -414,10 +511,67 @@ Result<uint64_t> PromptProcessor::prefill(
     shifted_pos += metadata_.ar_len;
   }
 
-  cur_token = decoder_runner_->logits_to_token(
-      output_tensors_[0],
-      (num_prompt_tokens + metadata_.ar_len - 1) % metadata_.ar_len);
+  const int64_t last_row =
+      (num_prompt_tokens + metadata_.ar_len - 1) % metadata_.ar_len;
+  if (emb_module_ != nullptr) {
+    // Headless: output_tensors_[0] is hidden. Project the last chunk through
+    // lm_head.pte and sample the last valid row of its logits.
+    run_lm_head_prefill(logits_.data);
+    // lm_head.pte writes uint16 logits even though the program declares the
+    // output Float. Reading them as f32 yields zeros; bind as UInt16 instead.
+    // argmax is unaffected by skipping dequantization (order is preserved).
+    auto lm_out_meta = lm_head_prefill_meta_->output_tensor_meta(0).get();
+    std::vector<executorch::aten::TensorImpl::SizesType> lm_sizes(
+        lm_out_meta.sizes().begin(), lm_out_meta.sizes().end());
+    std::vector<executorch::aten::TensorImpl::DimOrderType> lm_dimo(
+        lm_out_meta.dim_order().begin(), lm_out_meta.dim_order().end());
+    TensorImpl lm_impl(
+        executorch::aten::ScalarType::UInt16,
+        lm_sizes.size(),
+        lm_sizes.data(),
+        lm_head_logits_buf_,
+        lm_dimo.data());
+    Tensor lm_logits(&lm_impl);
+    cur_token = decoder_runner_->logits_to_token(lm_logits, last_row);
+  } else {
+    cur_token = decoder_runner_->logits_to_token(output_tensors_[0], last_row);
+  }
   return cur_token;
+}
+
+void PromptProcessor::run_embedding_prefill() {
+  auto tok_meta = emb_prefill_meta_->input_tensor_meta(0).get();
+  auto out_meta = emb_prefill_meta_->output_tensor_meta(0).get();
+  TensorImpl tok_impl = make_impl(tok_meta, emb_tok_buf_);
+  TensorImpl out_impl = make_impl(out_meta, emb_out_buf_);
+  std::vector<EValue> ins{EValue(Tensor(&tok_impl))};
+  std::vector<EValue> outs{EValue(Tensor(&out_impl))};
+  ET_CHECK_MSG(
+      emb_module_->set_output(
+          "tok_embedding_prefill_forward", outs[0], 0) == Error::Ok,
+      "[DFlash] emb prefill set_output failed");
+  auto res = emb_module_->execute("tok_embedding_prefill_forward", ins);
+  ET_CHECK_MSG(res.ok(), "[DFlash] emb prefill execute failed");
+  // emb.pte's output is ALREADY uint16 in the decoder's own embeds encoding
+  // (scale/zp injected at compile time), even though the program declares the
+  // tensor Float. So this boundary is a lossless uint16 hand-off -- copy the
+  // bytes straight into the decoder's embeds input; quantizing here would
+  // reinterpret u16 payload as f32 and destroy it.
+  std::memcpy(input_toks_.data, emb_out_buf_, input_toks_.size);
+}
+
+void PromptProcessor::run_lm_head_prefill(std::byte* hidden_u16) {
+  auto in_meta = lm_head_prefill_meta_->input_tensor_meta(0).get();
+  auto out_meta = lm_head_prefill_meta_->output_tensor_meta(0).get();
+  TensorImpl in_impl = make_impl(in_meta, hidden_u16);
+  TensorImpl out_impl = make_impl(out_meta, lm_head_logits_buf_);
+  std::vector<EValue> ins{EValue(Tensor(&in_impl))};
+  std::vector<EValue> outs{EValue(Tensor(&out_impl))};
+  ET_CHECK_MSG(
+      lm_head_module_->set_outputs("lm_head_prefill_forward", outs) == Error::Ok,
+      "[DFlash] lm_head prefill set_outputs failed");
+  auto res = lm_head_module_->execute("lm_head_prefill_forward", ins);
+  ET_CHECK_MSG(res.ok(), "[DFlash] lm_head prefill execute failed");
 }
 
 } // namespace example

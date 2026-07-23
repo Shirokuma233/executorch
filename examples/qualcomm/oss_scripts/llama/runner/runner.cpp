@@ -26,6 +26,7 @@
 #include <pytorch/tokenizers/hf_tokenizer.h>
 #include <pytorch/tokenizers/llama2c_tokenizer.h>
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 
 using executorch::extension::Module;
@@ -113,8 +114,8 @@ Runner::Runner(
     std::unique_ptr<executorch::extension::Module> dflash_draft_module,
     int block_size,
     int dflash_max_context_len,
-    const std::string& dflash_embed_path,
-    const std::string& dflash_lm_head_path)
+    std::unique_ptr<executorch::extension::Module> dflash_emb_module,
+    std::unique_ptr<executorch::extension::Module> dflash_lm_head_module)
     : module_(std::move(module)),
       attention_sink_rope_module_(std::move(attention_sink_rope_module)),
       eagle_head_module_(std::move(eagle_head_module)),
@@ -126,10 +127,10 @@ Runner::Runner(
       eagle_t2d_path_(eagle_t2d_path),
       eagle_embed_path_(eagle_embed_path),
       dflash_draft_module_(std::move(dflash_draft_module)),
+      dflash_emb_module_(std::move(dflash_emb_module)),
+      dflash_lm_head_module_(std::move(dflash_lm_head_module)),
       block_size_(block_size),
       dflash_max_context_len_(dflash_max_context_len),
-      dflash_embed_path_(dflash_embed_path),
-      dflash_lm_head_path_(dflash_lm_head_path),
       ngram_(ngram),
       window_(window),
       gcap_(gcap),
@@ -277,6 +278,117 @@ Error Runner::load() {
   // For some tokenizer.json, runtime vocab_size might be different, use output
   // shape to get vocab size.
   int32_t vocab_size = method_meta->output_tensor_meta(0)->sizes()[2];
+
+  // DFlash: the recompiled decoder is headless -- input[0] is embeds (u16) and
+  // output[0] is hidden (u16), NOT tokens/logits. The embedding and vocab
+  // projection are their own ptes. Load them up front so the sampler is sized to
+  // the true vocab and both the prompt processor and the generator can bind them.
+  const bool dflash = (eval_mode_ == EvalMode::kDFlashDecoding);
+  std::unique_ptr<MethodMeta> dflash_emb_kv_meta, dflash_emb_prefill_meta,
+      dflash_lm_kv_meta, dflash_lm_prefill_meta;
+  float dflash_embeds_scale = 1.0f, dflash_logits_scale = 1.0f;
+  int32_t dflash_embeds_zp = 0, dflash_logits_zp = 0;
+  if (dflash) {
+    ET_CHECK_MSG(
+        dflash_emb_module_ != nullptr && dflash_lm_head_module_ != nullptr,
+        "DFlash mode requires --dflash_emb_pte_path and --dflash_lm_head_pte_path "
+        "(auto-derived as siblings of --dflash_draft_path).");
+    ET_CHECK_OK_OR_RETURN_ERROR(
+        dflash_emb_module_->load_method("tok_embedding_kv_forward"));
+    ET_CHECK_OK_OR_RETURN_ERROR(
+        dflash_emb_module_->load_method("tok_embedding_prefill_forward"));
+    ET_CHECK_OK_OR_RETURN_ERROR(
+        dflash_lm_head_module_->load_method("lm_head_kv_forward"));
+    ET_CHECK_OK_OR_RETURN_ERROR(
+        dflash_lm_head_module_->load_method("lm_head_prefill_forward"));
+    dflash_emb_kv_meta = std::make_unique<MethodMeta>(
+        ET_UNWRAP(dflash_emb_module_->method_meta("tok_embedding_kv_forward")));
+    dflash_emb_prefill_meta = std::make_unique<MethodMeta>(ET_UNWRAP(
+        dflash_emb_module_->method_meta("tok_embedding_prefill_forward")));
+    dflash_lm_kv_meta = std::make_unique<MethodMeta>(
+        ET_UNWRAP(dflash_lm_head_module_->method_meta("lm_head_kv_forward")));
+    dflash_lm_prefill_meta = std::make_unique<MethodMeta>(
+        ET_UNWRAP(dflash_lm_head_module_->method_meta("lm_head_prefill_forward")));
+    // The true target vocab lives on the lm_head output, not decoder output[0].
+    vocab_size =
+        static_cast<int32_t>(dflash_lm_kv_meta->output_tensor_meta(0)->sizes()[2]);
+
+    // Boundary QDQ params, self-calibrated into the decoder graph.
+    auto ev_to_double = [](const executorch::runtime::EValue& ev,
+                           double fb) -> double {
+      if (ev.isDouble()) {
+        return ev.toDouble();
+      }
+      if (ev.isInt()) {
+        return static_cast<double>(ev.toInt());
+      }
+      if (ev.isTensor()) {
+        auto t = ev.toTensor();
+        if (t.numel() >= 1) {
+          switch (t.scalar_type()) {
+            case executorch::aten::ScalarType::Float:
+              return t.const_data_ptr<float>()[0];
+            case executorch::aten::ScalarType::Double:
+              return t.const_data_ptr<double>()[0];
+            case executorch::aten::ScalarType::Int:
+              return t.const_data_ptr<int32_t>()[0];
+            case executorch::aten::ScalarType::Long:
+              return t.const_data_ptr<int64_t>()[0];
+            default:
+              break;
+          }
+        }
+      }
+      return fb;
+    };
+    auto read_dec_double = [&](const char* name, double fb) -> double {
+      if (module_->method_names()->count(name) > 0) {
+        auto res = module_->get(name);
+        if (res.ok()) {
+          return ev_to_double(res.get(), fb);
+        }
+      }
+      ET_LOG(Error, "[DFlash] decoder getter %s missing; using %f", name, fb);
+      return fb;
+    };
+    dflash_embeds_scale =
+        static_cast<float>(read_dec_double("get_embeds_scale", 1.0));
+    dflash_embeds_zp = static_cast<int32_t>(
+        std::lround(read_dec_double("get_embeds_zero_point", 0.0)));
+    dflash_logits_scale =
+        static_cast<float>(read_dec_double("get_logits_scale", 1.0));
+    dflash_logits_zp = static_cast<int32_t>(
+        std::lround(read_dec_double("get_logits_zero_point", 0.0)));
+
+    // Aux ION budget: emb/lm_head IO. The token generator binds the kv views
+    // (its buffers never see prefill), the prompt processor the prefill views;
+    // each buffer is single-view, so size it for exactly the graph it feeds.
+    // The prompt processor reuses the decoder hidden buffer as the lm_head input,
+    // so it needs no separate quantized-hidden buffer.
+    auto in0 = [](const MethodMeta& m) {
+      return m.input_tensor_meta(0)->nbytes();
+    };
+    auto out0 = [](const MethodMeta& m) {
+      return m.output_tensor_meta(0)->nbytes();
+    };
+    const size_t tok_gen_aux = in0(*dflash_emb_kv_meta) +
+        out0(*dflash_emb_kv_meta) + out0(*dflash_lm_kv_meta) +
+        in0(*dflash_lm_kv_meta);
+    const size_t prompt_aux = in0(*dflash_emb_prefill_meta) +
+        out0(*dflash_emb_prefill_meta) + out0(*dflash_lm_prefill_meta);
+    dflash_aux_io_size_ = tok_gen_aux + prompt_aux;
+    ET_LOG(
+        Info,
+        "[DFlash] headless decoder: vocab=%d | embeds scale=%g zp=%d | logits "
+        "scale=%g zp=%d | aux IO %.1f MB",
+        vocab_size,
+        dflash_embeds_scale,
+        dflash_embeds_zp,
+        dflash_logits_scale,
+        dflash_logits_zp,
+        static_cast<double>(dflash_aux_io_size_) / (1 << 20));
+  }
+
   decoder_runner_ =
       std::make_unique<DecoderRunner>(module_.get(), vocab_size, temperature_);
 
@@ -363,7 +475,15 @@ Error Runner::load() {
           sliding_window,
           cache_mode_},
       std::make_unique<MethodMeta>(
-          std::move(module_->method_meta(prompt_processor_method_name).get())));
+          std::move(module_->method_meta(prompt_processor_method_name).get())),
+      dflash ? dflash_emb_module_.get() : nullptr,
+      dflash ? dflash_lm_head_module_.get() : nullptr,
+      std::move(dflash_emb_prefill_meta),
+      std::move(dflash_lm_prefill_meta),
+      dflash_embeds_scale,
+      dflash_embeds_zp,
+      dflash_logits_scale,
+      dflash_logits_zp);
   if (eval_mode_ == EvalMode::kLookaheadDecoding) {
     token_generator_ = std::make_unique<LhdTokenGenerator>(
         tokenizer_.get(),
@@ -626,31 +746,6 @@ Error Runner::load() {
     // The MethodMeta above was consumed; fetch a fresh one for the generator.
     auto draft_kv_meta2 = ET_UNWRAP(dflash_draft_module_->method_meta("kv_forward"));
 
-    auto load_fp16_bin = [](const std::string& path) -> std::vector<uint16_t> {
-      std::vector<uint16_t> t;
-      if (path.empty()) {
-        return t;
-      }
-      std::ifstream f(path, std::ios::binary | std::ios::ate);
-      if (f.is_open()) {
-        auto sz = f.tellg();
-        f.seekg(0);
-        t.resize(static_cast<size_t>(sz) / sizeof(uint16_t));
-        f.read(reinterpret_cast<char*>(t.data()), sz);
-      } else {
-        ET_LOG(Error, "[DFlash] cannot open %s", path.c_str());
-      }
-      return t;
-    };
-    std::vector<uint16_t> embed_table = load_fp16_bin(dflash_embed_path_);
-    std::vector<uint16_t> lm_head_table = load_fp16_bin(dflash_lm_head_path_);
-    ET_LOG(
-        Info,
-        "[DFlash] embed.bin=%zu lm_head.bin=%zu (tied=%s)",
-        embed_table.size(),
-        lm_head_table.size(),
-        lm_head_table.empty() ? "yes" : "no");
-
     DFlashTokenGenerator::Metadata dflash_md{
         /*target_context_len=*/context_len_,
         /*target_num_heads=*/num_heads,
@@ -683,14 +778,15 @@ Error Runner::load() {
         std::make_unique<MethodMeta>(std::move(
             module_->method_meta(token_generator_method_name).get())),
         std::make_unique<MethodMeta>(std::move(draft_kv_meta2)),
-        std::make_unique<MethodMeta>(std::move(draft_prefill_meta)));
-    if (!embed_table.empty()) {
-      dflash_gen->set_embed_table(
-          std::move(embed_table), vocab_size, hidden_dim);
-    }
-    if (!lm_head_table.empty()) {
-      dflash_gen->set_lm_head_table(std::move(lm_head_table));
-    }
+        std::make_unique<MethodMeta>(std::move(draft_prefill_meta)),
+        dflash_emb_module_.get(),
+        dflash_lm_head_module_.get(),
+        std::move(dflash_emb_kv_meta),
+        std::move(dflash_lm_kv_meta),
+        dflash_embeds_scale,
+        dflash_embeds_zp,
+        dflash_logits_scale,
+        dflash_logits_zp);
     token_generator_ = std::move(dflash_gen);
   } else {
     token_generator_ = std::make_unique<TokenGenerator>(
@@ -724,7 +820,7 @@ Error Runner::load() {
     }
     if (dflash_kv_manager_ != nullptr) {
       cache_size += dflash_kv_manager_->total_cache_size_in_bytes() +
-          dflash_draft_io_size_;
+          dflash_draft_io_size_ + dflash_aux_io_size_;
     }
     buffer_manager_ = std::make_unique<RpcMem>(
         cache_size,

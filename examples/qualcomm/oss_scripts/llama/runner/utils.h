@@ -9,6 +9,7 @@
 #pragma once
 #include <executorch/runtime/core/exec_aten/exec_aten.h>
 #include <executorch/runtime/core/exec_aten/util/scalar_type_util.h>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -41,6 +42,27 @@ inline float fp16_to_fp32(uint16_t h) {
   float result;
   std::memcpy(&result, &f, sizeof(result));
   return result;
+}
+
+// Affine-quantize fp32 to the graph's uint16 encoding:
+//   u16 = clamp(lround(f32 / scale) + zero_point, 0, 65535).
+// The scale/zero_point come from the decoder pte's self-calibrated getters, so
+// the result is bit-identical to the QDQ the monolithic graph used to fold in.
+inline void quantize_f32_to_u16(
+    const float* src,
+    uint16_t* dst,
+    size_t n,
+    float scale,
+    int32_t zero_point) {
+  for (size_t i = 0; i < n; ++i) {
+    long q = std::lround(static_cast<double>(src[i]) / scale) + zero_point;
+    if (q < 0) {
+      q = 0;
+    } else if (q > 65535) {
+      q = 65535;
+    }
+    dst[i] = static_cast<uint16_t>(q);
+  }
 }
 
 // Template struct to hold tensor data and tensor

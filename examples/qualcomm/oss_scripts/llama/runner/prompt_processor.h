@@ -40,7 +40,19 @@ class PromptProcessor {
       KVManager* kv_manager,
       const std::string& method_name,
       Metadata metadata,
-      std::unique_ptr<executorch::extension::MethodMeta> method_meta);
+      std::unique_ptr<executorch::extension::MethodMeta> method_meta,
+      // DFlash headless-decoder companions. Null for every other eval mode, in
+      // which case the prompt processor behaves exactly as before.
+      executorch::extension::Module* emb_module = nullptr,
+      executorch::extension::Module* lm_head_module = nullptr,
+      std::unique_ptr<executorch::extension::MethodMeta> emb_prefill_meta =
+          nullptr,
+      std::unique_ptr<executorch::extension::MethodMeta> lm_head_prefill_meta =
+          nullptr,
+      float embeds_scale = 1.0f,
+      int32_t embeds_zero_point = 0,
+      float logits_scale = 1.0f,
+      int32_t logits_zero_point = 0);
 
   virtual ~PromptProcessor() = default;
 
@@ -123,6 +135,13 @@ class PromptProcessor {
       const std::vector<uint64_t>& prompt_tokens,
       int64_t prompt_pos,
       int64_t start_pos);
+
+  // DFlash headless helpers: emb.pte prefill (tokens in emb_tok_buf_ -> f32
+  // embeds -> quantize into inputs_[0]) and lm_head.pte prefill (u16 hidden ->
+  // f32 logits in lm_head_logits_buf_). No-ops unless emb_module_ is set.
+  void run_embedding_prefill();
+  void run_lm_head_prefill(std::byte* hidden_u16);
+
   DecoderRunner* decoder_runner_;
   KVManager* kv_manager_;
   std::string method_name_;
@@ -139,6 +158,30 @@ class PromptProcessor {
   std::vector<TensorStructRaw> extra_outputs_;
   size_t extra_outputs_size_{0};
   ExtraOutputObserver extra_output_observer_;
+
+  // DFlash headless-decoder companions. Null for every other eval mode.
+  executorch::extension::Module* emb_module_ = nullptr;
+  executorch::extension::Module* lm_head_module_ = nullptr;
+  std::unique_ptr<executorch::extension::MethodMeta> emb_prefill_meta_;
+  std::unique_ptr<executorch::extension::MethodMeta> lm_head_prefill_meta_;
+  float embeds_scale_ = 1.0f;
+  int32_t embeds_zero_point_ = 0;
+  float logits_scale_ = 1.0f;
+  int32_t logits_zero_point_ = 0;
+  bool emb_tok_i64_ = false;
+  int32_t lm_head_vocab_size_ = 0;
+  // emb/lm_head IO, carved from the shared (ION) region + QNN-registered, sized
+  // for the prefill views. lm_head's input is the decoder hidden buffer
+  // (logits_.data) directly, so no separate quantized-hidden buffer is needed.
+  std::byte* emb_tok_buf_ = nullptr; // i32/i64 token ids into emb.pte
+  size_t emb_tok_nbytes_ = 0;
+  // TODO(dflash-uint16): 临时桥接。emb输出目前是 f32(编译端边界没做成 uint16),
+  // 消费端 host quantize 进 decoder embeds(u16)。日后编译端把 emb 输出 tag 成
+  // uint16 后,此 buffer 改 u16、可直传。详见 dflash/RUNNER_M5_PLAN.md "技术债" 节。
+  std::byte* emb_out_buf_ = nullptr; // f32 embeds out of emb.pte
+  size_t emb_out_nbytes_ = 0;
+  std::byte* lm_head_logits_buf_ = nullptr; // f32 logits out of lm_head.pte
+  size_t lm_head_logits_nbytes_ = 0;
 
   // layer -> TensorImpl
   std::vector<std::unique_ptr<executorch::aten::TensorImpl>> k_cache_in_;

@@ -138,14 +138,17 @@ DEFINE_int32(
     0,
     "[DFlash Decoding] Fixed context length the draft attends to (0 => model).");
 DEFINE_string(
-    dflash_embed_path,
+    dflash_emb_pte_path,
     "",
-    "[DFlash Decoding] Path to embed.bin (fp16[target_vocab, hidden]). "
-    "Default: <dflash_draft dir>/embed.bin");
+    "[DFlash Decoding] Path to the compiled token-embedding pte (headless "
+    "decoder consumes embeds, not token ids). "
+    "Default: <dflash_draft dir>/tok_embedding_qnn.pte");
 DEFINE_string(
-    dflash_lm_head_path,
+    dflash_lm_head_pte_path,
     "",
-    "[DFlash Decoding] Path to lm_head.bin. Empty => reuse embed.bin (tied).");
+    "[DFlash Decoding] Path to the compiled lm_head pte (headless decoder emits "
+    "hidden, not logits). "
+    "Default: <dflash_draft dir>/lm_head_qnn.pte");
 
 std::vector<std::string> CollectPrompts(int argc, char** argv) {
   // Collect all prompts from command line, example usage:
@@ -287,8 +290,8 @@ void start_runner(
     const std::string& eagle_t2d_path,
     const std::string& eagle_embed_path,
     std::unique_ptr<executorch::extension::Module> dflash_draft_module,
-    const std::string& dflash_embed_path,
-    const std::string& dflash_lm_head_path) {
+    std::unique_ptr<executorch::extension::Module> dflash_emb_module,
+    std::unique_ptr<executorch::extension::Module> dflash_lm_head_module) {
   bool use_tokenized_prompt =
       gflags::GetCommandLineFlagInfoOrDie("tokenized_prompt").is_default ? false
                                                                          : true;
@@ -319,8 +322,8 @@ void start_runner(
       std::move(dflash_draft_module),
       FLAGS_block_size,
       FLAGS_dflash_max_context_len,
-      dflash_embed_path,
-      dflash_lm_head_path);
+      std::move(dflash_emb_module),
+      std::move(dflash_lm_head_module));
   auto decoder_model_version = runner.get_decoder_model_version();
   std::vector<char> buf;
   buf.reserve(5 * FLAGS_seq_len); // assume each token is around 5 char
@@ -413,14 +416,27 @@ int main(int argc, char** argv) {
       : FLAGS_eagle_embed_path;
 
   std::unique_ptr<executorch::extension::Module> dflash_draft_module;
+  std::unique_ptr<executorch::extension::Module> dflash_emb_module;
+  std::unique_ptr<executorch::extension::Module> dflash_lm_head_module;
   if (!FLAGS_dflash_draft_path.empty()) {
     dflash_draft_module = std::make_unique<executorch::extension::Module>(
         FLAGS_dflash_draft_path.c_str(),
         executorch::extension::Module::LoadMode::MmapUseMlockIgnoreErrors);
+    // The recompiled decoder is headless: it takes embeds (u16) and emits hidden
+    // (u16), so the embedding and lm_head projections run as their own ptes.
+    std::string emb_pte = FLAGS_dflash_emb_pte_path.empty()
+        ? sibling_path(FLAGS_dflash_draft_path, "tok_embedding_qnn.pte")
+        : FLAGS_dflash_emb_pte_path;
+    std::string lm_head_pte = FLAGS_dflash_lm_head_pte_path.empty()
+        ? sibling_path(FLAGS_dflash_draft_path, "lm_head_qnn.pte")
+        : FLAGS_dflash_lm_head_pte_path;
+    dflash_emb_module = std::make_unique<executorch::extension::Module>(
+        emb_pte.c_str(),
+        executorch::extension::Module::LoadMode::MmapUseMlockIgnoreErrors);
+    dflash_lm_head_module = std::make_unique<executorch::extension::Module>(
+        lm_head_pte.c_str(),
+        executorch::extension::Module::LoadMode::MmapUseMlockIgnoreErrors);
   }
-  std::string dflash_embed_path = FLAGS_dflash_embed_path.empty()
-      ? sibling_path(FLAGS_dflash_draft_path, "embed.bin")
-      : FLAGS_dflash_embed_path;
 
   start_runner(
       std::move(module),
@@ -431,8 +447,8 @@ int main(int argc, char** argv) {
       t2d_path,
       embed_path,
       std::move(dflash_draft_module),
-      dflash_embed_path,
-      FLAGS_dflash_lm_head_path);
+      std::move(dflash_emb_module),
+      std::move(dflash_lm_head_module));
 
   return 0;
 }
