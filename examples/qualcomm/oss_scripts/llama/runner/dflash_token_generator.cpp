@@ -488,8 +488,19 @@ void DFlashTokenGenerator::run_embedding(
   ET_CHECK_MSG(
       emb_module_->set_outputs("tok_embedding_kv_forward", outs) == Error::Ok,
       "[DFlash] emb set_outputs failed");
+  const long t0 = time_in_ms();
   auto res = emb_module_->execute("tok_embedding_kv_forward", ins);
+  emb_exec_ms_ += static_cast<double>(time_in_ms() - t0);
+  ++emb_calls_;
   ET_CHECK_MSG(res.ok(), "[DFlash] emb execute failed");
+  if (!dtype_checked_) {
+    dtype_checked_ = true;
+    check_payload_dtype(
+        "emb.pte out",
+        emb_out_buf_,
+        static_cast<size_t>(ar) * dflash_meta_.hidden_dim,
+        out_meta.scalar_type());
+  }
 }
 
 void DFlashTokenGenerator::run_lm_head(std::byte* hidden_u16) {
@@ -502,8 +513,75 @@ void DFlashTokenGenerator::run_lm_head(std::byte* hidden_u16) {
   ET_CHECK_MSG(
       lm_head_module_->set_outputs("lm_head_kv_forward", outs) == Error::Ok,
       "[DFlash] lm_head set_outputs failed");
+  const long t0 = time_in_ms();
   auto res = lm_head_module_->execute("lm_head_kv_forward", ins);
+  lm_head_exec_ms_ += static_cast<double>(time_in_ms() - t0);
+  ++lm_head_calls_;
   ET_CHECK_MSG(res.ok(), "[DFlash] lm_head execute failed");
+  static bool lm_checked = false;
+  if (!lm_checked) {
+    lm_checked = true;
+    check_payload_dtype(
+        "lm_head.pte out",
+        lm_head_logits_buf_,
+        static_cast<size_t>(out_meta.sizes()[1]) * lm_head_vocab_size_,
+        out_meta.scalar_type());
+  }
+}
+
+// ---------------------------------------------------------------------------
+// A pte's program can declare an output Float while the delegate writes uint16
+// codes. probe tooling and method_meta both report the DECLARED value, so the
+// only reliable check is to look at the payload itself: u16 codes read as f32
+// produce absurd magnitudes (two ~30000 codes concatenate into ~1e30+), while
+// genuine f32 activations stay within a sane range.
+// ---------------------------------------------------------------------------
+void DFlashTokenGenerator::check_payload_dtype(
+    const char* name,
+    const std::byte* buf,
+    size_t n_elems,
+    ScalarType declared) {
+  if (declared != ScalarType::Float || n_elems == 0) {
+    return; // only Float declarations can hide a u16 payload
+  }
+  const size_t n = std::min<size_t>(n_elems, 4096);
+  const float* f = reinterpret_cast<const float*>(buf);
+  const uint16_t* u = reinterpret_cast<const uint16_t*>(buf);
+  size_t absurd = 0, nonzero = 0;
+  double u_sum = 0.0;
+  for (size_t i = 0; i < n; ++i) {
+    const float x = f[i];
+    if (std::isfinite(x)) {
+      const float a = std::fabs(x);
+      if (a > 1e20f) {
+        ++absurd;
+      }
+      if (a > 0.0f) {
+        ++nonzero;
+      }
+    } else {
+      ++absurd;
+    }
+    u_sum += static_cast<double>(u[i]);
+  }
+  const double absurd_frac = static_cast<double>(absurd) / static_cast<double>(n);
+  if (absurd_frac > 0.10) {
+    ET_LOG(
+        Error,
+        "[DFlash][dtype] %s declares Float but %.0f%% of the payload is absurd "
+        "as f32 (|x|>1e20) -- it is almost certainly uint16. Mean u16 code "
+        "%.0f. Reading it as f32 will corrupt everything downstream.",
+        name,
+        absurd_frac * 100.0,
+        u_sum / static_cast<double>(n));
+  } else {
+    ET_LOG(
+        Info,
+        "[DFlash][dtype] %s: payload consistent with declared Float (%.0f%% "
+        "nonzero, no absurd magnitudes).",
+        name,
+        100.0 * static_cast<double>(nonzero) / static_cast<double>(n));
+  }
 }
 
 // Quantize `count` draft hidden rows to the lm_head's u16 input encoding, run
@@ -529,6 +607,7 @@ void DFlashTokenGenerator::decode_lm_head(
   run_lm_head(draft_hidden_u16_buf_);
 
   // uint16 logits (see target_verify_block); argmax directly on the raw codes.
+  const long t_smp = time_in_ms();
   const size_t V = static_cast<size_t>(lm_head_vocab_size_);
   const uint16_t* lg = reinterpret_cast<const uint16_t*>(lm_head_logits_buf_);
   out_tokens->assign(static_cast<size_t>(count), 0);
@@ -542,6 +621,7 @@ void DFlashTokenGenerator::decode_lm_head(
       }
     }
   }
+  sample_ms_ += static_cast<double>(time_in_ms() - t_smp);
   lm_head_time_ms_ += static_cast<double>(time_in_ms() - lm_start_ms);
 }
 
@@ -868,7 +948,9 @@ void DFlashTokenGenerator::target_verify_block(
   // Headless: step returns hidden in output_tensors_[0] (== logits_.data); the L
   // captured layers land in target_hidden_bufs_. We ignore the return tensor and
   // project the hidden through lm_head.pte to get the verify logits.
+  const long t_dec = time_in_ms();
   auto step_res = decoder_runner_->step(method_name_, inputs_);
+  decoder_exec_ms_ += static_cast<double>(time_in_ms() - t_dec);
   ET_CHECK_MSG(step_res.ok(), "[DFlash] target verify step failed");
   run_lm_head(logits_.data);
   target_verify_time_ms_ += static_cast<double>(time_in_ms() - start_ms);
@@ -889,11 +971,13 @@ void DFlashTokenGenerator::target_verify_block(
       lm_head_logits_buf_,
       lm_dimo.data());
   Tensor lm_logits(&lm_impl);
+  const long t_smp = time_in_ms();
   target_sampled->resize(static_cast<size_t>(ar));
   for (int k = 0; k < ar; ++k) {
     (*target_sampled)[k] =
         static_cast<uint64_t>(decoder_runner_->logits_to_token(lm_logits, k));
   }
+  sample_ms_ += static_cast<double>(time_in_ms() - t_smp);
 }
 
 // ---------------------------------------------------------------------------
@@ -1063,8 +1147,9 @@ Result<int64_t> DFlashTokenGenerator::generate(
     ET_LOG(
         Info,
         "[DFlash] done: drafted=%llu accepted=%llu accept_rate=%.3f "
-        "accept_len=%.2f tok/target_call | "
-        "draft_ms=%.1f (%llu calls) verify_ms=%.1f lm_head_ms=%.1f",
+        "accept_len=%.2f tok/target_call | phase: draft=%.1f (%llu) "
+        "verify=%.1f (%llu) draft_lm_head=%.1f | per-pte ms: emb=%.1f (%llu) "
+        "decoder=%.1f draft=%.1f lm_head=%.1f (%llu) host_argmax=%.1f",
         static_cast<unsigned long long>(total_drafted_),
         static_cast<unsigned long long>(total_accepted_),
         total_drafted_ ? static_cast<double>(total_accepted_) /
@@ -1075,7 +1160,16 @@ Result<int64_t> DFlashTokenGenerator::generate(
         draft_time_ms_,
         static_cast<unsigned long long>(draft_calls_),
         target_verify_time_ms_,
-        lm_head_time_ms_);
+        static_cast<unsigned long long>(target_verify_calls_),
+        lm_head_time_ms_,
+        // per-pte breakdown
+        emb_exec_ms_,
+        static_cast<unsigned long long>(emb_calls_),
+        decoder_exec_ms_,
+        draft_time_ms_,
+        lm_head_exec_ms_,
+        static_cast<unsigned long long>(lm_head_calls_),
+        sample_ms_);
   }
   return static_cast<int64_t>(cur_pos - start_pos);
 }

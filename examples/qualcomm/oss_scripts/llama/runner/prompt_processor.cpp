@@ -532,7 +532,22 @@ Result<uint64_t> PromptProcessor::prefill(
         lm_head_logits_buf_,
         lm_dimo.data());
     Tensor lm_logits(&lm_impl);
+    const long t_smp = time_in_ms();
     cur_token = decoder_runner_->logits_to_token(lm_logits, last_row);
+    sample_ms_ += static_cast<double>(time_in_ms() - t_smp);
+    ET_LOG(
+        Info,
+        "[DFlash] prefill per-pte ms: emb=%.1f (%llu chunks) decoder=%.1f (%llu) "
+        "lm_head=%.1f embeds_copy=%.1f host_argmax=%.1f | total graph=%.1f",
+        emb_exec_ms_,
+        static_cast<unsigned long long>(emb_calls_),
+        graph_execute_time_ms_,
+        static_cast<unsigned long long>(graph_execute_calls_),
+        lm_head_exec_ms_,
+        embeds_copy_ms_,
+        sample_ms_,
+        emb_exec_ms_ + graph_execute_time_ms_ + lm_head_exec_ms_ +
+            embeds_copy_ms_ + sample_ms_);
   } else {
     cur_token = decoder_runner_->logits_to_token(output_tensors_[0], last_row);
   }
@@ -550,14 +565,19 @@ void PromptProcessor::run_embedding_prefill() {
       emb_module_->set_output(
           "tok_embedding_prefill_forward", outs[0], 0) == Error::Ok,
       "[DFlash] emb prefill set_output failed");
+  const long t_emb = time_in_ms();
   auto res = emb_module_->execute("tok_embedding_prefill_forward", ins);
+  emb_exec_ms_ += static_cast<double>(time_in_ms() - t_emb);
+  ++emb_calls_;
   ET_CHECK_MSG(res.ok(), "[DFlash] emb prefill execute failed");
   // emb.pte's output is ALREADY uint16 in the decoder's own embeds encoding
   // (scale/zp injected at compile time), even though the program declares the
   // tensor Float. So this boundary is a lossless uint16 hand-off -- copy the
   // bytes straight into the decoder's embeds input; quantizing here would
   // reinterpret u16 payload as f32 and destroy it.
+  const long t_cp = time_in_ms();
   std::memcpy(input_toks_.data, emb_out_buf_, input_toks_.size);
+  embeds_copy_ms_ += static_cast<double>(time_in_ms() - t_cp);
 }
 
 void PromptProcessor::run_lm_head_prefill(std::byte* hidden_u16) {
@@ -570,7 +590,9 @@ void PromptProcessor::run_lm_head_prefill(std::byte* hidden_u16) {
   ET_CHECK_MSG(
       lm_head_module_->set_outputs("lm_head_prefill_forward", outs) == Error::Ok,
       "[DFlash] lm_head prefill set_outputs failed");
+  const long t_lm = time_in_ms();
   auto res = lm_head_module_->execute("lm_head_prefill_forward", ins);
+  lm_head_exec_ms_ += static_cast<double>(time_in_ms() - t_lm);
   ET_CHECK_MSG(res.ok(), "[DFlash] lm_head prefill execute failed");
 }
 

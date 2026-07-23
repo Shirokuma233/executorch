@@ -271,6 +271,18 @@ class DFlashTokenGenerator : public TokenGenerator {
   std::array<std::unique_ptr<executorch::aten::TensorImpl>, kMaxCtxLayers>
       target_hidden_impls_;
 
+  // A pte's program may declare an output Float while the QNN delegate actually
+  // writes uint16 codes; both probe tooling and method_meta report the declared
+  // value, so the mismatch is invisible until the numbers come out as garbage.
+  // Called once per buffer after its first execute: reinterprets the payload as
+  // both f32 and u16 and logs an error when the declared dtype looks wrong.
+  static void check_payload_dtype(
+      const char* name,
+      const std::byte* buf,
+      size_t n_elems,
+      executorch::aten::ScalarType declared);
+  bool dtype_checked_{false};
+
   // stats
   uint64_t total_drafted_{0};
   uint64_t total_accepted_{0};
@@ -281,6 +293,17 @@ class DFlashTokenGenerator : public TokenGenerator {
   double draft_prefill_time_ms_{0.0};
   double target_verify_time_ms_{0.0};
   double lm_head_time_ms_{0.0};
+
+  // Per-pte breakdown. draft_time_ms_/target_verify_time_ms_ above are the
+  // coarse per-phase totals; these split them across the individual graphs so
+  // the cost of the four-way split is attributable.
+  double emb_exec_ms_{0.0}; // emb.pte  (verify tokens + draft noise)
+  double decoder_exec_ms_{0.0}; // decoder.pte (headless target)
+  double lm_head_exec_ms_{0.0}; // lm_head.pte (verify + draft)
+  double sample_ms_{0.0}; // host argmax over the vocab
+  // draft.pte's own execute time is draft_time_ms_ above.
+  uint64_t emb_calls_{0};
+  uint64_t lm_head_calls_{0};
 };
 
 } // namespace example

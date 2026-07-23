@@ -200,5 +200,14 @@ class PromptProcessor {
 
   uint64_t graph_execute_calls_{0};
   double graph_execute_time_ms_{0.0};
+
+  // Per-pte prefill breakdown (DFlash split only; graph_execute_time_ms_ above
+  // is decoder.pte). Lets the cost of the four-way split be attributed instead
+  // of guessed -- prefill is where the split pays extra emb/lm_head executes.
+  double emb_exec_ms_{0.0}; // emb.pte prefill, once per chunk
+  double lm_head_exec_ms_{0.0}; // lm_head.pte prefill, once at the end
+  double embeds_copy_ms_{0.0}; // memcpy of the u16 embeds into the decoder input
+  double sample_ms_{0.0}; // host argmax for the first token
+  uint64_t emb_calls_{0};
 };
 } // namespace example
