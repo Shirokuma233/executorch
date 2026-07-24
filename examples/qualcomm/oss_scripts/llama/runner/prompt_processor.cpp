@@ -549,7 +549,19 @@ Result<uint64_t> PromptProcessor::prefill(
         emb_exec_ms_ + graph_execute_time_ms_ + lm_head_exec_ms_ +
             embeds_copy_ms_ + sample_ms_);
   } else {
+    const long t_smp = time_in_ms();
     cur_token = decoder_runner_->logits_to_token(output_tensors_[0], last_row);
+    sample_ms_ += static_cast<double>(time_in_ms() - t_smp);
+    // Monolithic counterpart of the DFlash breakdown above: one graph carries
+    // embedding + decoder + lm_head, so there is a single execute to attribute.
+    ET_LOG(
+        Info,
+        "[Hybrid] prefill per-pte ms: monolithic=%.1f (%llu chunks) "
+        "host_argmax=%.1f | total graph=%.1f",
+        graph_execute_time_ms_,
+        static_cast<unsigned long long>(graph_execute_calls_),
+        sample_ms_,
+        graph_execute_time_ms_ + sample_ms_);
   }
   return cur_token;
 }

@@ -880,6 +880,40 @@ class DFlashDraftCompiler(Component):
         elif len(compile_spec) == 1:
             compile_spec = [compile_spec[0], compile_spec[0]]
 
+        # Expose the K/V caches at the pte boundary as 8-bit instead of letting the
+        # delegate dequantize them back to f32. The encoding already exists --
+        # _calibrate_draft steps through the sequence writing k_new/v_new back into
+        # past_k/past_v, so the observers saw the real accumulated cache -- it was
+        # simply never surfaced. The draft's K/V are the only 4-D tensors in the
+        # graph (noise/mask/new_context/hidden are 2-D or 3-D), so rank identifies
+        # them. Cuts draft KV traffic 4x (39.7MB -> ~9.9MB), which is what actually
+        # bounds draft.pte: 5 layers cost 27.4ms vs the 36-layer target's 41.6ms,
+        # i.e. 4.7x per layer, tracking its 4x larger per-layer KV footprint.
+        from executorch.backends.qualcomm._passes import TagQuantIO
+        from executorch.backends.qualcomm.builders.utils import is_graph_output
+        from executorch.backends.qualcomm.utils.constants import (
+            QCOM_PASS_ACTIVATE_KEY,
+            QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY,
+        )
+
+        def _tag_draft_kv(node, kv_dtype=torch.uint8):
+            if node.op != "placeholder" and not is_graph_output(node):
+                return None
+            val = node.meta.get("val", None)
+            # Multi-output nodes carry a tuple/list of FakeTensors (no .size());
+            # the K/V IO never does, so skip anything that is not a lone tensor.
+            if val is None or isinstance(val, (tuple, list)):
+                return None
+            size_fn = getattr(val, "size", None)
+            if size_fn is None:
+                return None
+            return kv_dtype if len(size_fn()) == 4 else None
+
+        self.passes_job[TagQuantIO][QCOM_PASS_ACTIVATE_KEY] = True
+        self.passes_job[TagQuantIO][QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY][
+            "get_quant_io_dtype_fn"
+        ] = _tag_draft_kv
+
         edge_prog_mgr = to_edge_transform_and_lower_to_qnn(
             module=dict(zip(graph_names, modules)),
             inputs=dict(zip(graph_names, inputs)),

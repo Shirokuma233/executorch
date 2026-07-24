@@ -740,6 +740,14 @@ class DFlashDraftQuantRecipe(StaticLLMQuantRecipe):
                 granularity=QuantGranularity.PER_CHANNEL,
             )
         )
+        # Quantize the K/V cache to 8-bit IN-GRAPH (same as Qwen3_4BQuantRecipe).
+        # Without this the draft's KV is 16a4w's default 16-bit activation, and
+        # tagging the pte's KV IO as u8 at lower time then reuses the 16-bit scale
+        # on an 8-bit tensor -- 255/256 of the range is clipped and acceptance
+        # collapses. With it, the observers calibrate KV at 8-bit, so the in-graph
+        # math and the u8 boundary agree and the calibration/inference trajectories
+        # match. get_kv_io_bit_width() also flips 16 -> 8 accordingly.
+        self.recipe.custom_quant_annotations.append(annotate_kv_8bit)
 
 
 class Smollm2QuantRecipe(StaticLLMQuantRecipe):
