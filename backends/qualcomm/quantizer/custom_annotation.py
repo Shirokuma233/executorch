@@ -276,6 +276,68 @@ def annotate_kv_8bit(  # noqa: C901
             annotate_matmul_input1(node.args[1], is_qat=is_qat)
 
 
+def annotate_draft_shared_head(gm: torch.fx.GraphModule, is_qat=False) -> None:
+    """Make the per-head attention activations within each DFlash-draft layer share
+    ONE output observer, recovering MHA's shared-scale granularity on the per-head SHA
+    graph (which lowers without QNN 1003, unlike ConvertMhaToSha on non-causal attn).
+
+    Runs after annotate_kv_8bit, so every per-head matmul/softmax already carries a
+    concrete output_qspec. For each (layer, kind) group, heads 1..N re-point their
+    output_qspec to the layer's first head via SharedQuantizationSpec; PT2E unions all
+    heads' calibration ranges into one scale (== the pre-split batched-MHA scale).
+    """
+    import logging
+    import re
+    from collections import defaultdict
+
+    groups = defaultdict(list)
+    for idx, node in enumerate(gm.graph.nodes):
+        if node.op != "call_function":
+            continue
+        ann = node.meta.get(Q_ANNOTATION_KEY)
+        if ann is None or ann.output_qspec is None:
+            continue
+        target = str(node.target)
+        if not ("matmul" in target or "bmm" in target or "softmax" in target):
+            continue
+        layer = None
+        for _, v in node.meta.get("nn_module_stack", {}).items():
+            path = v[0] if isinstance(v, (tuple, list)) else str(v)
+            m = re.search(r"layers\.(\d+)\.self_attn", str(path))
+            if m:
+                layer = int(m.group(1))
+        if layer is None:
+            continue
+        if "softmax" in target:
+            kind = "softmax"
+        else:
+            val = node.meta.get("val", None)
+            last = val.shape[-1] if (val is not None and hasattr(val, "shape")) else 0
+            kind = "scores" if last > 256 else "attn_out"
+        groups[(layer, kind)].append((idx, node))
+
+    n_shared = 0
+    for lst in groups.values():
+        if len(lst) < 2:
+            continue
+        lst.sort(key=lambda x: x[0])  # graph order -> head0 (anchor) first
+        anchor = lst[0][1]
+        shared = SharedQuantizationSpec(anchor)
+        for _, node in lst[1:]:
+            ann = node.meta[Q_ANNOTATION_KEY]
+            node.meta[Q_ANNOTATION_KEY] = QuantizationAnnotation(
+                input_qspec_map=ann.input_qspec_map,
+                output_qspec=shared,
+                _annotated=True,
+            )
+            n_shared += 1
+    logging.getLogger(__name__).info(
+        "[draft-shared-head] shared %d per-head activations across %d groups",
+        n_shared,
+        len(groups),
+    )
+
+
 def custom_annotate_llama_matmul_16a8w(gm: torch.fx.GraphModule) -> None:  # noqa: C901
     """
     This function is specific for llama matmul op 16a8w.

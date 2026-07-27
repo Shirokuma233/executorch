@@ -296,11 +296,39 @@ class QnnPassManager(PassManager):
         return ep
 
     def transform_for_preprocess_pipeline(
-        self, exported_program: ExportedProgram, use_mha2sha=False
+        self,
+        exported_program: ExportedProgram,
+        use_mha2sha=False,
+        use_dflash_mha2sha=False,
     ):
         self.add_pass(FoldQDQ(exported_program, force_fold=True))
-        if use_mha2sha:
-            self.add_pass(ConvertMhaToSha(exported_program))
+        if use_mha2sha or use_dflash_mha2sha:
+            from executorch.exir.dialects._ops import ops as exir_ops
+
+            targets = {
+                n.target
+                for n in exported_program.graph_module.graph.nodes
+                if n.op == "call_function"
+            }
+            # The DFlash draft is the only graph with index_select GQA feeding a
+            # softmax attention; the target uses repeat_kv (no index_select). Route
+            # the draft to DFlashMhaToSha (non-causal, symmetric shallow split) and
+            # everything else to the causal ConvertMhaToSha.
+            is_dflash = use_dflash_mha2sha or (
+                exir_ops.edge.aten.index_select.default in targets
+                and (
+                    exir_ops.edge.aten._softmax.default in targets
+                    or exir_ops.edge.aten._safe_softmax.default in targets
+                )
+            )
+            if is_dflash:
+                from executorch.backends.qualcomm._passes.dflash_mha_to_sha import (
+                    DFlashMhaToSha,
+                )
+
+                self.add_pass(DFlashMhaToSha(exported_program))
+            else:
+                self.add_pass(ConvertMhaToSha(exported_program))
         self.add_pass(InsertRequantize())
         self.add_pass(InsertIOQDQ(exported_program))
         self.add_pass(LayoutTransform(exported_program, insert_permute=True))

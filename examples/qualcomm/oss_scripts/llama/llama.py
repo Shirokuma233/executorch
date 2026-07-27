@@ -152,17 +152,18 @@ def compile_dflash(
             online_prepare=args.online_prepare,
         )
     ] * len(DECODER_GRAPH_NAMES)
-    # ConvertMhaToSha pattern-matches the standard causal attention that
-    # static_llama emits. DFlash's block attention is non-causal and builds K/V by
-    # concatenating [cache | new_context | block], so the pass rewrites it into a
-    # graph that aborts the HTP skel at execution (QNN 1003). The target still
-    # wants the pass; the draft must not have it.
+    # Both target and draft want an MHA->SHA split; the pass manager auto-selects the
+    # variant from the graph. The target's causal attention (repeat_kv GQA) goes to
+    # ConvertMhaToSha. The draft's non-causal block attention (index_select GQA, K/V =
+    # cat[cache | new_context | block]) goes to DFlashMhaToSha, which splits symmetrically
+    # and shallowly (batched proj/norm/RoPE -> per-head slice) so the HTP skel runs it
+    # (no QNN 1003) while activations stay calibrated as MHA (shared per-head scale).
     draft_compile_spec_list = [
         generate_qnn_executorch_compiler_spec(
             soc_model=get_soc_to_chipset_map()[args.soc_model],
             backend_options=backend_options,
             shared_buffer=not args.enable_x86_64,
-            use_mha2sha=False,
+            use_mha2sha=True,
             online_prepare=args.online_prepare,
         )
     ] * len(DFLASH_GRAPH_NAMES)

@@ -7,7 +7,10 @@
 from typing import Optional
 
 import torch
-from executorch.backends.qualcomm.quantizer.custom_annotation import annotate_kv_8bit
+from executorch.backends.qualcomm.quantizer.custom_annotation import (
+    annotate_draft_shared_head,
+    annotate_kv_8bit,
+)
 from executorch.backends.qualcomm.quantizer.quant_recipe import (
     QuantGranularity,
     QuantRecipe,
@@ -748,6 +751,13 @@ class DFlashDraftQuantRecipe(StaticLLMQuantRecipe):
         # math and the u8 boundary agree and the calibration/inference trajectories
         # match. get_kv_io_bit_width() also flips 16 -> 8 accordingly.
         self.recipe.custom_quant_annotations.append(annotate_kv_8bit)
+        # [shared-head experiment] gate behind DFLASH_SHARE_HEAD: default keeps per-head
+        # scales; set the env to make each layer's 32 per-head attention activations
+        # share one scale (recovers MHA accept on the SHA graph, no QNN 1003).
+        import os
+
+        if os.environ.get("DFLASH_SHARE_HEAD"):
+            self.recipe.custom_quant_annotations.append(annotate_draft_shared_head)
 
 
 class Smollm2QuantRecipe(StaticLLMQuantRecipe):

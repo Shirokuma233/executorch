@@ -83,6 +83,26 @@ def _shape(node):
     return list(node.meta["val"].shape)
 
 
+def _leads_to(node, targets, stop=(), seen=None):
+    """Whether node's input subgraph reaches an op in ``targets`` before crossing a
+    ``stop`` op. ``stop`` (the Q/K/V projections) bounds the search to the local
+    attention block so it can't run up the residual chain into earlier layers."""
+    if seen is None:
+        seen = set()
+    if not _is_node(node) or node in seen:
+        return False
+    seen.add(node)
+    if _is_call(node) and node.target in targets:
+        return True
+    if _is_call(node) and node.target in stop:
+        return False
+    for arg in node.args:
+        items = arg if isinstance(arg, (list, tuple)) else [arg]
+        if any(_leads_to(it, targets, stop, seen) for it in items):
+            return True
+    return False
+
+
 @dataclass
 class Sha:
     axis: int
@@ -107,10 +127,16 @@ class ConvertMhaToSha(ExportPass):
         self,
         edge_program: torch.export.ExportedProgram,
         verbose=False,
+        dflash_mode=False,
     ):
         super().__init__()
         self.edge_program = edge_program
         self.verbose = verbose
+        # DFlash draft variant: keep the batched K/V cat and slice its output per head
+        # (cat->slice) instead of splitting inputs (slice->cat), and handle index_select
+        # GQA. This produces the HTP-runnable, non-causal-safe topology (no QNN 1003)
+        # while still copying the shared MHA activation scale to every head.
+        self.dflash_mode = dflash_mode
 
     def _nodes(self, graph_module, wanted_sources, node_checker=None):
         nodes = []
@@ -274,6 +300,66 @@ class ConvertMhaToSha(ExportPass):
 
             new_nodes = _split_call(node, sha, new_args, out_shape)
             return new_nodes
+
+        def _visit_cat_dflash(node, sha):
+            # DFlash: keep the batched cat as ONE tensor and slice its OUTPUT per head
+            # (cat->slice). Do NOT recurse into inputs -- recursing is what splits the
+            # uint8 past_k/past_v graph inputs into the slice->cat topology the HTP skel
+            # aborts on (QNN 1003). GQA already switched sha to kv_sha, so we slice into
+            # nKV heads here; _visit_index_select then replicates each n_rep times.
+            out_shape = _shape(node)
+            assert out_shape[sha.axis] % sha.heads == 0
+            return _split_placeholder(
+                node, axis=sha.axis, size=out_shape[sha.axis] // sha.heads, count=sha.heads
+            )
+
+        def _visit_index_select(node, sha):
+            # DFlash GQA: k = index_select(cat, kv_rep_idx), kv_rep_idx = arange(nH)//n_rep
+            # (contiguous groups), so head h uses kv head h//n_rep. Mirrors _visit_reshape's
+            # repeat_kv handling: descend into the source with kv_sha (nKV heads), then
+            # replicate each kv-head result n_rep times to feed the nH query heads.
+            src = node.args[0]
+            nKV = _shape(src)[sha.axis]
+            n_rep = sha.heads // nKV
+            kv_sha = Sha(sha.axis, nKV)
+            new_arg0s = _visit(src, kv_sha)
+            return [arg for arg in new_arg0s for _ in range(n_rep)]
+
+        def _visit_matmul_dflash(node, sha):
+            # DFlash: shallow-split the attention matmuls (eager-SHA topology). Only the
+            # operand that leads to softmax (attn weights) or index_select (K/V) is
+            # recursed -- those stay per-head via the softmax path / cat_dflash. The Q
+            # operand of the score matmul leads to neither, so we SLICE the batched Q per
+            # head and keep its projection / q_norm / RoPE batched, instead of recursing
+            # into q_proj (which fragments them into per-head convs/norms). Symmetric with
+            # how K/V are handled, this reproduces the HTP-runnable eager-SHA graph while
+            # the batched forward keeps activations calibrated as MHA (shared scale).
+            recurse = {
+                exir_ops.edge.aten._softmax.default,
+                exir_ops.edge.aten._safe_softmax.default,
+                exir_ops.edge.aten.index_select.default,
+            }
+            stop = {
+                exir_ops.edge.aten.convolution.default,
+                exir_ops.edge.aten.mm.default,
+            }
+            out_shape = _shape(node)
+            if out_shape[sha.axis] != 1:
+                assert out_shape[sha.axis] % sha.heads == 0
+                out_shape[sha.axis] //= sha.heads
+            split_args = []
+            for arg in node.args:
+                if not _is_mha(arg, sha):
+                    split_args.append([arg] * sha.heads)
+                elif _leads_to(arg, recurse, stop):
+                    split_args.append(_visit(arg, sha))
+                else:
+                    per = _shape(arg)[sha.axis] // sha.heads
+                    split_args.append(
+                        _split_placeholder(arg, axis=sha.axis, size=per, count=sha.heads)
+                    )
+            new_args = list(zip(*split_args))
+            return _split_call(node, sha, new_args, out_shape)
 
         def _visit_default(node, sha):
             out_shape = _shape(node)
@@ -566,11 +652,17 @@ class ConvertMhaToSha(ExportPass):
                 exir_ops.edge.aten.permute_copy.default: _visit_permute,
                 exir_ops.edge.aten.convolution.default: _visit_linear_conv,
                 exir_ops.edge.aten.mm.default: _visit_linear_conv,
-                exir_ops.edge.aten.cat.default: _visit_cat,
+                exir_ops.edge.aten.cat.default: (
+                    _visit_cat_dflash if self.dflash_mode else _visit_cat
+                ),
                 exir_ops.edge.aten.add.Tensor: _visit_binary,
                 exir_ops.edge.aten.mul.Tensor: _visit_binary,
                 exir_ops.edge.aten.eq.Tensor: _no_split,
             }
+            if self.dflash_mode:
+                visitors[exir_ops.edge.aten.index_select.default] = _visit_index_select
+                visitors[exir_ops.edge.aten.matmul.default] = _visit_matmul_dflash
+                visitors[exir_ops.edge.aten.bmm.default] = _visit_matmul_dflash
 
             target = node.target if _is_call(node) else node.op
             visited[node] = visitors.get(target, _visit_default)(node, sha)
