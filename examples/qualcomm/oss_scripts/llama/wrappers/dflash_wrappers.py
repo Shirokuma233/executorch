@@ -656,7 +656,21 @@ class DFlashDraftCompiler(Component):
         # calibration. The draft graph itself has no embedding.
         self.max_context_len = max_context_len
         self.target = None
-        self.embed_weight = sd["embed_tokens.weight"].float()
+        # Checkpoints with tie_word_embeddings (Qwen3-4B-DFlash-b16) ship no
+        # embed_tokens: the table IS the target's. Resolved lazily from the target,
+        # which DFlashManager wires in after this constructor returns.
+        self._embed_weight = (
+            sd["embed_tokens.weight"].float()
+            if "embed_tokens.weight" in sd
+            else None
+        )
+
+    @property
+    def embed_weight(self):
+        if self._embed_weight is None:
+            emb = self.target.prefill.tok_embedding.input_embedding_module
+            self._embed_weight = emb.weight.detach().float()
+        return self._embed_weight
 
     @log_info
     def quantize(self, request: Request):
@@ -1002,6 +1016,9 @@ class DFlashManager(Component):
         # Draft PTQ calibrates on the quantized target's real hidden (path B); the
         # draft runs after the target in the chain, so target is converted by then.
         self.draft_compiler.target = self.target
+        # Tied-embedding drafts read the token table off the target. Resolve it now so
+        # a wiring error surfaces here, not an hour later inside draft calibration.
+        assert self.draft_compiler.embed_weight is not None
 
     def process(self, request: Request) -> Request:
         Processor.process(self, request)

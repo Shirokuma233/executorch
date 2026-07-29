@@ -1018,6 +1018,21 @@ def export_llama(args) -> None:
         assert (
             args.dflash_draft_checkpoint is not None or args.pre_gen_pte
         ), "DFlash mode requires --dflash_draft_checkpoint or --pre_gen_pte."
+        # --block_size drives the target's verify ar_len (next_power_of_two) while the
+        # draft graph is built from the checkpoint's own block_size. A mismatch wires
+        # two different block lengths together and every drafted token misaligns.
+        if args.dflash_draft_checkpoint is not None:
+            from executorch.examples.qualcomm.oss_scripts.llama.wrappers.dflash_wrappers import (
+                load_dflash_config,
+            )
+
+            ckpt_block_size = load_dflash_config(
+                args.dflash_draft_checkpoint
+            ).block_size
+            assert args.block_size == ckpt_block_size, (
+                f"--block_size {args.block_size} != draft checkpoint block_size "
+                f"{ckpt_block_size} ({args.dflash_draft_checkpoint})"
+            )
         pte_filename = "dflash_target_qnn"
     else:
         raise RuntimeError(f"Unknown model_mode: {args.model_mode}.")
