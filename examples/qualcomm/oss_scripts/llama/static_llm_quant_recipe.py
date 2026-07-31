@@ -696,6 +696,21 @@ class Qwen3_4BQuantRecipe(StaticLLMQuantRecipe):
         self.recipe.custom_quant_annotations.append(annotate_kv_8bit)
 
 
+class Qwen3_8BQuantRecipe(Qwen3_4BQuantRecipe):
+    """Same 16a4w recipe as Qwen3-4B, for Qwen3-8B (36 layers, hidden 4096).
+
+    8B shares the 4B's depth (36), head layout (32 q / 8 kv x 128) and vocab,
+    and differs only in width (2560 -> 4096, MLP 9728 -> 12288), so the outlier
+    structure the 4B recipe protects at 16a8w per-channel -- lm_head and the MLP
+    down_proj that writes into the residual stream -- is the same. Named
+    separately rather than aliased so the two can diverge once 8B calibration
+    data says it needs more (or less) protection.
+
+    Unlike 4B, 8B does not tie its embeddings, so the checkpoint carries a real
+    lm_head and `output.conv` is quantized from its own weights.
+    """
+
+
 class DFlashDraftQuantRecipe(StaticLLMQuantRecipe):
     """16a4w recipe for the DFlash draft (block-speculative head).
 

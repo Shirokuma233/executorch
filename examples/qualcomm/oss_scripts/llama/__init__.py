@@ -84,6 +84,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.static_llm_quant_recipe impo
     Qwen3_0_6BQuantRecipe,
     Qwen3_1_7BQuantRecipe,
     Qwen3_4BQuantRecipe,
+    Qwen3_8BQuantRecipe,
     Smollm2QuantRecipe,
     Smollm3QuantRecipe,
     SmolVLMQuantRecipe,
@@ -546,6 +547,28 @@ class Qwen3_4B(LLMModelConfig):
     # Dedicated 4B 16a4w recipe: protects lm_head + MLP down_proj at 16a8w to
     # preserve the residual-stream hidden states DFlash's draft consumes.
     quant_recipe = Qwen3_4BQuantRecipe
+
+
+@register_llm_model("qwen3-8b")
+@dataclass(init=False, frozen=True)
+class Qwen3_8B(LLMModelConfig):
+    repo_id: str = "Qwen/Qwen3-8B"
+    params_path: str = os.path.join(
+        BASE_DIR, "../../../models/qwen3/config/8b_config.json"
+    )
+    convert_weights = convert_qwen3_weights
+    transform_weight = False
+    instruct_model = True
+    # Shards have tracked params so far (1.7B -> 2, 4B -> 4); 8B is ~2x the 4B
+    # in weight bytes, so 8 keeps each HTP context binary near the size that
+    # already loads for 4B. Tune if compilation/loading hits HTP size limits.
+    num_sharding = 8
+    masked_softmax = True
+    seq_mse_candidates = 0
+    r1 = False
+    r2 = False
+    r3 = True
+    quant_recipe = Qwen3_8BQuantRecipe
 
 
 @register_llm_model("smollm2_135m")

@@ -78,6 +78,7 @@ DECODER_MODEL_VERSION = {
     "qwen3-0_6b": "qwen3",
     "qwen3-1_7b": "qwen3",
     "qwen3-4b": "qwen3",
+    "qwen3-8b": "qwen3",
     "smollm2_135m": "smollm2_135m",
     "smollm3-3b": "smollm3",
     "glm-1_5b": "glm",
