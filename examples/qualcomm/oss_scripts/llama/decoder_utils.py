@@ -333,6 +333,18 @@ def retrieve_info_from_pte(pte_path: str) -> dict:
     return meta_info
 
 
+def encode_prompt(tokenizer, prompt) -> List[int]:
+    """Prompt (or an already-tokenized tensor) to token ids."""
+    if not isinstance(prompt, str):
+        return prompt.flatten().tolist()
+    # Llama2 tokenizer has no special tokens
+    if isinstance(tokenizer, (SentencePieceTokenizer, HuggingFaceTokenizer)):
+        return tokenizer.encode(prompt, bos=True, eos=False)
+    if isinstance(tokenizer, TiktokenTokenizer):
+        return tokenizer.encode(prompt, bos=True, eos=False, allowed_special="all")
+    raise RuntimeError("Unknown tokenizer")
+
+
 def smart_mask_updater(
     n_updates: int,
     atten_mask: AttentionMask,
@@ -404,6 +416,7 @@ def _prefill_chunking(
     v_caches,
     total_token_list,
     last_input_sample=None,
+    dflash_config=None,
 ):
     with torch.no_grad():
         num_prompt_tokens = len(total_token_list)
@@ -492,6 +505,20 @@ def _prefill_chunking(
                             *v_caches,
                         )
 
+            # Seed the DFlash draft from the same chunk. `_eagle_extra` carries the
+            # selected hidden layers this graph exports; they were being dropped on
+            # the floor while the draft recomputed a worse copy of them elsewhere.
+            # drop_sink skips the sink row but keeps every surviving row's real
+            # position, so slot i holds token i+1 rather than shifting the RoPE.
+            if dflash_config is not None:
+                rows = torch.cat(
+                    [h[0, :num_tokens_in_chunk] for h in _eagle_extra], dim=-1
+                )
+                skip = 1 if (dflash_config.drop_sink and pos == 0) else 0
+                n_ctx = num_tokens_in_chunk - skip
+                if n_ctx > 0 and dflash_config.can_append(n_ctx):
+                    dflash_config.seed(rows[skip:], n_ctx, pos + skip)
+
             # Update the pos, KV cache and attention mask.
             pos, k_caches, v_caches = smart_mask_updater(
                 num_tokens_in_chunk,
@@ -511,6 +538,111 @@ def _prefill_chunking(
         return pos, last_input_sample
 
 
+def _generate_dflash(
+    inputs: DecoderInputs,
+    pos,
+    module: torch.fx.GraphModule,
+    tokenizer,
+    ar_len: int,
+    k_caches,
+    v_caches,
+    total_token_list,
+    dflash_config,
+    last_input_sample=None,
+):
+    """Calibrate through real speculative decoding: the draft proposes a block, this
+    graph verifies it, and both sets of observers see exactly the traffic they get at
+    inference. Mirrors the decode loop in dflash_token_generator.cpp.
+
+    The plain branch below would drive this graph with one real row and ar_len-1
+    zero-padded ones per call, while at inference dflash hands it a full block of
+    real tokens -- and would leave the draft to be calibrated afterwards, out of the
+    loop, on hidden that no graph ever emits.
+    """
+    if inputs.input_ids is None:
+        raise RuntimeError("DFlash calibration expects the token-input decoder path")
+    B, n_draft = dflash_config.block_size, dflash_config.n_draft
+    max_cache_len = k_caches[0].size(-1)
+    cur_pos = pos
+    last_committed = total_token_list[-1]
+    pending = (None, 0, 0)  # rows, count, position of the first row
+    accepted_total = 0
+    with torch.no_grad():
+        while cur_pos + B < max_cache_len:
+            rows, n_new, pos_base = pending
+            drafted = dflash_config.draft_block(
+                last_committed, rows, n_new, pos_base, cur_pos
+            )
+            verify = [last_committed] + drafted
+            vtok = torch.zeros((1, ar_len), dtype=inputs.input_ids_dtype)
+            vtok[0, : len(verify)] = torch.tensor(
+                verify, dtype=inputs.input_ids_dtype
+            )
+            # Padded slots repeat the last real position: an out-of-range RoPE index
+            # would be a second, invisible difference from the device.
+            vpos = torch.zeros((1, ar_len), dtype=torch.int32)
+            for k in range(ar_len):
+                vpos[0, k] = cur_pos + min(k, len(verify) - 1)
+            logits, new_k_caches, new_v_caches, *captured = module(
+                vtok, *inputs.atten_mask, vpos, *k_caches, *v_caches
+            )
+            last_input_sample = (
+                vtok,
+                *inputs.atten_mask,
+                vpos,
+                *k_caches,
+                *v_caches,
+            )
+            # Slot k predicts slot k+1, so sampled[k] is what the target would have
+            # put where the draft put verify[k+1].
+            sampled = [int(logits[0, k].argmax()) for k in range(len(verify))]
+            accepted = 0
+            for k in range(n_draft):
+                if verify[k + 1] == sampled[k]:
+                    accepted += 1
+                else:
+                    break
+            n_commit = accepted + 1
+            pos_base = cur_pos
+            cur_pos, k_caches, v_caches = smart_mask_updater(
+                n_commit,
+                inputs.atten_mask,
+                cur_pos,
+                k_caches,
+                v_caches,
+                new_k_caches,
+                new_v_caches,
+            )
+            pending = (
+                torch.cat([h[0, :n_commit] for h in captured], dim=-1),
+                n_commit,
+                pos_base,
+            )
+            accepted_total += accepted
+            hit_eos = False
+            for k in range(1, n_commit):
+                total_token_list.append(verify[k])
+                if verify[k] == tokenizer.eos_id:
+                    hit_eos = True
+                    break
+            if hit_eos:
+                break
+            last_committed = sampled[accepted]
+            total_token_list.append(last_committed)
+            if last_committed == tokenizer.eos_id:
+                break
+            if not dflash_config.can_append(n_commit):
+                logging.info("dflash calibration: draft context full")
+                break
+    logging.info(
+        "dflash calibration accepted / total generated: %d / %d over %d rounds",
+        accepted_total,
+        cur_pos - pos,
+        dflash_config.rounds,
+    )
+    return last_input_sample
+
+
 def _generate(
     inputs: DecoderInputs,
     pos,
@@ -524,9 +656,23 @@ def _generate(
     total_token_list,
     lookahead_config,
     last_input_sample=None,
+    dflash_config=None,
 ):
     max_cache_len = max_seq_len - ar_len
     num_tokens = len(total_token_list)
+    if dflash_config is not None:
+        return _generate_dflash(
+            inputs,
+            pos,
+            module,
+            tokenizer,
+            ar_len,
+            k_caches,
+            v_caches,
+            total_token_list,
+            dflash_config,
+            last_input_sample,
+        )
     if lookahead_config is None:
         while total_token_list[-1] != tokenizer.eos_id and num_tokens < max_seq_len:
             chunk_start_idx = min(pos, max_cache_len)
@@ -727,12 +873,20 @@ def kv_inference(  # noqa: C901
     collect_logits=False,
     seq_mse_candidates=0,
     lookahead_config=None,
+    dflash_config=None,
 ):
     input_samples = []  # Record input sample for quantization error analysis
     # external embedding: the decoder takes inputs_embeds instead of token ids —
     # multimodal (image/audio) OR the text emb-split (tok_embedding in its own pte).
     # The actual multimodal merge below is separately gated on `hidden_states`.
     use_external_embedding = tok_embedding is not None
+    # max_seq_len bounds prompt AND generation, so a prompt longer than it walks
+    # `all_pos` off the end and _prefill_chunking assigns from an empty slice.
+    prompt_len = len(encode_prompt(tokenizer, prompt))
+    if prompt_len > max_seq_len:
+        raise RuntimeError(
+            f"prompt is {prompt_len} tokens but max_seq_len is {max_seq_len}"
+        )
 
     _, atten_mask, _, k_caches, v_caches = get_example_inputs()
 
@@ -742,19 +896,7 @@ def kv_inference(  # noqa: C901
     prompt_token_list, total_token_list, result_logits = [], [], []
 
     # 1. prepare token ids
-    if isinstance(prompt, str):
-        # Llama2 tokenizer has no special tokens
-        if isinstance(tokenizer, (SentencePieceTokenizer, HuggingFaceTokenizer)):
-            prompt_token_list = tokenizer.encode(prompt, bos=True, eos=False)
-        elif isinstance(tokenizer, TiktokenTokenizer):
-            prompt_token_list = tokenizer.encode(
-                prompt, bos=True, eos=False, allowed_special="all"
-            )
-        else:
-            raise RuntimeError("Unknown tokenizer")
-    else:
-        # pyre-ignore
-        prompt_token_list = prompt.flatten().tolist()
+    prompt_token_list = encode_prompt(tokenizer, prompt)
 
     # 2. process embedding
     if use_external_embedding:
@@ -835,6 +977,7 @@ def kv_inference(  # noqa: C901
             k_caches,
             v_caches,
             total_token_list,
+            dflash_config=dflash_config,
         )
 
         # Phase 2: Generate tokens until the EOS token is generated or max_seq_len is reached.
@@ -851,6 +994,7 @@ def kv_inference(  # noqa: C901
             v_caches,
             total_token_list,
             lookahead_config,
+            dflash_config=dflash_config,
         )
         if generate_input_sample is not None:
             input_samples.append(generate_input_sample)
@@ -889,21 +1033,8 @@ def prefill_inference(
 
     # TODO: change criteria & support batch inputs if necessary
 
-    token_list, result_logits = [], []
-
-    if isinstance(prompt, str):
-        # Llama2 tokenizer has no special tokens
-        if isinstance(tokenizer, (SentencePieceTokenizer, HuggingFaceTokenizer)):
-            token_list = tokenizer.encode(prompt, bos=True, eos=False)
-        elif isinstance(tokenizer, TiktokenTokenizer):
-            token_list = tokenizer.encode(
-                prompt, bos=True, eos=False, allowed_special="all"
-            )
-        else:
-            raise RuntimeError("Unknown tokenizer")
-    else:
-        # pyre-ignore
-        token_list = prompt.flatten().tolist()
+    result_logits = []
+    token_list = encode_prompt(tokenizer, prompt)
 
     pos = len(token_list)
     dtype = torch.int64 if use_i64_token else torch.int32
@@ -966,6 +1097,7 @@ def graph_module_inference(
     event_name: Optional[str] = None,
     seq_mse_candidates: int = 0,
     lookahead_config: Optional[Tuple[int]] = None,
+    dflash_config=None,
 ):
     """
     This function supports model execution from static nn.Module decoder model
@@ -981,6 +1113,7 @@ def graph_module_inference(
         if use_kv_cache:
             kwargs["ar_len"] = ar_len
             kwargs["lookahead_config"] = lookahead_config
+            kwargs["dflash_config"] = dflash_config
 
         _, input_samples = INFERENCE_REGISTRY[use_kv_cache](
             get_example_inputs,

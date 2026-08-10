@@ -884,6 +884,13 @@ void DFlashTokenGenerator::stage_prompt_hidden(
     return;
   }
   for (int j = 0; j < n_valid; ++j) {
+    // The graph was calibrated without the sink row, so it must not be sent.
+    // Nothing else needs adjusting: stage_pos_base_ picks up pos_base + j, which
+    // is still the row's true position, and draft_ctx_len_ counts cache slots
+    // rather than positions, so it simply ends up one shorter.
+    if (dflash_meta_.drop_sink && pos_base + j == 0) {
+      continue;
+    }
     if (stage_count_ == 0) {
       stage_pos_base_ = pos_base + j;
     }

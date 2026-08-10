@@ -63,6 +63,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
     VISION_ENCODER,
 )
 from executorch.examples.qualcomm.oss_scripts.llama.decoder_utils import (
+    encode_prompt,
     graph_module_inference,
 )
 from executorch.examples.qualcomm.oss_scripts.llama.encoder.encoder_config import (
@@ -146,6 +147,10 @@ class TextDecoder(Component):
         self.dep_table = get_passes_dependency_for_capture_program()
         self.meta = {}
         self.output_hidden_layers = output_hidden_layers
+        # DFlashManager sets this on the decode wrapper so the draft rides along in
+        # this graph's calibration loop instead of being calibrated afterwards on a
+        # separate forward through the (uncalibrated) prefill graph.
+        self.dflash_draft = None
         # apply_output=False -> headless decoder (no lm_head, output = final hidden);
         # lm_head lives in a separate shared pte. Flips the IO tagging to hidden-shaped.
         self.apply_output = apply_output
@@ -727,6 +732,25 @@ class TextDecoder(Component):
             )
             else None
         )
+        # prepare dflash config if applicable: the draft is observed inside this
+        # graph's loop, so its new_context range comes from the hidden this graph
+        # actually emits and its block traffic comes from real accept lengths.
+        dflash_config = (
+            self.dflash_draft.make_calibrator(
+                self.tok_embedding,
+                self.lm_head,
+                self.meta["get_ar_len"],
+                torch.int64
+                if self.control_args.embedding_quantize is not None
+                else torch.int32,
+            )
+            # `event` gates the post-convert re-run: that pass exists for error
+            # analysis and would drive the draft's cache a second time.
+            if self.dflash_draft is not None
+            and self.mode == Mode.DECODE
+            and event == "prepare_pt2e"
+            else None
+        )
         # check user's prompt which helps calibrate special token
         for turn in zip(intermediate_outputs, user_calibration_data):
             hidden_states, prompt = turn
@@ -745,6 +769,7 @@ class TextDecoder(Component):
                 use_i64_token=self.control_args.embedding_quantize is not None,
                 event_name=f"{event}_prompt",
                 lookahead_config=lookahead_config,
+                dflash_config=dflash_config,
             )
             input_samples.extend(input_sample)
         return input_samples
@@ -837,8 +862,14 @@ class TextDecoder(Component):
                 module=combined,
                 tokenizer=self._verify_tokenizer,
                 ar_len=self.meta["get_ar_len"],
-                # cap generation so a broken split doesn't emit a full context of garbage
-                max_seq_len=min(self.meta["get_max_context_len"], 64),
+                # Cap GENERATION so a broken split doesn't emit a full context of
+                # garbage. max_seq_len bounds prompt+generation together, so it has to
+                # clear the prompt first -- a flat 64 silently worked only while every
+                # calibration prompt was shorter than that.
+                max_seq_len=min(
+                    self.meta["get_max_context_len"],
+                    len(encode_prompt(self._verify_tokenizer, p)) + 64,
+                ),
                 prompt=p,
                 use_i64_token=self.control_args.embedding_quantize is not None,
                 event_name=f"verify_split_{i}",
@@ -1165,7 +1196,10 @@ class HybridTextDecoder(Component):
         self.apply_embedding = apply_embedding
         self.apply_output = apply_output
 
-    def _encoding_override(self, decode_model, prefill_model):  # noqa: C901
+    # Static so the DFlash draft can reuse it: its two graphs share one KV cache
+    # too, so they need identical encodings for the same reason hybrid does.
+    @staticmethod
+    def _encoding_override(decode_model, prefill_model):  # noqa: C901
         pbq_target = {
             torch.ops.torchao.dequantize_affine,
             torch.ops.torchao.quantize_affine,
@@ -1212,11 +1246,20 @@ class HybridTextDecoder(Component):
                     activation_override(decode_user, prefill_user)
 
         def parameter_override(decode_node, prefill_node):
-            setattr(
-                prefill_model,
-                prefill_node.target,
-                getattr(decode_model, decode_node.target),
-            )
+            # get_attr targets can be dotted paths into submodules -- the DFlash
+            # draft keeps buffers like `layers.0.self_attn.kv_rep_idx` there, where a
+            # plain getattr raises and a plain setattr would silently bind the literal
+            # dotted name, leaving the real buffer untouched. The lifted-constant
+            # graphs this ran on before only ever had flat names.
+            src = decode_model
+            for part in decode_node.target.split("."):
+                src = getattr(src, part)
+            dst, *rest = prefill_node.target.split(".")
+            obj = prefill_model
+            while rest:
+                obj = getattr(obj, dst)
+                dst, *rest = rest
+            setattr(obj, dst, src)
             # scale / zero point are part of op's attributes
             if list(decode_node.users)[0].target in ptq_target:
                 activation_override(decode_node, prefill_node)

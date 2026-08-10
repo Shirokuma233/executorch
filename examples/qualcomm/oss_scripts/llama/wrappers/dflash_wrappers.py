@@ -127,6 +127,25 @@ class DFlashConfig:
         # Measured peak |fc(x)| on a real prompt: 281074 for Qwen3-4B-DFlash-b16
         # (needs S=256), 25188 for dflash_qwen3_4b_block7 (fits fp16, S=1).
         self.fc_output_scale: float = float(raw.get("fc_output_scale", 1.0))
+        # Never hand the draft the sink token's hidden state.
+        #
+        # new_context is quantized per-tensor, and the sink row is the only thing
+        # stretching its range: the concatenated target hidden has p99.9 = 22.7
+        # against absmax 16391.8, all of it at token 0. Scaling cannot help (it
+        # shrinks outlier and signal alike) and rotating it into the other channels
+        # was tried and lost (QDQ-vs-fp32 cos 0.9755 -> 0.9409). Dropping the row
+        # removes the outlier rather than redistributing it, so the calibrated scale
+        # collapses toward what the remaining rows actually need.
+        #
+        # Position 0 is the attention sink -- a parking slot the model dumps
+        # attention mass into -- so it costs the whole quantization range while
+        # carrying almost no context for the draft to use.
+        #
+        # This ships in the pte metadata, not just as a build-time switch:
+        # calibration and the runner have to agree on which rows exist, and this
+        # codebase has twice been bitten by encoding mismatches that surface as
+        # degraded acceptance instead of as an error.
+        self.drop_sink: bool = bool(raw.get("drop_sink", False))
         # Two decode conventions, and they are off by one from each other:
         #
         #   aligned (DFlashDraftModel, e.g. Qwen3-4B-DFlash-b16)
@@ -418,6 +437,7 @@ class DFlashDraftModel(nn.Module):
             "get_dflash_prefill_ar_len": prefill_ar,
             "get_dflash_mask_token_id": int(self.cfg.mask_token_id or 0),
             "get_dflash_shifted_decode": int(self.cfg.shifted_decode),
+            "get_dflash_drop_sink": int(self.cfg.drop_sink),
         }
 
     # -- weight loading ---------------------------------------------------
@@ -556,17 +576,108 @@ def _draft_atten_mask(B, Cc, AR, n_past, n_new):
     return row.view(1, 1, W).expand(1, B, W).contiguous()
 
 
-def _encode_prompt(tokenizer, prompt):
-    """Encode a calibration prompt to token ids (mirrors kv_inference's encode)."""
-    if not isinstance(prompt, str):
-        return prompt.flatten().tolist() if torch.is_tensor(prompt) else list(prompt)
-    from executorch.examples.qualcomm.oss_scripts.llama.decoder_utils import (
-        TiktokenTokenizer,
-    )
+class DFlashCalibrator:
+    """Drives the draft inside the target's calibration loop, so both graphs'
+    observers see the traffic they actually get at inference.
 
-    if isinstance(tokenizer, TiktokenTokenizer):
-        return tokenizer.encode(prompt, bos=True, eos=False, allowed_special="all")
-    return tokenizer.encode(prompt, bos=True, eos=False)
+    The previous path (`_dump_target_hidden`) hand-rolled a single degenerate
+    forward instead of reusing kv_inference: it read the target's PREFILL graph,
+    whose activations at that point are calibrated on `torch.randn` and are only
+    overwritten by `_encoding_override` later, in compile. The draft therefore
+    learned a new_context range of +3369 for hidden that really reaches +15852 --
+    4.7x off -- from 13 rows of one prompt, with an empty KV cache and pos_ids all
+    zero.
+
+    This mirrors dflash_token_generator.cpp instead. Three details that path got
+    wrong and that only agreeing with the runner fixes:
+      - run_draft takes TWO independent position bases; context rows RoPE at
+        ctx_pos_base + j while the block sits at block_pos_base + k.
+      - the seeding block is all mask tokens (flush_stage), not a real token.
+      - the decode block leads with the last committed token, i.e. the previous
+        round's bonus -- not the token at the head of the appended rows.
+
+    Owns the draft's context K/V; block K/V are transient by construction (the
+    graph does not emit them).
+    """
+
+    def __init__(self, draft, cfg, tok_embedding, lm_head, max_context_len, ar,
+                 target_ar, token_dtype):
+        self.draft = draft
+        self.cfg = cfg
+        self.tok_embedding = tok_embedding
+        self.lm_head = lm_head
+        self.ar = ar
+        # emb.pte and lm_head.pte are the target's, so their graphs are that width;
+        # only new_context / context_pos follow the draft's append length.
+        self.target_ar = target_ar
+        self.token_dtype = token_dtype
+        self.B = self.block_size = cfg.block_size
+        self.drop_sink = cfg.drop_sink
+        self.n_draft = self.B if cfg.shifted_decode else self.B - 1
+        self.hidden_row0 = 0 if cfg.shifted_decode else 1
+        self.Cc = max_context_len - ar
+        L, nKV, D = cfg.num_hidden_layers, cfg.num_key_value_heads, cfg.head_dim
+        self.past_k = [torch.zeros(1, nKV, D, self.Cc) for _ in range(L)]
+        self.past_v = [torch.zeros(1, nKV, self.Cc, D) for _ in range(L)]
+        self.ctx_len = 0
+        self.rounds = 0
+        self.accepted_total = 0
+        # First block's worth of (rows, committed) kept for the QDQ-vs-fp32 verify,
+        # which used to re-derive them from the dumped hidden.
+        self.verify_sample = None
+
+    def can_append(self, n_new: int) -> bool:
+        return self.ctx_len + n_new <= self.Cc
+
+    def _forward(self, block_tokens, rows, n_new, ctx_pos_base, block_pos_base):
+        cfg = self.cfg
+        B, ar = self.B, self.ar
+        ids = torch.zeros(1, self.target_ar, dtype=self.token_dtype)
+        ids[0, :B] = torch.tensor(block_tokens, dtype=self.token_dtype)
+        noise = self.tok_embedding(ids)[:, :B, :]
+        atten = _draft_atten_mask(B, self.Cc, ar, self.ctx_len, n_new)
+        new_ctx = torch.zeros(1, ar, len(cfg.target_layer_ids) * cfg.hidden_size)
+        if n_new:
+            new_ctx[0, :n_new] = rows
+        ctx_pos = (ctx_pos_base + torch.arange(ar)).view(1, ar).to(torch.int32)
+        blk_pos = (block_pos_base + torch.arange(B)).view(1, B).to(torch.int32)
+        inp = (noise, atten, new_ctx, ctx_pos, blk_pos)
+        out = self.draft(*inp, *self.past_k, *self.past_v)
+        L = cfg.num_hidden_layers
+        k_new, v_new = out[1 : 1 + L], out[1 + L : 1 + 2 * L]
+        if n_new:
+            for i in range(L):
+                self.past_k[i][:, :, :, self.ctx_len : self.ctx_len + n_new] = k_new[
+                    i
+                ][:, :, :, :n_new]
+                self.past_v[i][:, :, self.ctx_len : self.ctx_len + n_new, :] = v_new[
+                    i
+                ][:, :, :n_new, :]
+            self.ctx_len += n_new
+        if self.verify_sample is None and n_new:
+            # Taken while the cache was still empty, so the verify can replay it
+            # against fresh zero caches. The inputs are never mutated after this.
+            self.verify_sample = inp
+        return out[0]
+
+    def seed(self, rows, n_new, ctx_pos_base):
+        """One prompt chunk: append its context rows, block half unused."""
+        block = [self.cfg.mask_token_id or 0] * self.B
+        self._forward(block, rows, n_new, ctx_pos_base, ctx_pos_base + n_new)
+
+    def draft_block(self, committed, rows, n_new, ctx_pos_base, cur_pos):
+        """One speculative round: append last round's accepted rows, then draft."""
+        block = [self.cfg.mask_token_id or 0] * self.B
+        block[0] = committed
+        hidden = self._forward(block, rows, n_new, ctx_pos_base, cur_pos)
+        padded = torch.zeros(1, self.target_ar, self.cfg.hidden_size)
+        padded[0, : self.B] = hidden[0]
+        logits = self.lm_head(padded)
+        self.rounds += 1
+        return [
+            int(logits[0, self.hidden_row0 + k].argmax())
+            for k in range(self.n_draft)
+        ]
 
 
 class DFlashDraftCompiler(Component):
@@ -664,6 +775,11 @@ class DFlashDraftCompiler(Component):
             if "embed_tokens.weight" in sd
             else None
         )
+        # Set by prepare_graphs/make_calibrator, which DFlashManager runs before the
+        # target calibrates so the draft can ride along in the same loop.
+        self.prepared = False
+        self.calibrator = None
+        self.fp_ref = None
 
     @property
     def embed_weight(self):
@@ -673,8 +789,15 @@ class DFlashDraftCompiler(Component):
         return self._embed_weight
 
     @log_info
-    def quantize(self, request: Request):
-        data = request.method_data[DFLASH_DRAFT]
+    def prepare_graphs(self, data):
+        """prepare_pt2e both draft graphs BEFORE the target calibrates.
+
+        Only example inputs are needed to prepare, so the draft can be observed
+        inside the target's own kv_inference loop instead of being calibrated
+        afterwards on a hand-rolled forward. Returns nothing; `self.decode` and
+        `self.prefill` become observed GraphModules and `self.fp_ref` keeps the
+        fp32 originals for the QDQ-vs-fp32 verify.
+        """
         if data.skip_quantize:
             return  # draft runs fp16, no PTQ
 
@@ -683,24 +806,12 @@ class DFlashDraftCompiler(Component):
         from executorch.examples.qualcomm.oss_scripts.llama.static_llm_quant_recipe import (
             DFlashDraftQuantRecipe,
         )
-        from torchao.quantization.pt2e.quantize_pt2e import convert_pt2e, prepare_pt2e
+        from torchao.quantization.pt2e.quantize_pt2e import prepare_pt2e
 
-        if self.target is None:
-            raise RuntimeError(
-                "DFlash draft PTQ requires the quantized target (set by DFlashManager)"
-            )
-
-        # Real-trajectory context features from the full quantized target (path B):
-        # the target is calibrated as a complete graph (headless decoder + lm_head
-        # jointly quantized on the real lm_head-argmax trajectory), so the hidden it
-        # emits equals what the draft consumes at inference.
-        hidden_seqs, token_seqs = self._dump_target_hidden(data)
-
-        fp_ref = {}
+        self.fp_ref = {}
         for name, ex in (("decode", self.decode_input), ("prefill", self.prefill_input)):
             model = getattr(self, name).float()
-            fp_ref[name] = model  # fp32 reference for the QDQ-vs-fp verify below
-            ar = model.AR
+            self.fp_ref[name] = model
             quantizer = make_quantizer(
                 quant_dtype=QuantDtype.use_16a4w,
                 per_channel_conv=True,
@@ -709,13 +820,66 @@ class DFlashDraftCompiler(Component):
                 soc_model=data.soc_model,
             )
             quantizer.set_recipe(DFlashDraftQuantRecipe().recipe)
-            prepared = prepare_pt2e(torch.export.export(model, ex).module(), quantizer)
-            with torch.no_grad():
-                for hidden_seq, tokens in zip(hidden_seqs, token_seqs):
-                    self._calibrate_draft(prepared, ar, hidden_seq, tokens)
-            setattr(self, name, convert_pt2e(prepared))
+            setattr(
+                self,
+                name,
+                prepare_pt2e(torch.export.export(model, ex).module(), quantizer),
+            )
+        self.prepared = True
+
+    def make_calibrator(self, tok_embedding, lm_head, target_ar, token_dtype):
+        """Bind the prepared decode graph to the target's emb/lm_head for the joint
+        loop. Only the decode graph is driven: prefill's encodings are overwritten
+        from decode in `quantize`, exactly as the target does."""
+        if not self.prepared:
+            return None
+        self.calibrator = DFlashCalibrator(
+            self.decode,
+            self.dflash_cfg,
+            tok_embedding,
+            lm_head,
+            self.max_context_len,
+            self.decode_input[2].shape[1],
+            target_ar,
+            token_dtype,
+        )
+        return self.calibrator
+
+    @log_info
+    def quantize(self, request: Request):
+        data = request.method_data[DFLASH_DRAFT]
+        if data.skip_quantize:
+            return  # draft runs fp16, no PTQ
+        if self.calibrator is None or self.calibrator.rounds == 0:
+            raise RuntimeError(
+                "DFlash draft was never driven by the target's calibration loop; "
+                "DFlashManager must call prepare_graphs/make_calibrator first"
+            )
+
+        from executorch.examples.qualcomm.oss_scripts.llama.wrappers.llm_wrappers import (
+            HybridTextDecoder,
+        )
+        from torchao.quantization.pt2e.quantize_pt2e import convert_pt2e
+
+        # The decode graph's observers were filled by the joint loop. prefill was
+        # never driven -- like the target's, its encodings are copied from decode
+        # below -- but convert_pt2e still needs one forward to clear the affine
+        # observer, so give it the export sample.
+        with torch.no_grad():
+            self.prefill(*self.prefill_input)
+        self.decode = convert_pt2e(self.decode)
+        self.prefill = convert_pt2e(self.prefill)
+        # prefill seeds the context cache that decode then appends to, through one
+        # shared draft_kv_manager_ (dflash_token_generator.h) whose K/V cross the pte
+        # boundary as uint8. Two independently calibrated scales there would make
+        # decode misread every row prefill wrote.
+        HybridTextDecoder._encoding_override(
+            decode_model=self.decode, prefill_model=self.prefill
+        )
         logging.info(
-            "DFlash draft quantized (16a4w; fc/down_proj/lm_head 16a8w protected)"
+            "DFlash draft quantized over %d speculative rounds "
+            "(16a4w; fc/down_proj/lm_head 16a8w protected)",
+            self.calibrator.rounds,
         )
 
         # Dump the decode (block) QDQ graph so the host accept loop can drive the
@@ -736,134 +900,38 @@ class DFlashDraftCompiler(Component):
         # the fp32 draft on the real dumped target hidden: same drafted tokens =>
         # no accept loss from draft quantization. QDQ == the device pte numerically.
         if getattr(self.control_args, "verify_split", False):
-            self._verify_draft_quant(
-                fp_ref["decode"], self.decode, fp_ref["decode"].AR,
-                hidden_seqs, token_seqs,
-            )
+            self._verify_draft_quant()
 
-    def _dump_target_hidden(self, data):
-        """Prefill each calibration prompt through the quantized target's prefill
-        graph (real tokens, no argmax needed) and read the trailing captured hiddens
-        = the num_ctx_layers selected layers, concatenated into the draft's
-        new_context feature [1, T, num_ctx_layers*H]. Returns per-prompt hidden and
-        committed-token sequences."""
-        prefill = self.target.prefill  # quantized TextDecoder (prefill graph)
-        decoder = prefill.decoder  # QDQ GraphModule -> (hidden, k, v, *captured)
-        # emb-split target: the decoder takes inputs_embeds, so ex[0] is [1, ar, H].
-        # Embed the calibration tokens with the raw (tied) target table — the
-        # emb.pte -> decoder boundary is fp32, and the decoder applies its own
-        # embedding_scale_factor, so the raw fp32 lookup is exactly the decoder input.
-        ex = list(prefill.export_input)  # (inputs_embeds, mask, pos, *caches)
-        pref_ar = ex[0].shape[1]
-        H = self.dflash_cfg.hidden_size
-        Lc = len(self.dflash_cfg.target_layer_ids)
-        hidden_seqs, token_seqs = [], []
-        with torch.no_grad():
-            for prompt in data.calibration_data.datasets:
-                ids = _encode_prompt(data.tokenizer, prompt)[:pref_ar]
-                if not ids:
-                    continue
-                T = len(ids)
-                embeds = torch.zeros(1, pref_ar, H)  # pad past T (rows masked out)
-                embeds[0, :T] = self.embed_weight[torch.tensor(ids, dtype=torch.long)]
-                out = decoder(embeds, *ex[1:])
-                captured = out[-Lc:]  # selected layers, [1, pref_ar, H] each
-                new_context = torch.cat([c[:, :T] for c in captured], dim=-1)
-                hidden_seqs.append(new_context)  # [1, T, Lc*H]
-                token_seqs.append(torch.tensor(ids))
-        if not hidden_seqs:
-            raise RuntimeError("DFlash draft calibration produced no hidden (no prompts)")
-        logging.info(
-            "DFlash draft: dumped hidden for %d calibration prompts (max_len=%d)",
-            len(hidden_seqs),
-            pref_ar,
-        )
-        return hidden_seqs, token_seqs
-
-    def _draft_block_inputs(self, hidden_row, committed, ar, n_past, n_new, pos):
-        """Build the 5 non-cache draft inputs for one block in the run_draft layout
-        (dflash_token_generator): noise_embedding, additive atten_mask, new_context,
-        and the context/block RoPE positions."""
-        cfg = self.dflash_cfg
-        B, H = cfg.block_size, cfg.hidden_size
-        Lc = len(cfg.target_layer_ids)
-        Cc = self.max_context_len - ar
-        ids = torch.full((B,), cfg.mask_token_id or 0, dtype=torch.long)
-        ids[0] = committed
-        noise = self.embed_weight[ids].view(1, B, H)
-        atten = _draft_atten_mask(B, Cc, ar, n_past, n_new)
-        new_ctx = torch.zeros(1, ar, Lc * H)
-        new_ctx[0, :n_new] = hidden_row
-        ctx_pos = (pos + torch.arange(ar)).view(1, ar).to(torch.int32)
-        blk_pos = (pos + torch.arange(B)).view(1, B).to(torch.int32)
-        return noise, atten, new_ctx, ctx_pos, blk_pos
-
-    def _calibrate_draft(self, model, ar, hidden_seq, tokens):
-        """Feed the prepared draft real inputs in the run_draft layout: step through
-        the sequence appending `ar` context rows per block (committed = real token,
-        teacher-forcing), accumulating the draft KV cache, so its activation observers
-        see the real quantized-target hidden they get at inference."""
-        cfg = self.dflash_cfg
-        nKV, D, L = cfg.num_key_value_heads, cfg.head_dim, cfg.num_hidden_layers
-        Cc = self.max_context_len - ar
-        T = hidden_seq.shape[1]
-        past_k = [torch.zeros(1, nKV, D, Cc) for _ in range(L)]
-        past_v = [torch.zeros(1, nKV, Cc, D) for _ in range(L)]
-        n_past = pos = s = 0
-        while s < T and n_past + min(ar, T - s) <= Cc:
-            n_new = min(ar, T - s)
-            inp = self._draft_block_inputs(
-                hidden_seq[0, s : s + n_new], int(tokens[s]), ar, n_past, n_new, pos
-            )
-            out = model(*inp, *past_k, *past_v)
-            k_new, v_new = out[1 : 1 + L], out[1 + L : 1 + 2 * L]
-            for i in range(L):
-                past_k[i][:, :, :, n_past : n_past + n_new] = k_new[i][:, :, :, :n_new]
-                past_v[i][:, :, n_past : n_past + n_new, :] = v_new[i][:, :, :n_new, :]
-            n_past += n_new
-            pos += n_new
-            s += n_new
-
-    def _verify_draft_quant(self, fp_model, qdq_model, ar, hidden_seqs, token_seqs):
+    def _verify_draft_quant(self):
         """Compare the EXACT QDQ decode graph (lowered into the pte) against the fp32
-        draft on the real dumped target hidden: run the first block of each sequence
-        through both and compare the drafted-token argmax (top1) + logit error. With
-        an in-graph lm_head the last output is block logits; top1==1 means the
-        quantized draft drafts identical tokens => no accept loss from quantization."""
+        draft on one real block from the joint loop, and report the drafted-token
+        argmax (top1) + logit error. With an in-graph lm_head the last output is block
+        logits; top1==1 means the quantized draft drafts identical tokens => no accept
+        loss from quantization."""
         import torch.nn.functional as F
 
+        inp = self.calibrator.verify_sample
+        if inp is None:
+            return
         cfg = self.dflash_cfg
         nKV, D, L = cfg.num_key_value_heads, cfg.head_dim, cfg.num_hidden_layers
-        Cc = self.max_context_len - ar
-        hits = tot = n = 0
-        cos_sum = mae_sum = 0.0
+        Cc = self.calibrator.Cc
+        # The sample is the loop's first block, taken when the cache was still empty.
+        past_k = [torch.zeros(1, nKV, D, Cc) for _ in range(L)]
+        past_v = [torch.zeros(1, nKV, Cc, D) for _ in range(L)]
+        idx = -1 if self.with_lm_head else 0
         with torch.no_grad():
-            for hidden_seq, tokens in zip(hidden_seqs, token_seqs):
-                n_new = min(ar, hidden_seq.shape[1])
-                past_k = [torch.zeros(1, nKV, D, Cc) for _ in range(L)]
-                past_v = [torch.zeros(1, nKV, Cc, D) for _ in range(L)]
-                inp = self._draft_block_inputs(
-                    hidden_seq[0, :n_new], int(tokens[0]), ar, 0, n_new, 0
-                )
-                fp_o = fp_model(*inp, *past_k, *past_v)[-1 if self.with_lm_head else 0]
-                q_o = qdq_model(*inp, *past_k, *past_v)[-1 if self.with_lm_head else 0]
-                if self.with_lm_head:
-                    hits += (fp_o.argmax(-1) == q_o.argmax(-1)).sum().item()
-                    tot += fp_o.argmax(-1).numel()
-                cos_sum += F.cosine_similarity(
-                    fp_o.flatten(), q_o.flatten(), dim=0
-                ).item()
-                mae_sum += (fp_o - q_o).abs().mean().item()
-                n += 1
-        top1 = hits / tot if tot else float("nan")
+            fp_o = self.fp_ref["decode"](*inp, *past_k, *past_v)[idx]
+            q_o = self.decode(*inp, *past_k, *past_v)[idx]
+        top1 = float("nan")
+        if self.with_lm_head:
+            top1 = (fp_o.argmax(-1) == q_o.argmax(-1)).float().mean().item()
         logging.info(
-            "DFlash draft QDQ-vs-fp32 verify (block %s): top1=%.4f cos=%.4f "
-            "mae=%.6f over %d prompts",
+            "DFlash draft QDQ-vs-fp32 verify (block %s): top1=%.4f cos=%.4f mae=%.6f",
             "logits" if self.with_lm_head else "hidden",
             top1,
-            cos_sum / max(n, 1),
-            mae_sum / max(n, 1),
-            n,
+            F.cosine_similarity(fp_o.flatten(), q_o.flatten(), dim=0).item(),
+            (fp_o - q_o).abs().mean().item(),
         )
 
     @log_info
@@ -1065,6 +1133,12 @@ class DFlashManager(Component):
             ),
             DFLASH_TARGET: Request.Data(),
         }
+        # Observe the draft BEFORE the target calibrates, so it can be driven inside
+        # the target's own kv_inference loop: the target's decode graph is the only
+        # one carrying real encodings (prefill's are copied in at compile), and the
+        # draft consumes exactly its hidden. prepare_pt2e needs example inputs only.
+        self.draft_compiler.prepare_graphs(method_data[DFLASH_DRAFT])
+        self.target.decode.dflash_draft = self.draft_compiler
         self.process(Request(method_name="quantize", method_data=method_data))
 
     @log_info

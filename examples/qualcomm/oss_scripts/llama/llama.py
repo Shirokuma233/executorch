@@ -1237,6 +1237,12 @@ def main():
     parser = _build_parser()
     args = parser.parse_args()
     args.build_folder = os.path.realpath(args.build_folder)
+    # get_example_inputs() draws randn/randint, and a PREFILL graph's only
+    # "calibration" is one forward on exactly that tensor -- so without a seed the
+    # quantization parameters differ between two builds of the same config. Measured:
+    # the draft's new_context scale came out 0.0649 and 0.0403 on identical inputs.
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
     try:
         export_llama(args)
     except Exception as e:
