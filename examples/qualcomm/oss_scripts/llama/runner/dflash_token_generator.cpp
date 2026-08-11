@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <ctime>
 #include <limits>
 #include <vector>
 
@@ -31,7 +32,63 @@ using executorch::runtime::TensorInfo;
 
 namespace example {
 
+const char* const DFlashTokenGenerator::kStageNames[
+    DFlashTokenGenerator::kNumStages] = {
+    "draft_prep",
+    "draft_exec",
+    "draft_post",
+    "draft_head",
+    "draft_pick",
+    "tree_build",
+    "verify_prep",
+    "verify_exec",
+    "verify_head",
+    "verify_pick",
+    "stage_copy",
+    "commit",
+    "emit",
+};
+
 namespace {
+
+// time_in_ms() rounds to whole milliseconds, so a stage that costs 40 us reads as
+// 0 or 1 and its total is quantization noise rather than a measurement.
+inline int64_t time_in_us() {
+  struct timespec t;
+#if defined(__ANDROID_API__)
+  clock_gettime(CLOCK_MONOTONIC, &t);
+#else
+  timespec_get(&t, TIME_UTC);
+#endif
+  return static_cast<int64_t>(t.tv_sec) * 1000000 + t.tv_nsec / 1000;
+}
+
+// Argmax per row over raw uint16 logit codes. The lm_head's encoding is a
+// monotone affine map, so the winning index is the same as on dequantized
+// values, and strict `>` breaks ties toward the lower id exactly as
+// Sampler::sample_argmax does.
+//
+// This exists because DecoderRunner::logits_to_token cannot be used cheaply: for
+// every row it expands all 151936 codes into a float vector (608 KB of stores)
+// through a per-element dtype switch, then rescans that vector. Measured on
+// device at 0.42 ms/row against 0.080 ms/row here.
+inline void argmax_u16_rows(
+    const uint16_t* logits,
+    size_t vocab,
+    int rows,
+    std::vector<uint64_t>* out) {
+  out->assign(static_cast<size_t>(rows), 0);
+  for (int k = 0; k < rows; ++k) {
+    const uint16_t* row = logits + static_cast<size_t>(k) * vocab;
+    uint16_t best = 0;
+    for (size_t v = 0; v < vocab; ++v) {
+      if (row[v] > best) {
+        best = row[v];
+        (*out)[k] = static_cast<uint64_t>(v);
+      }
+    }
+  }
+}
 
 // fp16_to_fp32 lives in runner/utils.h (shared with the EAGLE sampler).
 
@@ -593,6 +650,7 @@ void DFlashTokenGenerator::decode_lm_head(
     std::vector<uint64_t>* out_tokens) {
   const int H = dflash_meta_.hidden_dim;
   const long lm_start_ms = time_in_ms();
+  const int64_t t_head = time_in_us();
   std::memset(draft_hidden_u16_buf_, 0, draft_hidden_u16_nbytes_);
   // TODO(dflash-uint16): 临时桥接。emb输出/draft-IO 目前是 f32(编译端边界没做成
   // uint16),故此处 host quantize。日后编译端把 emb 输出 + draft noise/hidden tag
@@ -605,23 +663,18 @@ void DFlashTokenGenerator::decode_lm_head(
       logits_scale_,
       logits_zero_point_);
   run_lm_head(draft_hidden_u16_buf_);
+  stage_us_[kDraftHead] += time_in_us() - t_head;
 
   // uint16 logits (see target_verify_block); argmax directly on the raw codes.
+  const int64_t t_pick = time_in_us();
   const long t_smp = time_in_ms();
-  const size_t V = static_cast<size_t>(lm_head_vocab_size_);
-  const uint16_t* lg = reinterpret_cast<const uint16_t*>(lm_head_logits_buf_);
-  out_tokens->assign(static_cast<size_t>(count), 0);
-  for (int k = 0; k < count; ++k) {
-    const uint16_t* row = lg + static_cast<size_t>(k) * V;
-    uint16_t best = 0;
-    for (size_t v = 0; v < V; ++v) {
-      if (row[v] > best) {
-        best = row[v];
-        (*out_tokens)[k] = static_cast<uint64_t>(v);
-      }
-    }
-  }
+  argmax_u16_rows(
+      reinterpret_cast<const uint16_t*>(lm_head_logits_buf_),
+      static_cast<size_t>(lm_head_vocab_size_),
+      count,
+      out_tokens);
   sample_ms_ += static_cast<double>(time_in_ms() - t_smp);
+  stage_us_[kDraftPick] += time_in_us() - t_pick;
   lm_head_time_ms_ += static_cast<double>(time_in_ms() - lm_start_ms);
 }
 
@@ -643,6 +696,7 @@ void DFlashTokenGenerator::run_draft(
     const std::vector<uint64_t>& block_tokens,
     int64_t block_pos_base,
     std::vector<float>* out_hidden) {
+  const int64_t t_prep = time_in_us();
   const int B = dflash_meta_.block_size;
   const int H = dflash_meta_.hidden_dim;
   const int Ld = dflash_meta_.num_draft_layers;
@@ -817,9 +871,13 @@ void DFlashTokenGenerator::run_draft(
       "[DFlash] draft set_outputs failed for %s",
       method.c_str());
 
+  stage_us_[kDraftPrep] += time_in_us() - t_prep;
+  const int64_t t_exec = time_in_us();
   const long start_ms = time_in_ms();
   auto res = draft_module_->execute(method, inputs);
   const double elapsed = static_cast<double>(time_in_ms() - start_ms);
+  stage_us_[kDraftExec] += time_in_us() - t_exec;
+  const int64_t t_post = time_in_us();
   ET_CHECK_MSG(res.ok(), "[DFlash] draft execute failed for %s", method.c_str());
 
   if (out_hidden != nullptr) {
@@ -848,6 +906,7 @@ void DFlashTokenGenerator::run_draft(
   // The block's logits are no longer produced in-graph (this build's draft emits
   // only hidden + K/V). The caller runs lm_head.pte over the returned hidden via
   // decode_lm_head, which also handles the shifted/aligned row offset.
+  stage_us_[kDraftPost] += time_in_us() - t_post;
 }
 
 // ---------------------------------------------------------------------------
@@ -895,6 +954,7 @@ void DFlashTokenGenerator::stage_prompt_hidden(
       stage_pos_base_ = pos_base + j;
     }
     float* dst = stage_buf_.data() + static_cast<size_t>(stage_count_) * LH;
+    const int64_t t_cp = time_in_us();
     for (int l = 0; l < L; ++l) {
       for (int h = 0; h < H; ++h) {
         dst[l * H + h] = read_scalar(
@@ -903,6 +963,7 @@ void DFlashTokenGenerator::stage_prompt_hidden(
             static_cast<size_t>(j) * H + h);
       }
     }
+    stage_us_[kStageCopy] += time_in_us() - t_cp;
     if (++stage_count_ == dflash_meta_.prefill_ar_len) {
       flush_stage();
     }
@@ -927,6 +988,7 @@ void DFlashTokenGenerator::target_verify_block(
     const std::vector<uint64_t>& packed_tokens,
     int64_t cur_pos,
     std::vector<uint64_t>* target_sampled) {
+  const int64_t t_prep = time_in_us();
   const int ar = dflash_meta_.target_ar_len;
   const int H = dflash_meta_.hidden_dim;
   const int n = static_cast<int>(packed_tokens.size());
@@ -950,41 +1012,39 @@ void DFlashTokenGenerator::target_verify_block(
   }
   kv_manager_->init_attention_mask(
       attention_mask_.data, attention_map, ar, static_cast<int32_t>(cur_pos));
+  stage_us_[kVerifyPrep] += time_in_us() - t_prep;
 
   long start_ms = time_in_ms();
   // Headless: step returns hidden in output_tensors_[0] (== logits_.data); the L
   // captured layers land in target_hidden_bufs_. We ignore the return tensor and
   // project the hidden through lm_head.pte to get the verify logits.
+  const int64_t t_exec = time_in_us();
   const long t_dec = time_in_ms();
   auto step_res = decoder_runner_->step(method_name_, inputs_);
   decoder_exec_ms_ += static_cast<double>(time_in_ms() - t_dec);
+  stage_us_[kVerifyExec] += time_in_us() - t_exec;
   ET_CHECK_MSG(step_res.ok(), "[DFlash] target verify step failed");
+  const int64_t t_head = time_in_us();
   run_lm_head(logits_.data);
+  stage_us_[kVerifyHead] += time_in_us() - t_head;
   target_verify_time_ms_ += static_cast<double>(time_in_ms() - start_ms);
   ++target_verify_calls_;
 
   // lm_head.pte emits uint16 logits despite declaring the output Float; reading
-  // them as f32 gives all zeros. Bind UInt16 -- argmax is order-preserving so no
-  // dequantization is needed.
-  auto lm_out_meta = lm_head_kv_meta_->output_tensor_meta(0).get();
-  std::vector<TensorImpl::SizesType> lm_sizes(
-      lm_out_meta.sizes().begin(), lm_out_meta.sizes().end());
-  std::vector<TensorImpl::DimOrderType> lm_dimo(
-      lm_out_meta.dim_order().begin(), lm_out_meta.dim_order().end());
-  TensorImpl lm_impl(
-      ScalarType::UInt16,
-      lm_sizes.size(),
-      lm_sizes.data(),
-      lm_head_logits_buf_,
-      lm_dimo.data());
-  Tensor lm_logits(&lm_impl);
+  // them as f32 gives all zeros, so pick straight off the codes. The sampler this
+  // replaces is built on the same lm_head vocab (runner.cpp:313) and breaks ties
+  // the same way, so at temperature 0 the tokens are identical -- and greedy is
+  // the only mode this generator has ever been correct in, since acceptance is an
+  // exact-match test and the draft side already hard-argmaxes.
+  const int64_t t_pick = time_in_us();
   const long t_smp = time_in_ms();
-  target_sampled->resize(static_cast<size_t>(ar));
-  for (int k = 0; k < ar; ++k) {
-    (*target_sampled)[k] =
-        static_cast<uint64_t>(decoder_runner_->logits_to_token(lm_logits, k));
-  }
+  argmax_u16_rows(
+      reinterpret_cast<const uint16_t*>(lm_head_logits_buf_),
+      static_cast<size_t>(lm_head_vocab_size_),
+      ar,
+      target_sampled);
   sample_ms_ += static_cast<double>(time_in_ms() - t_smp);
+  stage_us_[kVerifyPick] += time_in_us() - t_pick;
 }
 
 // ---------------------------------------------------------------------------
@@ -998,6 +1058,9 @@ Result<int64_t> DFlashTokenGenerator::generate(
     bool /*dump_logits*/,
     AttentionSinkRopeRunner* /*attention_sink_rope_runner*/) {
   ET_CHECK_MSG(!tokens.empty(), "[DFlash] empty tokens");
+  // Everything the stage timers hold right now was spent seeding the draft from
+  // the prompt; the decode phase is whatever accumulates after this line.
+  prefill_stage_us_ = stage_us_;
   const int B = dflash_meta_.block_size;
   const int H = dflash_meta_.hidden_dim;
   const int L = dflash_meta_.num_ctx_layers;
@@ -1033,6 +1096,7 @@ Result<int64_t> DFlashTokenGenerator::generate(
       draft_decode_ar_,
       n_draft + 1);
 
+  const int64_t t_decode = time_in_us();
   while (cur_pos < static_cast<int64_t>(seq_len) - 1) {
     // --- DRAFT: append last round's accepted hidden, then denoise the block ---
     // The draft always sees B slots: the confirmed token, then masks.
@@ -1065,6 +1129,7 @@ Result<int64_t> DFlashTokenGenerator::generate(
 
     // Verify slot k predicts slot k+1, so target_sampled[k] is what the target
     // would have put where the draft put verify[k+1].
+    const int64_t t_acc = time_in_us();
     int accepted = 0;
     for (int k = 0; k < n_draft; ++k) {
       if (verify[k + 1] == target_sampled[k]) {
@@ -1074,8 +1139,10 @@ Result<int64_t> DFlashTokenGenerator::generate(
       }
     }
     uint64_t bonus = target_sampled[accepted];
+    stage_us_[kVerifyPick] += time_in_us() - t_acc;
 
     // --- COMMIT target KV for slots [0..accepted] ---
+    const int64_t t_commit = time_in_us();
     std::vector<bool> selected(static_cast<size_t>(dflash_meta_.target_ar_len), false);
     for (int k = 0; k <= accepted; ++k) {
       selected[static_cast<size_t>(k)] = true;
@@ -1090,8 +1157,10 @@ Result<int64_t> DFlashTokenGenerator::generate(
         dflash_meta_.target_ar_len,
         static_cast<int32_t>(cur_pos),
         accepted + 1);
+    stage_us_[kCommit] += time_in_us() - t_commit;
 
     // --- stage the accepted tokens' hidden for the next draft call ---
+    const int64_t t_cp = time_in_us();
     pending_rows = accepted + 1;
     pending_pos_base = cur_pos;
     for (int k = 0; k < pending_rows; ++k) {
@@ -1106,6 +1175,8 @@ Result<int64_t> DFlashTokenGenerator::generate(
       }
     }
 
+    stage_us_[kStageCopy] += time_in_us() - t_cp;
+
     total_accepted_ += static_cast<uint64_t>(accepted);
     ET_LOG(
         Debug,
@@ -1119,6 +1190,7 @@ Result<int64_t> DFlashTokenGenerator::generate(
     // --- emit accepted draft tokens + bonus ---
     // An EOS among the accepted tokens ends generation at that token, but must not
     // skip the summary below, so it leaves through the same exit as everything else.
+    const int64_t t_emit = time_in_us();
     uint64_t prev = last_committed;
     bool hit_eos = false;
     for (int k = 1; k <= accepted; ++k) {
@@ -1131,9 +1203,11 @@ Result<int64_t> DFlashTokenGenerator::generate(
       prev = verify[k];
     }
     if (hit_eos) {
+      stage_us_[kEmit] += time_in_us() - t_emit;
       break;
     }
     token_callback(ET_UNWRAP_TOKENIZER(tokenizer_->decode(prev, bonus)));
+    stage_us_[kEmit] += time_in_us() - t_emit;
 
     cur_pos += accepted + 1;
     last_committed = bonus;
@@ -1146,6 +1220,7 @@ Result<int64_t> DFlashTokenGenerator::generate(
       break;
     }
   }
+  decode_wall_us_ = time_in_us() - t_decode;
 
   if (target_verify_calls_ > 0) {
     // accept_len is the metric that matters: tokens committed per target forward.
@@ -1177,6 +1252,52 @@ Result<int64_t> DFlashTokenGenerator::generate(
         lm_head_exec_ms_,
         static_cast<unsigned long long>(lm_head_calls_),
         sample_ms_);
+
+    // Per-round stage breakdown. One line per stage so it parses with a regex,
+    // and an `other` row carrying whatever the stages failed to claim -- without
+    // it a breakdown silently reads as complete when it is not.
+    const double rounds = static_cast<double>(target_verify_calls_);
+    const double wall_ms = static_cast<double>(decode_wall_us_) / 1000.0;
+    int64_t claimed_us = 0;
+    for (int i = 0; i < kNumStages; ++i) {
+      claimed_us += stage_us_[i] - prefill_stage_us_[i];
+    }
+    ET_LOG(
+        Info,
+        "[DFlash][stage] phase=decode rounds=%.0f wall_ms=%.1f round_ms=%.3f",
+        rounds,
+        wall_ms,
+        wall_ms / rounds);
+    for (int i = 0; i < kNumStages; ++i) {
+      const double ms =
+          static_cast<double>(stage_us_[i] - prefill_stage_us_[i]) / 1000.0;
+      ET_LOG(
+          Info,
+          "[DFlash][stage] decode %-11s total_ms=%9.1f round_ms=%7.3f pct=%5.1f",
+          kStageNames[i],
+          ms,
+          ms / rounds,
+          100.0 * ms / wall_ms);
+    }
+    const double other_ms =
+        (static_cast<double>(decode_wall_us_ - claimed_us)) / 1000.0;
+    ET_LOG(
+        Info,
+        "[DFlash][stage] decode %-11s total_ms=%9.1f round_ms=%7.3f pct=%5.1f",
+        "other",
+        other_ms,
+        other_ms / rounds,
+        100.0 * other_ms / wall_ms);
+    for (int i = 0; i < kNumStages; ++i) {
+      if (prefill_stage_us_[i] == 0) {
+        continue;
+      }
+      ET_LOG(
+          Info,
+          "[DFlash][stage] prefill %-11s total_ms=%9.1f",
+          kStageNames[i],
+          static_cast<double>(prefill_stage_us_[i]) / 1000.0);
+    }
   }
   return static_cast<int64_t>(cur_pos - start_pos);
 }

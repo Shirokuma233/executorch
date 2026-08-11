@@ -309,6 +309,35 @@ class DFlashTokenGenerator : public TokenGenerator {
   // draft.pte's own execute time is draft_time_ms_ above.
   uint64_t emb_calls_{0};
   uint64_t lm_head_calls_{0};
+
+  // Non-overlapping stage timers, in microseconds. The counters above overlap
+  // (verify contains lm_head, host argmax is charged inside two of them) and
+  // leave ~8% of the round unattributed, which is not good enough to say where a
+  // tree round differs from a chain round. These partition the round instead:
+  // their sum plus `other` is the measured decode wall time. Microseconds because
+  // several stages take tens of them and time_in_ms() would round them to zero.
+  enum Stage {
+    kDraftPrep, // emb.pte for the noise block + writing the draft's 5 inputs
+    kDraftExec, // draft.pte
+    kDraftPost, // draft KV append + hidden readback
+    kDraftHead, // quantize draft hidden + lm_head.pte over the drafted rows
+    kDraftPick, // host argmax (tree: top-k) over those rows
+    kTreeBuild, // host tree construction; zero on the chain path
+    kVerifyPrep, // emb.pte for the verify block + positions + attention mask
+    kVerifyExec, // target decoder.pte
+    kVerifyHead, // lm_head.pte over the verify rows
+    kVerifyPick, // host argmax + accept comparison
+    kStageCopy, // target hidden -> stage_buf_ (prompt seeding and per round)
+    kCommit, // target KV update_cache + attention mask advance
+    kEmit, // tokenizer decode + callback
+    kNumStages,
+  };
+  static const char* const kStageNames[kNumStages];
+  std::array<int64_t, kNumStages> stage_us_{};
+  // Snapshot taken on entry to generate(); everything accumulated before that
+  // belongs to prompt seeding, so the two phases separate without extra plumbing.
+  std::array<int64_t, kNumStages> prefill_stage_us_{};
+  int64_t decode_wall_us_{0};
 };
 
 } // namespace example
