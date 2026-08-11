@@ -79,7 +79,9 @@ class Runner : public executorch::extension::llm::IRunner {
       int dflash_max_context_len = 0,
       std::unique_ptr<executorch::extension::Module> dflash_emb_module = nullptr,
       std::unique_ptr<executorch::extension::Module> dflash_lm_head_module =
-          nullptr);
+          nullptr,
+      int dflash_tree_budget = 0,
+      float dflash_logit_out_scale = 0.0f);
 
   bool is_loaded() const override;
   executorch::runtime::Error load() override;
@@ -136,6 +138,8 @@ class Runner : public executorch::extension::llm::IRunner {
   std::unique_ptr<executorch::extension::Module> dflash_lm_head_module_;
   int block_size_{16};
   int dflash_max_context_len_{0};
+  int dflash_tree_budget_{0};
+  float dflash_logit_out_scale_{0.0f};
 
   int ngram_{0};
   int window_{0};

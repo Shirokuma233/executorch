@@ -137,6 +137,20 @@ DEFINE_int32(
     dflash_max_context_len,
     0,
     "[DFlash Decoding] Fixed context length the draft attends to (0 => model).");
+DEFINE_int32(
+    dflash_tree_budget,
+    0,
+    "[DFlash Decoding] Non-root nodes in the draft tree (DDTree). 0 keeps the "
+    "chain: one argmax per block position, first miss ends the round. Capped at "
+    "target_ar_len - 1, since the verify window is compiled, not configurable.");
+DEFINE_double(
+    dflash_logit_out_scale,
+    0.0015587152447551489,
+    "[DFlash Decoding] lm_head OUTPUT logit encoding scale. Only the tree needs "
+    "it: scoring a path sums log-probs across depths, and this scale is what "
+    "makes a depth look peaked or flat, i.e. how the budget splits between depth "
+    "and breadth. The lm_head pte carries no getters, hence a flag; the default "
+    "is build b16_joint's value, read off qdq_lm_head.pt2.");
 DEFINE_string(
     dflash_emb_pte_path,
     "",
@@ -323,7 +337,9 @@ void start_runner(
       FLAGS_block_size,
       FLAGS_dflash_max_context_len,
       std::move(dflash_emb_module),
-      std::move(dflash_lm_head_module));
+      std::move(dflash_lm_head_module),
+      FLAGS_dflash_tree_budget,
+      static_cast<float>(FLAGS_dflash_logit_out_scale));
   auto decoder_model_version = runner.get_decoder_model_version();
   std::vector<char> buf;
   buf.reserve(5 * FLAGS_seq_len); // assume each token is around 5 char

@@ -94,6 +94,15 @@ class DFlashTokenGenerator : public TokenGenerator {
     // than configured here: seeding a row the quantizer never saw silently costs
     // acceptance instead of failing.
     bool drop_sink;
+    // DDTree: non-root nodes to spend on the draft tree. 0 keeps the chain.
+    // Capped at target_ar_len - 1 -- the verify window is compiled, not
+    // configurable, so a budget of 15 costs the target exactly what the chain
+    // already costs.
+    int32_t tree_budget;
+    // lm_head's OUTPUT logit encoding scale (code -> logit). Only the tree reads
+    // it: path scores sum log-probs across depths, and this scale decides how
+    // peaked a depth looks, i.e. how the budget splits between depth and breadth.
+    float logit_out_scale;
   };
 
   DFlashTokenGenerator(
@@ -182,19 +191,32 @@ class DFlashTokenGenerator : public TokenGenerator {
   // `lm_head_logits_buf_`.
   void run_lm_head(std::byte* hidden_u16);
 
-  // Quantize `count` hidden rows (logits scale/zp) -> u16 -> lm_head.pte kv ->
-  // host argmax over the full target vocab, filling `out_tokens`.
-  void decode_lm_head(
-      const float* hidden,
-      int32_t count,
-      std::vector<uint64_t>* out_tokens);
+  // Quantize `rows` draft hidden rows -> lm_head.pte -> per-depth top-k, kept as
+  // log-probs in `draft_logp_` / `draft_ids_`.
+  //
+  // Log-probs, not raw logits, because the tree compares paths of DIFFERENT
+  // depths and every extra depth adds a term: with unnormalized logits a longer
+  // path could outscore a shorter one purely by being longer. The partition
+  // function is summed over the top-k alone -- the tail it drops is a few percent
+  // of the mass, and any error it leaves is common to all paths through that
+  // depth, whereas a full-vocab exp() would cost more than the tree saves.
+  void draft_topk(const float* hidden, int32_t rows, int32_t k);
 
-  // Target verify: run target kv_forward over the packed block, read logits and
-  // the L extra hidden outputs. Returns the target argmax per slot.
-  void target_verify_block(
-      const std::vector<uint64_t>& packed_tokens,
-      int64_t cur_pos,
-      std::vector<uint64_t>* target_sampled);
+  // DDTree: best-first expansion over the product of the per-depth distributions.
+  // Fills tree_ / tree_children_ with `budget` non-root nodes. Block diffusion
+  // makes this free -- depth d's distribution is a marginal that one draft
+  // forward already produced, so widening the tree never costs another one.
+  void build_tree(int32_t budget, int32_t depth_limit);
+
+  // Slot of `token` under `parent`, or -1. Linear over the children a node
+  // actually has, which the budget bounds well below any threshold where a map
+  // would pay for itself.
+  int32_t tree_child(int32_t parent, uint64_t token) const;
+
+  // Target verify: pack the tree into the ar window (tokens, per-depth
+  // positions, ancestor-only mask), run the decoder + lm_head. Leaves the logits
+  // in lm_head_logits_buf_; the caller argmaxes only the rows it walks.
+  void target_verify_tree(int64_t cur_pos, uint64_t root_token);
 
   executorch::extension::Module* draft_module_;
   KVManager* draft_kv_manager_;
@@ -255,6 +277,23 @@ class DFlashTokenGenerator : public TokenGenerator {
   std::byte* draft_hidden_buf_ = nullptr;
   size_t draft_hidden_nbytes_ = 0;
 
+  // One drafted node. `slot` is its column in the verify window and equals its
+  // index here plus one (slot 0 is the confirmed root token). `parent` is always
+  // a smaller slot: the heap cannot pop a child before its parent, since adding a
+  // depth only ever lowers a path's score. KVManager::init_attention_mask relies
+  // on that ordering -- it builds a row by copying its parent's.
+  struct TreeNode {
+    uint64_t token;
+    int32_t parent;
+    int32_t depth;
+  };
+  std::vector<TreeNode> tree_;
+  std::vector<std::vector<std::pair<uint64_t, int32_t>>> tree_children_;
+  // Per-depth top-k of the drafted block, row-major [depth][k].
+  std::vector<float> draft_logp_;
+  std::vector<uint64_t> draft_ids_;
+  int32_t draft_topk_ = 1;
+
   // Cache A: hidden staging. max(prefill_ar_len, block_size) rows of L*H fp32.
   std::vector<float> stage_buf_;
   int32_t stage_count_ = 0;
@@ -291,6 +330,8 @@ class DFlashTokenGenerator : public TokenGenerator {
   // stats
   uint64_t total_drafted_{0};
   uint64_t total_accepted_{0};
+  uint64_t total_tree_nodes_{0};
+  uint64_t total_tree_depth_{0};
   uint64_t draft_calls_{0};
   uint64_t draft_prefill_calls_{0};
   uint64_t target_verify_calls_{0};

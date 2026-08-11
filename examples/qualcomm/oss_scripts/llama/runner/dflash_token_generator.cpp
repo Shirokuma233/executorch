@@ -18,6 +18,8 @@
 #include <cstring>
 #include <ctime>
 #include <limits>
+#include <queue>
+#include <utility>
 #include <vector>
 
 using executorch::aten::ScalarType;
@@ -72,21 +74,54 @@ inline int64_t time_in_us() {
 // every row it expands all 151936 codes into a float vector (608 KB of stores)
 // through a per-element dtype switch, then rescans that vector. Measured on
 // device at 0.42 ms/row against 0.080 ms/row here.
-inline void argmax_u16_rows(
-    const uint16_t* logits,
-    size_t vocab,
-    int rows,
-    std::vector<uint64_t>* out) {
-  out->assign(static_cast<size_t>(rows), 0);
-  for (int k = 0; k < rows; ++k) {
-    const uint16_t* row = logits + static_cast<size_t>(k) * vocab;
-    uint16_t best = 0;
-    for (size_t v = 0; v < vocab; ++v) {
-      if (row[v] > best) {
-        best = row[v];
-        (*out)[k] = static_cast<uint64_t>(v);
-      }
+inline uint64_t argmax_u16_row(const uint16_t* row, size_t vocab) {
+  uint16_t best = 0;
+  uint64_t arg = 0;
+  for (size_t v = 0; v < vocab; ++v) {
+    if (row[v] > best) {
+      best = row[v];
+      arg = static_cast<uint64_t>(v);
     }
+  }
+  return arg;
+}
+
+// Top-k of one row, descending, into `codes`/`ids` (both at least k long).
+// Seeded with the first k entries so the threshold is valid from the start, then
+// one pass where the common case is a single comparison against it.
+inline void topk_u16_row(
+    const uint16_t* row,
+    size_t vocab,
+    int k,
+    uint16_t* codes,
+    uint64_t* ids) {
+  for (int i = 0; i < k; ++i) {
+    codes[i] = row[i];
+    ids[i] = static_cast<uint64_t>(i);
+  }
+  for (int i = 1; i < k; ++i) {
+    uint16_t c = codes[i];
+    uint64_t d = ids[i];
+    int j = i - 1;
+    for (; j >= 0 && codes[j] < c; --j) {
+      codes[j + 1] = codes[j];
+      ids[j + 1] = ids[j];
+    }
+    codes[j + 1] = c;
+    ids[j + 1] = d;
+  }
+  for (size_t v = static_cast<size_t>(k); v < vocab; ++v) {
+    const uint16_t c = row[v];
+    if (c <= codes[k - 1]) {
+      continue;
+    }
+    int j = k - 2;
+    for (; j >= 0 && codes[j] < c; --j) {
+      codes[j + 1] = codes[j];
+      ids[j + 1] = ids[j];
+    }
+    codes[j + 1] = c;
+    ids[j + 1] = static_cast<uint64_t>(v);
   }
 }
 
@@ -641,13 +676,12 @@ void DFlashTokenGenerator::check_payload_dtype(
   }
 }
 
-// Quantize `count` draft hidden rows to the lm_head's u16 input encoding, run
-// lm_head.pte, then argmax each row on the host (QNN's own argmax is off by
-// +/-65536 on an axis this wide). Ties resolve to the lowest id via strict `>`.
-void DFlashTokenGenerator::decode_lm_head(
+// Quantize `rows` draft hidden rows to the lm_head's u16 input encoding, run
+// lm_head.pte, then keep each row's top-k as log-probs.
+void DFlashTokenGenerator::draft_topk(
     const float* hidden,
-    int32_t count,
-    std::vector<uint64_t>* out_tokens) {
+    int32_t rows,
+    int32_t k) {
   const int H = dflash_meta_.hidden_dim;
   const long lm_start_ms = time_in_ms();
   const int64_t t_head = time_in_us();
@@ -659,23 +693,106 @@ void DFlashTokenGenerator::decode_lm_head(
   quantize_f32_to_u16(
       hidden,
       reinterpret_cast<uint16_t*>(draft_hidden_u16_buf_),
-      static_cast<size_t>(count) * H,
+      static_cast<size_t>(rows) * H,
       logits_scale_,
       logits_zero_point_);
   run_lm_head(draft_hidden_u16_buf_);
   stage_us_[kDraftHead] += time_in_us() - t_head;
 
-  // uint16 logits (see target_verify_block); argmax directly on the raw codes.
   const int64_t t_pick = time_in_us();
   const long t_smp = time_in_ms();
-  argmax_u16_rows(
-      reinterpret_cast<const uint16_t*>(lm_head_logits_buf_),
-      static_cast<size_t>(lm_head_vocab_size_),
-      count,
-      out_tokens);
+  const size_t V = static_cast<size_t>(lm_head_vocab_size_);
+  const uint16_t* lg = reinterpret_cast<const uint16_t*>(lm_head_logits_buf_);
+  const float s = dflash_meta_.logit_out_scale;
+  draft_ids_.assign(static_cast<size_t>(rows) * k, 0);
+  draft_logp_.assign(static_cast<size_t>(rows) * k, 0.0f);
+  std::vector<uint16_t> codes(static_cast<size_t>(k));
+  for (int d = 0; d < rows; ++d) {
+    uint64_t* ids = draft_ids_.data() + static_cast<size_t>(d) * k;
+    float* logp = draft_logp_.data() + static_cast<size_t>(d) * k;
+    topk_u16_row(lg + static_cast<size_t>(d) * V, V, k, codes.data(), ids);
+    // The zero point cancels in a difference, so it never has to be known here;
+    // only the scale survives, and it is what turns a code gap into nats.
+    double sum = 0.0;
+    for (int i = 0; i < k; ++i) {
+      logp[i] = s * (static_cast<float>(codes[i]) - static_cast<float>(codes[0]));
+      sum += std::exp(static_cast<double>(logp[i]));
+    }
+    const float log_z = static_cast<float>(std::log(sum));
+    for (int i = 0; i < k; ++i) {
+      logp[i] -= log_z;
+    }
+  }
   sample_ms_ += static_cast<double>(time_in_ms() - t_smp);
   stage_us_[kDraftPick] += time_in_us() - t_pick;
   lm_head_time_ms_ += static_cast<double>(time_in_ms() - lm_start_ms);
+}
+
+// ---------------------------------------------------------------------------
+// DDTree — best-first over the product of the per-depth distributions.
+//
+// A node at depth d draws its token from depth d's own top-k, independent of
+// what was chosen above it. That independence is the whole reason this is free:
+// block diffusion already produced every depth's distribution in the one draft
+// forward, so a wider tree never costs another one (EAGLE-style trees need a
+// draft call per level -- see eagle_token_generator.cpp:1118).
+//
+// Popping order gives prefix closure for nothing: extending a path adds a
+// log-prob, which is <= 0, so a parent always outranks its children and is
+// always popped first. init_attention_mask depends on exactly that -- it builds
+// a node's mask row by copying its parent's, which must already be written.
+//
+// With k == 1 the sibling push never fires and this degenerates into the chain:
+// one argmax per depth, `depth_limit` nodes, single path. That is the whole
+// tree_budget == 0 path, so the chain runs the same code as the tree.
+// ---------------------------------------------------------------------------
+void DFlashTokenGenerator::build_tree(int32_t budget, int32_t depth_limit) {
+  struct Cand {
+    float logw;
+    int32_t parent; // slot
+    int32_t depth; // 1-based
+    int32_t rank;
+    bool operator<(const Cand& o) const {
+      return logw < o.logw; // priority_queue pops the greatest
+    }
+  };
+  const int32_t k = draft_topk_;
+  tree_.clear();
+  tree_children_.assign(static_cast<size_t>(budget) + 1, {});
+  auto logp = [&](int32_t depth, int32_t rank) {
+    return draft_logp_[static_cast<size_t>(depth - 1) * k + rank];
+  };
+
+  std::priority_queue<Cand> heap;
+  heap.push(Cand{logp(1, 0), 0, 1, 0});
+  while (!heap.empty() && static_cast<int32_t>(tree_.size()) < budget) {
+    const Cand c = heap.top();
+    heap.pop();
+    const uint64_t token =
+        draft_ids_[static_cast<size_t>(c.depth - 1) * k + c.rank];
+    const int32_t slot = static_cast<int32_t>(tree_.size()) + 1;
+    tree_.push_back(TreeNode{token, c.parent, c.depth});
+    tree_children_[c.parent].emplace_back(token, slot);
+    if (c.rank + 1 < k) {
+      heap.push(Cand{
+          c.logw - logp(c.depth, c.rank) + logp(c.depth, c.rank + 1),
+          c.parent,
+          c.depth,
+          c.rank + 1});
+    }
+    if (c.depth < depth_limit) {
+      heap.push(Cand{c.logw + logp(c.depth + 1, 0), slot, c.depth + 1, 0});
+    }
+  }
+}
+
+int32_t DFlashTokenGenerator::tree_child(int32_t parent, uint64_t token) const {
+  for (const auto& [tok, slot] : tree_children_[parent]) {
+    if (tok == token) {
+      return slot;
+    }
+  }
+  return -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -984,14 +1101,19 @@ void DFlashTokenGenerator::finish_prompt_seeding() {
 // ---------------------------------------------------------------------------
 // Target verify a block (chain / causal), read logits argmax + L hidden.
 // ---------------------------------------------------------------------------
-void DFlashTokenGenerator::target_verify_block(
-    const std::vector<uint64_t>& packed_tokens,
+void DFlashTokenGenerator::target_verify_tree(
     int64_t cur_pos,
-    std::vector<uint64_t>* target_sampled) {
+    uint64_t root_token) {
   const int64_t t_prep = time_in_us();
   const int ar = dflash_meta_.target_ar_len;
-  const int H = dflash_meta_.hidden_dim;
-  const int n = static_cast<int>(packed_tokens.size());
+  const int n = 1 + static_cast<int>(tree_.size());
+  ET_CHECK_MSG(n <= ar, "[DFlash] tree has %d nodes but ar_len is %d", n, ar);
+
+  std::vector<uint64_t> packed_tokens(static_cast<size_t>(n));
+  packed_tokens[0] = root_token;
+  for (size_t i = 0; i < tree_.size(); ++i) {
+    packed_tokens[i + 1] = tree_[i].token;
+  }
 
   // Headless decoder input[0] is embeds (u16), not token ids. Run emb.pte over
   // the packed block (padded rows read as token 0, exactly as the old raw-token
@@ -1003,12 +1125,21 @@ void DFlashTokenGenerator::target_verify_block(
   // u16 payload as f32 and destroy it.
   std::memcpy(input_toks_.data, emb_out_buf_, input_toks_.size);
 
+  // Siblings share a position: a node sits at cur_pos + its depth, so the tree's
+  // branches all overlay the same stretch of the sequence. Padded slots repeat
+  // the last real position rather than running off the RoPE table.
+  const int32_t last_depth = tree_.empty() ? 0 : tree_.back().depth;
   for (int k = 0; k < ar; ++k) {
-    input_pos_.data[k] = static_cast<int32_t>(cur_pos) + std::min(k, n - 1);
+    const int32_t depth = (k == 0) ? 0 : (k < n ? tree_[k - 1].depth : last_depth);
+    input_pos_.data[k] = static_cast<int32_t>(cur_pos) + depth;
   }
-  std::vector<int32_t> attention_map(ar);
-  for (int k = 0; k < ar; ++k) {
-    attention_map[k] = (k == 0) ? -1 : std::min(k - 1, n - 1);
+  // attention_map[k] = k's parent slot; init_attention_mask copies the parent's
+  // mask row and lights up k itself, which is exactly "see your ancestors and
+  // nobody else". Padded slots point at the root -- their outputs are dropped.
+  std::vector<int32_t> attention_map(ar, 0);
+  attention_map[0] = -1;
+  for (int k = 1; k < n; ++k) {
+    attention_map[k] = tree_[k - 1].parent;
   }
   kv_manager_->init_attention_mask(
       attention_mask_.data, attention_map, ar, static_cast<int32_t>(cur_pos));
@@ -1030,21 +1161,10 @@ void DFlashTokenGenerator::target_verify_block(
   target_verify_time_ms_ += static_cast<double>(time_in_ms() - start_ms);
   ++target_verify_calls_;
 
-  // lm_head.pte emits uint16 logits despite declaring the output Float; reading
-  // them as f32 gives all zeros, so pick straight off the codes. The sampler this
-  // replaces is built on the same lm_head vocab (runner.cpp:313) and breaks ties
-  // the same way, so at temperature 0 the tokens are identical -- and greedy is
-  // the only mode this generator has ever been correct in, since acceptance is an
-  // exact-match test and the draft side already hard-argmaxes.
-  const int64_t t_pick = time_in_us();
-  const long t_smp = time_in_ms();
-  argmax_u16_rows(
-      reinterpret_cast<const uint16_t*>(lm_head_logits_buf_),
-      static_cast<size_t>(lm_head_vocab_size_),
-      ar,
-      target_sampled);
-  sample_ms_ += static_cast<double>(time_in_ms() - t_smp);
-  stage_us_[kVerifyPick] += time_in_us() - t_pick;
+  // The logits stay in lm_head_logits_buf_. The caller walks the tree one node
+  // at a time and argmaxes only the rows it lands on -- typically ~4 of the 16,
+  // because a round commits accept_len tokens and the rest of the window is
+  // branches the target never reached.
 }
 
 // ---------------------------------------------------------------------------
@@ -1082,8 +1202,6 @@ Result<int64_t> DFlashTokenGenerator::generate(
   int64_t pending_pos_base = 0;
 
   std::vector<float> block_hidden;
-  std::vector<uint64_t> drafted;
-  std::vector<uint64_t> target_sampled;
 
   // See Metadata::shifted_decode. Shifted draws a prediction from every block row
   // and hands the target one more token to check; aligned throws row 0 away.
@@ -1095,6 +1213,25 @@ Result<int64_t> DFlashTokenGenerator::generate(
       "[DFlash] kv_forward appends %d rows/call but a round commits up to %d",
       draft_decode_ar_,
       n_draft + 1);
+
+  // The chain is the k=1 tree: no siblings to push, so the heap can only go
+  // deeper and lays down n_draft nodes in a single path. Running both through
+  // build_tree keeps one code path instead of two that must be kept in step.
+  const int32_t budget = dflash_meta_.tree_budget > 0
+      ? std::min(dflash_meta_.tree_budget, dflash_meta_.target_ar_len - 1)
+      : n_draft;
+  draft_topk_ = dflash_meta_.tree_budget > 0 ? std::min(budget, 64) : 1;
+  ET_CHECK_MSG(
+      dflash_meta_.tree_budget <= 0 || dflash_meta_.logit_out_scale > 0.0f,
+      "[DFlash] tree needs --dflash_logit_out_scale (lm_head output encoding)");
+  ET_LOG(
+      Info,
+      "[DFlash] draft %s: budget=%d topk=%d depth_limit=%d ar=%d",
+      dflash_meta_.tree_budget > 0 ? "tree" : "chain",
+      budget,
+      draft_topk_,
+      n_draft,
+      dflash_meta_.target_ar_len);
 
   const int64_t t_decode = time_in_us();
   while (cur_pos < static_cast<int64_t>(seq_len) - 1) {
@@ -1114,38 +1251,42 @@ Result<int64_t> DFlashTokenGenerator::generate(
 
     // Project the drafted hidden through lm_head.pte. hidden_row0 selects the
     // first predicting row (0 shifted, H aligned) and n_draft the count.
-    decode_lm_head(block_hidden.data() + hidden_row0, n_draft, &drafted);
+    draft_topk(block_hidden.data() + hidden_row0, n_draft, draft_topk_);
 
-    // What the target checks: the confirmed token followed by the draft's guesses.
-    std::vector<uint64_t> verify(static_cast<size_t>(n_draft) + 1);
-    verify[0] = last_committed;
-    for (int k = 0; k < n_draft; ++k) {
-      verify[k + 1] = drafted[k];
-    }
-    total_drafted_ += static_cast<uint64_t>(n_draft);
+    const int64_t t_tree = time_in_us();
+    build_tree(budget, n_draft);
+    stage_us_[kTreeBuild] += time_in_us() - t_tree;
+    total_drafted_ += tree_.size();
+    total_tree_nodes_ += tree_.size();
+    total_tree_depth_ += tree_.empty() ? 0 : tree_.back().depth;
 
-    // --- VERIFY: target runs the whole block causally ---
-    target_verify_block(verify, cur_pos, &target_sampled);
+    // --- VERIFY: one target forward over the whole tree ---
+    target_verify_tree(cur_pos, last_committed);
 
-    // Verify slot k predicts slot k+1, so target_sampled[k] is what the target
-    // would have put where the draft put verify[k+1].
+    // Accept the longest prefix of the target's own continuation that the tree
+    // happens to contain: read the target's argmax at a node, step to that child
+    // if it exists, stop when it does not. Lazy on purpose -- only the nodes on
+    // this path get argmaxed, not all ar of them.
     const int64_t t_acc = time_in_us();
-    int accepted = 0;
-    for (int k = 0; k < n_draft; ++k) {
-      if (verify[k + 1] == target_sampled[k]) {
-        ++accepted;
-      } else {
-        break;
-      }
+    const size_t V = static_cast<size_t>(lm_head_vocab_size_);
+    const uint16_t* lg = reinterpret_cast<const uint16_t*>(lm_head_logits_buf_);
+    std::vector<int32_t> path{0};
+    uint64_t bonus = argmax_u16_row(lg, V);
+    for (int32_t child = tree_child(0, bonus); child >= 0;
+         child = tree_child(path.back(), bonus)) {
+      path.push_back(child);
+      bonus = argmax_u16_row(lg + static_cast<size_t>(child) * V, V);
     }
-    uint64_t bonus = target_sampled[accepted];
+    const int accepted = static_cast<int>(path.size()) - 1;
     stage_us_[kVerifyPick] += time_in_us() - t_acc;
 
-    // --- COMMIT target KV for slots [0..accepted] ---
+    // --- COMMIT the accepted slots' target KV ---
+    // A tree path lands on scattered columns, not 0..accepted, so update_cache
+    // gathers them -- the same job the reference calls compact_dynamic_cache.
     const int64_t t_commit = time_in_us();
     std::vector<bool> selected(static_cast<size_t>(dflash_meta_.target_ar_len), false);
-    for (int k = 0; k <= accepted; ++k) {
-      selected[static_cast<size_t>(k)] = true;
+    for (int32_t slot : path) {
+      selected[static_cast<size_t>(slot)] = true;
     }
     kv_manager_->update_cache(
         dflash_meta_.target_ar_len,
@@ -1160,17 +1301,21 @@ Result<int64_t> DFlashTokenGenerator::generate(
     stage_us_[kCommit] += time_in_us() - t_commit;
 
     // --- stage the accepted tokens' hidden for the next draft call ---
+    // Same scatter as the KV: read the path's slots, not the leading rows. What
+    // the draft receives is still a chain at consecutive positions from cur_pos,
+    // so nothing downstream of here knows a tree was involved.
     const int64_t t_cp = time_in_us();
     pending_rows = accepted + 1;
     pending_pos_base = cur_pos;
     for (int k = 0; k < pending_rows; ++k) {
+      const size_t src_row = static_cast<size_t>(path[k]);
       float* dst = stage_buf_.data() + static_cast<size_t>(k) * LH;
       for (int l = 0; l < L; ++l) {
         for (int h = 0; h < H; ++h) {
           dst[l * H + h] = read_scalar(
               target_hidden_bufs_[l].data(),
               target_hidden_dtypes_[l],
-              static_cast<size_t>(k) * H + h);
+              src_row * H + h);
         }
       }
     }
@@ -1194,13 +1339,14 @@ Result<int64_t> DFlashTokenGenerator::generate(
     uint64_t prev = last_committed;
     bool hit_eos = false;
     for (int k = 1; k <= accepted; ++k) {
-      token_callback(ET_UNWRAP_TOKENIZER(tokenizer_->decode(prev, verify[k])));
-      if (eos_ids_->count(verify[k]) > 0) {
+      const uint64_t tok = tree_[static_cast<size_t>(path[k]) - 1].token;
+      token_callback(ET_UNWRAP_TOKENIZER(tokenizer_->decode(prev, tok)));
+      if (eos_ids_->count(tok) > 0) {
         cur_pos += k;
         hit_eos = true;
         break;
       }
-      prev = verify[k];
+      prev = tok;
     }
     if (hit_eos) {
       stage_us_[kEmit] += time_in_us() - t_emit;
@@ -1252,6 +1398,19 @@ Result<int64_t> DFlashTokenGenerator::generate(
         lm_head_exec_ms_,
         static_cast<unsigned long long>(lm_head_calls_),
         sample_ms_);
+
+    // Tree shape. Depth well below the budget means breadth is winning the
+    // allocation, which is the whole point; depth pinned at the block horizon
+    // means the budget is too small to branch and the tree is just a chain.
+    ET_LOG(
+        Info,
+        "[DFlash] tree: budget=%d topk=%d nodes/round=%.2f max_depth/round=%.2f",
+        budget,
+        draft_topk_,
+        static_cast<double>(total_tree_nodes_) /
+            static_cast<double>(target_verify_calls_),
+        static_cast<double>(total_tree_depth_) /
+            static_cast<double>(target_verify_calls_));
 
     // Per-round stage breakdown. One line per stage so it parses with a regex,
     // and an `other` row carrying whatever the stages failed to claim -- without

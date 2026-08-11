@@ -115,7 +115,9 @@ Runner::Runner(
     int block_size,
     int dflash_max_context_len,
     std::unique_ptr<executorch::extension::Module> dflash_emb_module,
-    std::unique_ptr<executorch::extension::Module> dflash_lm_head_module)
+    std::unique_ptr<executorch::extension::Module> dflash_lm_head_module,
+    int dflash_tree_budget,
+    float dflash_logit_out_scale)
     : module_(std::move(module)),
       attention_sink_rope_module_(std::move(attention_sink_rope_module)),
       eagle_head_module_(std::move(eagle_head_module)),
@@ -131,6 +133,8 @@ Runner::Runner(
       dflash_lm_head_module_(std::move(dflash_lm_head_module)),
       block_size_(block_size),
       dflash_max_context_len_(dflash_max_context_len),
+      dflash_tree_budget_(dflash_tree_budget),
+      dflash_logit_out_scale_(dflash_logit_out_scale),
       ngram_(ngram),
       window_(window),
       gcap_(gcap),
@@ -765,6 +769,8 @@ Error Runner::load() {
         /*mask_token_id=*/mask_token_id,
         /*shifted_decode=*/shifted_decode,
         /*drop_sink=*/drop_sink,
+        /*tree_budget=*/dflash_tree_budget_,
+        /*logit_out_scale=*/dflash_logit_out_scale_,
     };
 
     auto dflash_gen = std::make_unique<DFlashTokenGenerator>(
