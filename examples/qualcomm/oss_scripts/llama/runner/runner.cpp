@@ -361,6 +361,34 @@ Error Runner::load() {
         std::lround(read_dec_double("get_embeds_zero_point", 0.0)));
     dflash_logits_scale =
         static_cast<float>(read_dec_double("get_logits_scale", 1.0));
+    // The lm_head's OUTPUT encoding, needed only by the draft tree. 0 means the pte
+    // predates the getter, in which case the CLI value stands -- and the tree is the
+    // one consumer that cannot detect a wrong value, so say so out loud.
+    const double pte_out_scale = read_dec_double("get_logits_out_scale", 0.0);
+    if (dflash_logit_out_scale_ > 0.0f) {
+      // Explicit CLI wins, which is what "override" has to mean; a pte that
+      // disagrees is worth saying out loud, because passing another build's scale
+      // is precisely the mistake this getter exists to prevent.
+      if (pte_out_scale > 0.0 &&
+          std::fabs(pte_out_scale - dflash_logit_out_scale_) >
+              1e-6 * pte_out_scale) {
+        ET_LOG(
+            Error,
+            "[DFlash] --dflash_logit_out_scale %g overrides the pte's %g. Only do "
+            "this deliberately: the tree is the one consumer that cannot detect a "
+            "wrong value, it just quietly accepts less.",
+            dflash_logit_out_scale_,
+            pte_out_scale);
+      }
+    } else if (pte_out_scale > 0.0) {
+      dflash_logit_out_scale_ = static_cast<float>(pte_out_scale);
+    } else if (dflash_tree_budget_ > 0) {
+      ET_LOG(
+          Error,
+          "[DFlash] no lm_head output scale: the pte predates get_logits_out_scale "
+          "and none was passed. Read it off qdq_lm_head.pt2 and pass "
+          "--dflash_logit_out_scale, or rebuild.");
+    }
     dflash_logits_zp = static_cast<int32_t>(
         std::lround(read_dec_double("get_logits_zero_point", 0.0)));
 

@@ -473,14 +473,26 @@ class DFlashDraftModel(nn.Module):
                 layer.mlp.down_proj.weight.copy_(sd[p + "mlp.down_proj.weight"].float())
 
 
-def load_dflash_config(ckpt_dir: str) -> DFlashConfig:
-    return DFlashConfig(json.load(open(os.path.join(ckpt_dir, "config.json"))))
+def load_dflash_config(ckpt_dir: str, drop_sink: bool = False) -> DFlashConfig:
+    """`drop_sink` overrides the checkpoint's own setting when True.
+
+    It lives on the command line as well as in the checkpoint because the
+    checkpoint directory is a downloaded artifact nobody tracks: flipping it there
+    to build a variant leaves the recipe unreproducible, with the pte's metadata as
+    the only surviving record of what was built.
+    """
+    raw = json.load(open(os.path.join(ckpt_dir, "config.json")))
+    if drop_sink:
+        raw.setdefault("dflash_config", raw)["drop_sink"] = True
+    return DFlashConfig(raw)
 
 
-def load_dflash_checkpoint(ckpt_dir: str) -> Tuple[dict, DFlashConfig]:
+def load_dflash_checkpoint(
+    ckpt_dir: str, drop_sink: bool = False
+) -> Tuple[dict, DFlashConfig]:
     from safetensors.torch import load_file
 
-    cfg = load_dflash_config(ckpt_dir)
+    cfg = load_dflash_config(ckpt_dir, drop_sink)
     st = os.path.join(ckpt_dir, "model.safetensors")
     sd = load_file(st) if os.path.exists(st) else torch.load(
         os.path.join(ckpt_dir, "pytorch_model.bin"), map_location="cpu"
@@ -601,7 +613,7 @@ class DFlashCalibrator:
     """
 
     def __init__(self, draft, cfg, tok_embedding, lm_head, max_context_len, ar,
-                 target_ar, token_dtype):
+                 target_ar, token_dtype, tree=False):
         self.draft = draft
         self.cfg = cfg
         self.tok_embedding = tok_embedding
@@ -611,6 +623,10 @@ class DFlashCalibrator:
         # only new_context / context_pos follow the draft's append length.
         self.target_ar = target_ar
         self.token_dtype = token_dtype
+        # Whether the target verifies a tree. The draft is unaffected either way --
+        # it only ever sees the accepted chain -- but the target's observers must
+        # see the tree-shaped mask and repeated positions it will get at inference.
+        self.tree = tree
         self.B = self.block_size = cfg.block_size
         self.drop_sink = cfg.drop_sink
         self.n_draft = self.B if cfg.shifted_decode else self.B - 1
@@ -665,8 +681,14 @@ class DFlashCalibrator:
         block = [self.cfg.mask_token_id or 0] * self.B
         self._forward(block, rows, n_new, ctx_pos_base, ctx_pos_base + n_new)
 
-    def draft_block(self, committed, rows, n_new, ctx_pos_base, cur_pos):
-        """One speculative round: append last round's accepted rows, then draft."""
+    def draft_block(self, committed, rows, n_new, ctx_pos_base, cur_pos, topk=1):
+        """One speculative round: append last round's accepted rows, then draft.
+
+        Returns each drafted depth's top-k as (log-probs, ids). k=1 is the chain.
+        Log-probs rather than logits because the tree compares paths of different
+        depths; the lm_head here is fake-quantized but still float, so this can
+        normalize over the full vocab instead of the runner's top-k approximation.
+        """
         block = [self.cfg.mask_token_id or 0] * self.B
         block[0] = committed
         hidden = self._forward(block, rows, n_new, ctx_pos_base, cur_pos)
@@ -674,10 +696,8 @@ class DFlashCalibrator:
         padded[0, : self.B] = hidden[0]
         logits = self.lm_head(padded)
         self.rounds += 1
-        return [
-            int(logits[0, self.hidden_row0 + k].argmax())
-            for k in range(self.n_draft)
-        ]
+        rows_out = logits[0, self.hidden_row0 : self.hidden_row0 + self.n_draft]
+        return rows_out.float().log_softmax(-1).topk(topk, dim=-1)
 
 
 class DFlashDraftCompiler(Component):
@@ -699,7 +719,7 @@ class DFlashDraftCompiler(Component):
     ):
         self.control_args = control_args
         self.config = config
-        sd, cfg = load_dflash_checkpoint(ckpt_dir)
+        sd, cfg = load_dflash_checkpoint(ckpt_dir, control_args.dflash_drop_sink)
         self.dflash_cfg = cfg
         self.prefill_ar = prefill_ar
 
@@ -827,7 +847,7 @@ class DFlashDraftCompiler(Component):
             )
         self.prepared = True
 
-    def make_calibrator(self, tok_embedding, lm_head, target_ar, token_dtype):
+    def make_calibrator(self, tok_embedding, lm_head, target_ar, token_dtype, tree=False):
         """Bind the prepared decode graph to the target's emb/lm_head for the joint
         loop. Only the decode graph is driven: prefill's encodings are overwritten
         from decode in `quantize`, exactly as the target does."""
@@ -842,6 +862,7 @@ class DFlashDraftCompiler(Component):
             self.decode_input[2].shape[1],
             target_ar,
             token_dtype,
+            tree,
         )
         return self.calibrator
 
@@ -1028,7 +1049,7 @@ class DFlashManager(Component):
         )
 
         ckpt = control_args.dflash_draft_checkpoint
-        cfg = load_dflash_config(ckpt)
+        cfg = load_dflash_config(ckpt, control_args.dflash_drop_sink)
         max_ctx = (
             getattr(control_args, "dflash_max_context_len", 0)
             or control_args.max_context_len

@@ -98,8 +98,15 @@ def process_model_args(
             else:
                 ar_len = next_power_of_two(control_args.draft_len + 1)
         elif control_args.model_mode == "dflash":
-            # Target verifies a whole draft block per step.
-            ar_len = next_power_of_two(control_args.block_size)
+            # Target verifies a whole draft block per step -- or, with a draft tree,
+            # a whole tree. Not rounded to a power of two like the other modes: the
+            # node count IS the cost here (0.44 ms per verify slot), so rounding 96
+            # up to 128 would buy 32 slots the tree never fills.
+            ar_len = (
+                max(control_args.block_size, control_args.dflash_tree_nodes)
+                if control_args.dflash_tree_nodes > 0
+                else next_power_of_two(control_args.block_size)
+            )
         else:
             ar_len = 1
     else:

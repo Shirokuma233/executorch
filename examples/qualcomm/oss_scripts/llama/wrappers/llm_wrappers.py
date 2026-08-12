@@ -466,6 +466,34 @@ class TextDecoder(Component):
                             self.meta["get_logits_zero_point"] = output_node.args[2]
                             break
 
+    def _save_lm_head_output_quant_attrs(self):
+        """The lm_head's OUTPUT (logits) encoding, so the runner is not told it by hand.
+
+        Only the draft tree reads it: a tree scores paths by summing log-probs across
+        DEPTHS, and this scale is what turns a code gap into nats -- i.e. it decides
+        how the node budget splits between depth and breadth. Chain decoding never
+        touches it, because argmax is scale-invariant. That asymmetry is exactly why
+        it has to ship in the pte: a wrong value cannot fail, it can only quietly cost
+        acceptance, and it moves per build (0.001559 for b16_joint, 0.001439 for
+        tree32).
+        """
+        for node in self.lm_head.graph.nodes:
+            if node.op != "output":
+                continue
+            for out in node.args[0]:
+                if (
+                    out.target
+                    == torch.ops.quantized_decomposed.dequantize_per_tensor.default
+                ):
+                    self.meta["get_logits_out_scale"] = out.args[1]
+                    self.meta["get_logits_out_zero_point"] = out.args[2]
+                    logging.info(
+                        "lm_head output encoding: scale=%s zp=%s",
+                        out.args[1],
+                        out.args[2],
+                    )
+                    return
+
     def _save_embeds_quant_attrs(self):
         # headless emb-split: read the tok_embedding output (embeds) quant scale/zp so it
         # can be injected onto the decoder's inputs_embeds input, making emb->decoder a
@@ -743,6 +771,7 @@ class TextDecoder(Component):
                 torch.int64
                 if self.control_args.embedding_quantize is not None
                 else torch.int32,
+                self.control_args.dflash_tree_nodes > 0,
             )
             # `event` gates the post-convert re-run: that pass exists for error
             # analysis and would drive the draft's cache a second time.
@@ -1076,6 +1105,7 @@ class TextDecoder(Component):
 
             if split_lm_head:
                 self.lm_head = convert_pt2e(self.lm_head)
+                self._save_lm_head_output_quant_attrs()
 
             # Dump the decode (AR) QDQ graphs so a host script can run the full
             # DFlash accept loop on CPU. Only the decode graphs carry the real

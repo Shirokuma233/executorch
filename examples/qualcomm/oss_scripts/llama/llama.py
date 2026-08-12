@@ -815,6 +815,28 @@ def _build_parser():
         "draft is quantized to 16a4w, calibrated on the quantized target's hidden.",
     )
     parser.add_argument(
+        "--dflash_drop_sink",
+        action="store_true",
+        help="[DFlash mode] Keep the sink token's hidden state out of the draft's "
+        "context (position 0 is where the model parks attention mass; it costs the "
+        "whole per-tensor quantization range and carries almost nothing the draft "
+        "can use). Overrides the checkpoint's own drop_sink. It is a flag and not "
+        "only a checkpoint field because the checkpoint directory is untracked: "
+        "flipping it there to build a variant leaves no reproducible recipe.",
+    )
+    parser.add_argument(
+        "--dflash_tree_nodes",
+        default=0,
+        type=int,
+        help="[DFlash mode] Verify a draft TREE of this many nodes instead of a "
+        "chain, and size the target's decode ar_len to match. 0 (default) keeps "
+        "the chain at ar_len = next_power_of_two(block_size). The draft is "
+        "untouched either way -- it still drafts block_size-1 positions and still "
+        "only ever ingests the accepted chain -- but the target's observers have "
+        "to see the tree-shaped mask and repeated positions they will get at "
+        "inference, so this has to be set at compile time, not just at runtime.",
+    )
+    parser.add_argument(
         "--block_size",
         default=16,
         type=int,

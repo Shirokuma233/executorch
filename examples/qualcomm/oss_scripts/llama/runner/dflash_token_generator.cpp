@@ -1226,12 +1226,13 @@ Result<int64_t> DFlashTokenGenerator::generate(
       "[DFlash] tree needs --dflash_logit_out_scale (lm_head output encoding)");
   ET_LOG(
       Info,
-      "[DFlash] draft %s: budget=%d topk=%d depth_limit=%d ar=%d",
+      "[DFlash] draft %s: budget=%d topk=%d depth_limit=%d ar=%d logit_scale=%g",
       dflash_meta_.tree_budget > 0 ? "tree" : "chain",
       budget,
       draft_topk_,
       n_draft,
-      dflash_meta_.target_ar_len);
+      dflash_meta_.target_ar_len,
+      dflash_meta_.logit_out_scale);
 
   const int64_t t_decode = time_in_us();
   while (cur_pos < static_cast<int64_t>(seq_len) - 1) {

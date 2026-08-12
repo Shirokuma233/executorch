@@ -69,16 +69,21 @@ KVManager::KVManager(Metadata metadata, std::unique_ptr<MethodMeta> method_meta)
   Result<TensorInfo> attention_mask = method_meta->input_tensor_meta(1);
   attention_mask_dtype_ = attention_mask->scalar_type();
 
-  // inputs are [input_tokens, attention_mask, (sliding window attention_mask),
-  // (input_pos), kv_caches] search kv_cache in inputs
+  // Find the kv_cache inputs by SHAPE, not by byte count. Byte count needs the
+  // cache length, and there is no single right one to compare against: this
+  // manager serves two graphs whose ar's differ, so their caches differ too
+  // (dflash at tree width: prefill 992, decode 960), and inferring it from the
+  // attention mask fails on the draft, whose mask is [1, B, Cc+ar+B] rather than
+  // [1, ar, context_len]. The shapes are unambiguous on their own:
+  //   k_cache [1, n_heads, head_dim, L]      v_cache [1, n_heads, L, head_dim]
+  // and nothing else in any of these graphs is rank 4.
   for (int i = 2; i < method_meta->num_inputs(); i++) {
     Result<TensorInfo> tensor_meta = method_meta->input_tensor_meta(i);
-    // k_cache: [1, n_heads, head_dim, seq_len]
-    size_t tensor_nbytes = tensor_meta->nbytes();
-    size_t expected_tensor_nbytes = metadata_.head_dim * metadata_.num_heads *
-        metadata_.max_cache_len * getDtypeSize(tensor_meta->scalar_type());
-    if (tensor_nbytes != expected_tensor_nbytes) {
-      // Not a kv_cache tensor (e.g. input_pos, sliding window attention mask).
+    auto sizes = tensor_meta->sizes();
+    const bool is_kv_cache = sizes.size() == 4 && sizes[0] == 1 &&
+        sizes[1] == metadata_.num_heads &&
+        (sizes[2] == metadata_.head_dim || sizes[3] == metadata_.head_dim);
+    if (!is_kv_cache) {
       continue;
     }
     if (kv_cache_dtype_ == executorch::aten::ScalarType::Undefined) {

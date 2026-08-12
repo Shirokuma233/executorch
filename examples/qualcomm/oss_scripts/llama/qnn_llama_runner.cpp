@@ -145,12 +145,13 @@ DEFINE_int32(
     "target_ar_len - 1, since the verify window is compiled, not configurable.");
 DEFINE_double(
     dflash_logit_out_scale,
-    0.0015587152447551489,
-    "[DFlash Decoding] lm_head OUTPUT logit encoding scale. Only the tree needs "
-    "it: scoring a path sums log-probs across depths, and this scale is what "
-    "makes a depth look peaked or flat, i.e. how the budget splits between depth "
-    "and breadth. The lm_head pte carries no getters, hence a flag; the default "
-    "is build b16_joint's value, read off qdq_lm_head.pt2.");
+    0.0,
+    "[DFlash Decoding] Override the lm_head OUTPUT logit encoding scale. 0 (the "
+    "default) takes it from the pte's get_logits_out_scale. Only the tree reads "
+    "it: scoring a path sums log-probs across DEPTHS, so this scale decides how "
+    "peaked a depth looks and therefore how the budget splits between depth and "
+    "breadth. Pass it only for ptes built before the getter existed -- read the "
+    "real value off that build's qdq_lm_head.pt2, never another build's.");
 DEFINE_string(
     dflash_emb_pte_path,
     "",

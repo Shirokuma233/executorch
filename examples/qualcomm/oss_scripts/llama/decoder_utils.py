@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import heapq
 import logging
 from collections import defaultdict, OrderedDict
 from dataclasses import dataclass
@@ -515,9 +516,16 @@ def _prefill_chunking(
                     [h[0, :num_tokens_in_chunk] for h in _eagle_extra], dim=-1
                 )
                 skip = 1 if (dflash_config.drop_sink and pos == 0) else 0
-                n_ctx = num_tokens_in_chunk - skip
-                if n_ctx > 0 and dflash_config.can_append(n_ctx):
-                    dflash_config.seed(rows[skip:], n_ctx, pos + skip)
+                # The draft's new_context is [1, draft_ar, .], so it cannot swallow
+                # a target chunk in one call once the two ar's diverge -- which they
+                # do as soon as the target widens for a tree.
+                base = pos + skip
+                for off in range(0, num_tokens_in_chunk - skip, dflash_config.ar):
+                    n_ctx = min(dflash_config.ar, num_tokens_in_chunk - skip - off)
+                    if n_ctx > 0 and dflash_config.can_append(n_ctx):
+                        dflash_config.seed(
+                            rows[skip + off : skip + off + n_ctx], n_ctx, base + off
+                        )
 
             # Update the pos, KV cache and attention mask.
             pos, k_caches, v_caches = smart_mask_updater(
@@ -536,6 +544,63 @@ def _prefill_chunking(
         )
 
         return pos, last_input_sample
+
+
+def build_ddtree(logp, ids, budget: int, depth_limit: int):
+    """DDTree: best-first over the product of the per-depth draft distributions.
+
+    A node at depth d draws from depth d's own top-k regardless of what was chosen
+    above it -- block diffusion produced every depth in the one draft forward, so
+    the tree is free no matter how wide it gets. Adding a depth only ever lowers a
+    path's score, so a parent is always popped before its children, which is what
+    lets slot k copy its parent's attention row.
+
+    With k == 1 no sibling is ever pushed and this lays down `depth_limit` nodes in
+    a single path: the plain chain, same code.
+
+    Returns (tokens, parents, depths, children) with one entry per non-root node;
+    slot indices are 1-based because slot 0 is the confirmed token.
+    """
+    k = logp.shape[1]
+    heap = [(-float(logp[0, 0]), 0, 1, 0)]  # (-logw, parent slot, depth, rank)
+    tokens, parents, depths = [], [], []
+    children = [dict()]
+    while heap and len(tokens) < budget:
+        neg_w, parent, depth, rank = heapq.heappop(heap)
+        token = int(ids[depth - 1, rank])
+        slot = len(tokens) + 1
+        tokens.append(token)
+        parents.append(parent)
+        depths.append(depth)
+        children.append(dict())
+        children[parent][token] = slot
+        if rank + 1 < k:
+            sib = -neg_w - float(logp[depth - 1, rank]) + float(logp[depth - 1, rank + 1])
+            heapq.heappush(heap, (-sib, parent, depth, rank + 1))
+        if depth < depth_limit:
+            heapq.heappush(heap, (neg_w - float(logp[depth, 0]), slot, depth + 1, 0))
+    return tokens, parents, depths, children
+
+
+def _write_tree_mask(atten_mask, parents, n_nodes: int, ar_len: int):
+    """Overwrite the new-token block of the attention mask with the tree topology.
+
+    Only the last ar_len columns -- the cache half is what smart_mask_update
+    maintains and it stays "everything committed so far". A node sees its
+    ancestors and itself, built by inheriting its parent's row, which is legal
+    because build_ddtree emits parents before children. Padded slots see the root
+    alone; their outputs are dropped either way.
+    """
+    vis = torch.zeros(ar_len, ar_len, dtype=torch.bool)
+    vis[0, 0] = True
+    for slot in range(1, n_nodes):
+        vis[slot] = vis[parents[slot - 1]]
+        vis[slot, slot] = True
+    for slot in range(n_nodes, ar_len):
+        vis[slot] = vis[0]
+    block = torch.where(vis, 0.0, -255.0)
+    for mask in atten_mask.masks:
+        mask.mask[:, :, -ar_len:] = block
 
 
 def _generate_dflash(
@@ -567,22 +632,46 @@ def _generate_dflash(
     last_committed = total_token_list[-1]
     pending = (None, 0, 0)  # rows, count, position of the first row
     accepted_total = 0
+    # The verify window is ar_len wide, so it holds the confirmed token plus
+    # ar_len - 1 drafted nodes. Chain calibration is the k=1 case of the same
+    # tree, which is why there is only one loop below.
+    budget = ar_len - 1
+    topk = min(budget, 64) if dflash_config.tree else 1
+    logging.info(
+        "dflash calibration: %s ar_len=%d budget=%d topk=%d depth_limit=%d",
+        "tree" if dflash_config.tree else "chain",
+        ar_len,
+        budget,
+        topk,
+        n_draft,
+    )
     with torch.no_grad():
         while cur_pos + B < max_cache_len:
             rows, n_new, pos_base = pending
-            drafted = dflash_config.draft_block(
-                last_committed, rows, n_new, pos_base, cur_pos
+            logp, ids = dflash_config.draft_block(
+                last_committed, rows, n_new, pos_base, cur_pos, topk
             )
-            verify = [last_committed] + drafted
+            tokens, parents, depths, children = build_ddtree(
+                logp, ids, budget, n_draft
+            )
+            n_nodes = 1 + len(tokens)
+
             vtok = torch.zeros((1, ar_len), dtype=inputs.input_ids_dtype)
-            vtok[0, : len(verify)] = torch.tensor(
-                verify, dtype=inputs.input_ids_dtype
-            )
-            # Padded slots repeat the last real position: an out-of-range RoPE index
+            vtok[0, 0] = last_committed
+            if tokens:
+                vtok[0, 1:n_nodes] = torch.tensor(
+                    tokens, dtype=inputs.input_ids_dtype
+                )
+            # Siblings share a position -- a node sits at cur_pos + its depth.
+            # Padded slots repeat the last real one: an out-of-range RoPE index
             # would be a second, invisible difference from the device.
             vpos = torch.zeros((1, ar_len), dtype=torch.int32)
+            last_depth = depths[-1] if depths else 0
             for k in range(ar_len):
-                vpos[0, k] = cur_pos + min(k, len(verify) - 1)
+                d = 0 if k == 0 else (depths[k - 1] if k < n_nodes else last_depth)
+                vpos[0, k] = cur_pos + d
+            _write_tree_mask(inputs.atten_mask, parents, n_nodes, ar_len)
+
             logits, new_k_caches, new_v_caches, *captured = module(
                 vtok, *inputs.atten_mask, vpos, *k_caches, *v_caches
             )
@@ -593,17 +682,20 @@ def _generate_dflash(
                 *k_caches,
                 *v_caches,
             )
-            # Slot k predicts slot k+1, so sampled[k] is what the target would have
-            # put where the draft put verify[k+1].
-            sampled = [int(logits[0, k].argmax()) for k in range(len(verify))]
-            accepted = 0
-            for k in range(n_draft):
-                if verify[k + 1] == sampled[k]:
-                    accepted += 1
-                else:
-                    break
+            # Walk the target's own continuation down the tree for as long as the
+            # tree has it, the same rule the runner applies.
+            path = [0]
+            bonus = int(logits[0, 0].argmax())
+            while bonus in children[path[-1]]:
+                path.append(children[path[-1]][bonus])
+                bonus = int(logits[0, path[-1]].argmax())
+            accepted = len(path) - 1
             n_commit = accepted + 1
+
             pos_base = cur_pos
+            # A tree path lands on scattered slots, so the KV rows have to be
+            # gathered rather than sliced -- lade_token_offset is the same hook
+            # lookahead uses for the same reason.
             cur_pos, k_caches, v_caches = smart_mask_updater(
                 n_commit,
                 inputs.atten_mask,
@@ -612,22 +704,24 @@ def _generate_dflash(
                 v_caches,
                 new_k_caches,
                 new_v_caches,
+                lade_token_offset=path,
             )
             pending = (
-                torch.cat([h[0, :n_commit] for h in captured], dim=-1),
+                torch.cat([h[0, path] for h in captured], dim=-1),
                 n_commit,
                 pos_base,
             )
             accepted_total += accepted
             hit_eos = False
             for k in range(1, n_commit):
-                total_token_list.append(verify[k])
-                if verify[k] == tokenizer.eos_id:
+                tok = tokens[path[k] - 1]
+                total_token_list.append(tok)
+                if tok == tokenizer.eos_id:
                     hit_eos = True
                     break
             if hit_eos:
                 break
-            last_committed = sampled[accepted]
+            last_committed = bonus
             total_token_list.append(last_committed)
             if last_committed == tokenizer.eos_id:
                 break
@@ -891,7 +985,15 @@ def kv_inference(  # noqa: C901
     _, atten_mask, _, k_caches, v_caches = get_example_inputs()
 
     # TODO: change criteria & support batch inputs if necessary
-    all_pos = torch.arange(0, max_seq_len, 1, dtype=torch.int32).unsqueeze(0)
+    # Sized by the context, not by max_seq_len: max_seq_len bounds how much to
+    # GENERATE, but the loop commits a chunk at a time and so overshoots it by up to
+    # ar_len, and then indexes positions that exist in the sequence but not in this
+    # table. An arange costs nothing, so give it the whole context and let the
+    # generation bound be enforced where it is actually meant -- the loop condition.
+    max_cache_len = k_caches[0].size(-1)
+    all_pos = torch.arange(
+        0, max(max_seq_len, max_cache_len + ar_len), 1, dtype=torch.int32
+    ).unsqueeze(0)
 
     prompt_token_list, total_token_list, result_logits = [], [], []
 
