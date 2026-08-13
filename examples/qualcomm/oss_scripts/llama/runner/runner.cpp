@@ -289,9 +289,12 @@ Error Runner::load() {
   // the true vocab and both the prompt processor and the generator can bind them.
   const bool dflash = (eval_mode_ == EvalMode::kDFlashDecoding);
   std::unique_ptr<MethodMeta> dflash_emb_kv_meta, dflash_emb_prefill_meta,
-      dflash_lm_kv_meta, dflash_lm_prefill_meta;
+      dflash_lm_kv_meta, dflash_lm_prefill_meta, dflash_emb_draft_meta,
+      dflash_lm_draft_meta;
   float dflash_embeds_scale = 1.0f, dflash_logits_scale = 1.0f;
   int32_t dflash_embeds_zp = 0, dflash_logits_zp = 0;
+  float dflash_draft_hidden_scale = 0.0f, dflash_draft_logit_out_scale = 0.0f;
+  int32_t dflash_draft_hidden_zp = 0;
   if (dflash) {
     ET_CHECK_MSG(
         dflash_emb_module_ != nullptr && dflash_lm_head_module_ != nullptr,
@@ -313,6 +316,18 @@ Error Runner::load() {
         ET_UNWRAP(dflash_lm_head_module_->method_meta("lm_head_kv_forward")));
     dflash_lm_prefill_meta = std::make_unique<MethodMeta>(
         ET_UNWRAP(dflash_lm_head_module_->method_meta("lm_head_prefill_forward")));
+    // The block_size-wide views the draft calls. Optional: ptes built before the
+    // split have only the two above, and the generator falls back to them.
+    if (dflash_emb_module_->load_method("tok_embedding_draft_forward") ==
+        Error::Ok) {
+      dflash_emb_draft_meta = std::make_unique<MethodMeta>(ET_UNWRAP(
+          dflash_emb_module_->method_meta("tok_embedding_draft_forward")));
+    }
+    if (dflash_lm_head_module_->load_method("lm_head_draft_forward") ==
+        Error::Ok) {
+      dflash_lm_draft_meta = std::make_unique<MethodMeta>(
+          ET_UNWRAP(dflash_lm_head_module_->method_meta("lm_head_draft_forward")));
+    }
     // The true target vocab lives on the lm_head output, not decoder output[0].
     vocab_size =
         static_cast<int32_t>(dflash_lm_kv_meta->output_tensor_meta(0)->sizes()[2]);
@@ -391,6 +406,21 @@ Error Runner::load() {
     }
     dflash_logits_zp = static_cast<int32_t>(
         std::lround(read_dec_double("get_logits_zero_point", 0.0)));
+    // The draft-width lm_head's own encodings. Only meaningful alongside that
+    // graph, so a pte with the getters but no graph (or the reverse) falls back
+    // together with the graph selection in the generator.
+    dflash_draft_hidden_scale =
+        static_cast<float>(read_dec_double("get_draft_hidden_scale", 0.0));
+    dflash_draft_hidden_zp = static_cast<int32_t>(
+        std::lround(read_dec_double("get_draft_hidden_zero_point", 0.0)));
+    dflash_draft_logit_out_scale =
+        static_cast<float>(read_dec_double("get_draft_logits_out_scale", 0.0));
+    if (dflash_lm_draft_meta != nullptr && dflash_draft_hidden_scale <= 0.0f) {
+      ET_LOG(
+          Error,
+          "[DFlash] lm_head_draft_forward exists but get_draft_hidden_scale does "
+          "not: the draft's hidden would be quantized with the target's scale.");
+    }
 
     // Aux ION budget: emb/lm_head IO. The token generator binds the kv views
     // (its buffers never see prefill), the prompt processor the prefill views;
@@ -799,6 +829,9 @@ Error Runner::load() {
         /*drop_sink=*/drop_sink,
         /*tree_budget=*/dflash_tree_budget_,
         /*logit_out_scale=*/dflash_logit_out_scale_,
+        /*draft_hidden_scale=*/dflash_draft_hidden_scale,
+        /*draft_hidden_zero_point=*/dflash_draft_hidden_zp,
+        /*draft_logit_out_scale=*/dflash_draft_logit_out_scale,
     };
 
     auto dflash_gen = std::make_unique<DFlashTokenGenerator>(
@@ -819,6 +852,8 @@ Error Runner::load() {
         dflash_lm_head_module_.get(),
         std::move(dflash_emb_kv_meta),
         std::move(dflash_lm_kv_meta),
+        std::move(dflash_emb_draft_meta),
+        std::move(dflash_lm_draft_meta),
         dflash_embeds_scale,
         dflash_embeds_zp,
         dflash_logits_scale,

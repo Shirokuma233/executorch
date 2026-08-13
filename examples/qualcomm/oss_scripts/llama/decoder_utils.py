@@ -422,8 +422,31 @@ def _prefill_chunking(
     with torch.no_grad():
         num_prompt_tokens = len(total_token_list)
         pos = 0  # Tracks how many prompt tokens have been processed.
+        # --no_sink: position 0 still runs -- the rest of the prompt has to be able
+        # to attend to it -- but its captured hidden may not widen the range the draft
+        # inherits. Measured on Qwen3-4B that row is 58x the next largest (16391.8 vs
+        # 280.3) and costs ~5.9 effective bits on every other one. Skipping the row
+        # (what the old drop_sink did) does NOT achieve this: the captured-hidden
+        # observer sees the prompt through THIS loop whatever the draft is fed.
+        #
+        # The flag must not otherwise perturb this graph's calibration, so the chunking
+        # is left alone: the first chunk runs full width exactly as it does with the
+        # sink kept, and afterwards the captured observers are rewound and re-fed rows
+        # 1.. by hand. Giving position 0 a chunk of its own would have been simpler but
+        # changes both the chunk boundaries and the number of forwards, which every
+        # other observer in the graph would see.
+        withhold_sink = dflash_config is not None and dflash_config.no_sink
         while pos < num_prompt_tokens:
             chunk_start_idx, chunk_end_idx = pos, min(num_prompt_tokens, pos + ar_len)
+            snap = (_observer_snapshot(_hidden_output_observers(module))
+                    if (withhold_sink and pos == 0) else None)
+            if snap is not None:
+                # Logged because the count is the whole correctness condition: it must
+                # be the number of captured layers, not every rank-3 output in sight.
+                logging.info(
+                    "no_sink: sink row withheld from %d captured-hidden observers",
+                    len(snap),
+                )
 
             # Take a chunk of prompt tokens, up to ar_len length.
             if inputs.input_ids is not None:
@@ -506,16 +529,24 @@ def _prefill_chunking(
                             *v_caches,
                         )
 
+            if snap is not None:
+                # Rewind the captured observers over this chunk and re-feed it without
+                # row 0. Everything else in the graph keeps what the full chunk gave it.
+                _observer_restore(snap)
+                for (obs, _), h in zip(snap, _eagle_extra):
+                    obs(h[:, 1:])
+
             # Seed the DFlash draft from the same chunk. `_eagle_extra` carries the
             # selected hidden layers this graph exports; they were being dropped on
             # the floor while the draft recomputed a worse copy of them elsewhere.
-            # drop_sink skips the sink row but keeps every surviving row's real
-            # position, so slot i holds token i+1 rather than shifting the RoPE.
+            # no_sink drops the sink row from the draft's context but keeps every
+            # surviving row's real position, so slot i holds token i+1 rather than
+            # renumbering RoPE.
             if dflash_config is not None:
                 rows = torch.cat(
                     [h[0, :num_tokens_in_chunk] for h in _eagle_extra], dim=-1
                 )
-                skip = 1 if (dflash_config.drop_sink and pos == 0) else 0
+                skip = 1 if (dflash_config.no_sink and pos == 0) else 0
                 # The draft's new_context is [1, draft_ar, .], so it cannot swallow
                 # a target chunk in one call once the two ar's diverge -- which they
                 # do as soon as the target widens for a tree.
@@ -544,6 +575,65 @@ def _prefill_chunking(
         )
 
         return pos, last_input_sample
+
+
+def _hidden_output_observers(module):
+    """The observers on the CAPTURED layer hiddens -- the raw residual-stream tensors
+    this graph hands to the draft, and nothing else.
+
+    The decoder returns (final_hidden, k_caches..., v_caches..., *captured) and the
+    calibration module is _SplitEval(emb, decoder, lm_head), so "every rank-3 output"
+    reaches three tensors that are not the draft's: emb's embeds, lm_head's logits and
+    the final hidden. Flat output 0 is the primary output of whichever graph we are in
+    (_is_primary_output's convention), and skipping it excludes all three -- emb and
+    lm_head return one tensor each.
+
+    Not cosmetic. Only the captured hiddens are pre-norm, and only there does the sink
+    dominate: measured 58.5x the next row, against 0.17x / 0.36x / 0.68x for the other
+    three, which sit after the final RMSNorm or are a table lookup
+    (ddtree/workspace/probe_sink_two_tensors.py). Withholding the sink from emb would
+    clip the sink token's own embedding, and every later token attends to its K/V --
+    the same reason the rank-4 outputs are left alone here.
+    """
+    found = []
+    for sub in module.modules():
+        g = getattr(sub, "graph", None)
+        if g is None:
+            continue
+        for node in g.nodes:
+            if node.op != "output":
+                continue
+            for out in list(node.args[0])[1:]:
+                if not hasattr(out, "op") or out.op != "call_module":
+                    continue
+                val = out.meta.get("val")
+                if val is None or val.dim() != 3:  # rank 4 == K/V cache, leave alone
+                    continue
+                obs = getattr(sub, out.target, None)
+                if obs is not None:
+                    found.append(obs)
+    return found
+
+
+def _observer_snapshot(observers):
+    """Every buffer of the given observers, cloned.
+
+    Used to run a forward whose ACTIVATIONS must not widen these ranges while its
+    side effects (KV cache, attention mask) must still happen. Restoring buffers is
+    type-agnostic, unlike toggling an `observer_enabled` flag that only FakeQuantize
+    has -- prepare_pt2e inserts plain observers.
+    """
+    return [
+        (obs, {n: b.detach().clone() for n, b in obs.named_buffers(recurse=False)})
+        for obs in observers
+    ]
+
+
+def _observer_restore(snap):
+    for obs, bufs in snap:
+        for n, b in obs.named_buffers(recurse=False):
+            if n in bufs:
+                b.copy_(bufs[n])
 
 
 def build_ddtree(logp, ids, budget: int, depth_limit: int):

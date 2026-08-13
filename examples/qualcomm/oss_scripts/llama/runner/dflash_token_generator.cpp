@@ -256,6 +256,8 @@ DFlashTokenGenerator::DFlashTokenGenerator(
     executorch::extension::Module* lm_head_module,
     std::unique_ptr<MethodMeta> emb_kv_meta,
     std::unique_ptr<MethodMeta> lm_head_kv_meta,
+    std::unique_ptr<MethodMeta> emb_draft_meta,
+    std::unique_ptr<MethodMeta> lm_head_draft_meta,
     float embeds_scale,
     int32_t embeds_zero_point,
     float logits_scale,
@@ -287,6 +289,8 @@ DFlashTokenGenerator::DFlashTokenGenerator(
       lm_head_module_(lm_head_module),
       emb_kv_meta_(std::move(emb_kv_meta)),
       lm_head_kv_meta_(std::move(lm_head_kv_meta)),
+      emb_draft_meta_(std::move(emb_draft_meta)),
+      lm_head_draft_meta_(std::move(lm_head_draft_meta)),
       embeds_scale_(embeds_scale),
       embeds_zero_point_(embeds_zero_point),
       logits_scale_(logits_scale),
@@ -523,6 +527,35 @@ void DFlashTokenGenerator::init_io(
       draft_hidden_u16_nbytes_,
       lm_head_kv_meta_->input_tensor_meta(0).get());
 
+  // The block_size-wide views share these buffers -- they are strictly smaller
+  // than the kv views -- but QNN registers memory per tensor meta, so each view
+  // has to be declared or the DSP has no handle for it.
+  if (emb_draft_meta_ != nullptr) {
+    buffer_manager->add_memory_info(
+        emb_tok_buf_,
+        emb_tok_nbytes_,
+        emb_draft_meta_->input_tensor_meta(0).get());
+    buffer_manager->add_memory_info(
+        emb_out_buf_,
+        emb_out_nbytes_,
+        emb_draft_meta_->output_tensor_meta(0).get());
+  }
+  if (lm_head_draft_meta_ != nullptr) {
+    buffer_manager->add_memory_info(
+        draft_hidden_u16_buf_,
+        draft_hidden_u16_nbytes_,
+        lm_head_draft_meta_->input_tensor_meta(0).get());
+    buffer_manager->add_memory_info(
+        lm_head_logits_buf_,
+        lm_head_logits_nbytes_,
+        lm_head_draft_meta_->output_tensor_meta(0).get());
+  }
+  ET_LOG(
+      Info,
+      "[DFlash] draft-width heads: emb %s, lm_head %s",
+      emb_draft_meta_ ? "yes" : "no (falls back to the tree-width graph)",
+      lm_head_draft_meta_ ? "yes" : "no (falls back to the tree-width graph)");
+
   lm_head_vocab_size_ =
       static_cast<int32_t>(lm_head_kv_meta_->output_tensor_meta(0)->sizes()[2]);
   ET_LOG(
@@ -558,9 +591,14 @@ void DFlashTokenGenerator::init_io(
 // ---------------------------------------------------------------------------
 void DFlashTokenGenerator::run_embedding(
     const uint64_t* tokens,
-    int32_t n_tokens) {
-  auto tok_meta = emb_kv_meta_->input_tensor_meta(0).get();
-  auto out_meta = emb_kv_meta_->output_tensor_meta(0).get();
+    int32_t n_tokens,
+    bool draft) {
+  const bool use_draft = draft && emb_draft_meta_ != nullptr;
+  MethodMeta* meta = use_draft ? emb_draft_meta_.get() : emb_kv_meta_.get();
+  const char* method = use_draft ? "tok_embedding_draft_forward"
+                                 : "tok_embedding_kv_forward";
+  auto tok_meta = meta->input_tensor_meta(0).get();
+  auto out_meta = meta->output_tensor_meta(0).get();
   const int32_t ar = static_cast<int32_t>(tok_meta.sizes()[1]);
   std::memset(emb_tok_buf_, 0, emb_tok_nbytes_);
   const bool tok_i64 = tok_meta.scalar_type() == ScalarType::Long;
@@ -578,10 +616,10 @@ void DFlashTokenGenerator::run_embedding(
   std::vector<EValue> ins{EValue(Tensor(&tok_impl))};
   std::vector<EValue> outs{EValue(Tensor(&out_impl))};
   ET_CHECK_MSG(
-      emb_module_->set_outputs("tok_embedding_kv_forward", outs) == Error::Ok,
+      emb_module_->set_outputs(method, outs) == Error::Ok,
       "[DFlash] emb set_outputs failed");
   const long t0 = time_in_ms();
-  auto res = emb_module_->execute("tok_embedding_kv_forward", ins);
+  auto res = emb_module_->execute(method, ins);
   emb_exec_ms_ += static_cast<double>(time_in_ms() - t0);
   ++emb_calls_;
   ET_CHECK_MSG(res.ok(), "[DFlash] emb execute failed");
@@ -595,18 +633,23 @@ void DFlashTokenGenerator::run_embedding(
   }
 }
 
-void DFlashTokenGenerator::run_lm_head(std::byte* hidden_u16) {
-  auto in_meta = lm_head_kv_meta_->input_tensor_meta(0).get();
-  auto out_meta = lm_head_kv_meta_->output_tensor_meta(0).get();
+void DFlashTokenGenerator::run_lm_head(std::byte* hidden_u16, bool draft) {
+  const bool use_draft = draft && lm_head_draft_meta_ != nullptr;
+  MethodMeta* meta =
+      use_draft ? lm_head_draft_meta_.get() : lm_head_kv_meta_.get();
+  const char* method =
+      use_draft ? "lm_head_draft_forward" : "lm_head_kv_forward";
+  auto in_meta = meta->input_tensor_meta(0).get();
+  auto out_meta = meta->output_tensor_meta(0).get();
   TensorImpl in_impl = make_impl(in_meta, hidden_u16);
   TensorImpl out_impl = make_impl(out_meta, lm_head_logits_buf_);
   std::vector<EValue> ins{EValue(Tensor(&in_impl))};
   std::vector<EValue> outs{EValue(Tensor(&out_impl))};
   ET_CHECK_MSG(
-      lm_head_module_->set_outputs("lm_head_kv_forward", outs) == Error::Ok,
+      lm_head_module_->set_outputs(method, outs) == Error::Ok,
       "[DFlash] lm_head set_outputs failed");
   const long t0 = time_in_ms();
-  auto res = lm_head_module_->execute("lm_head_kv_forward", ins);
+  auto res = lm_head_module_->execute(method, ins);
   lm_head_exec_ms_ += static_cast<double>(time_in_ms() - t0);
   ++lm_head_calls_;
   ET_CHECK_MSG(res.ok(), "[DFlash] lm_head execute failed");
@@ -690,20 +733,27 @@ void DFlashTokenGenerator::draft_topk(
   // uint16),故此处 host quantize。日后编译端把 emb 输出 + draft noise/hidden tag
   // 成 uint16 后,此 quantize 可删、改 buffer 直传。详见 dflash/RUNNER_M5_PLAN.md
   // "技术债" 节。
+  // Its own encoding when the draft-width graph exists: that one calibrated on
+  // draft hidden, which spans a fifth of the target's, so the target's scale
+  // would spend 2.3 bit of the u16 range on values that never appear here.
+  const bool own_head = lm_head_draft_meta_ != nullptr;
   quantize_f32_to_u16(
       hidden,
       reinterpret_cast<uint16_t*>(draft_hidden_u16_buf_),
       static_cast<size_t>(rows) * H,
-      logits_scale_,
-      logits_zero_point_);
-  run_lm_head(draft_hidden_u16_buf_);
+      own_head ? dflash_meta_.draft_hidden_scale : logits_scale_,
+      own_head ? dflash_meta_.draft_hidden_zero_point : logits_zero_point_);
+  run_lm_head(draft_hidden_u16_buf_, /*draft=*/true);
   stage_us_[kDraftHead] += time_in_us() - t_head;
 
   const int64_t t_pick = time_in_us();
   const long t_smp = time_in_ms();
   const size_t V = static_cast<size_t>(lm_head_vocab_size_);
   const uint16_t* lg = reinterpret_cast<const uint16_t*>(lm_head_logits_buf_);
-  const float s = dflash_meta_.logit_out_scale;
+  // These are the DRAFT's code gaps, so they want the scale the draft-width graph
+  // calibrated on draft logits. The other one is dominated by the target's.
+  const float s = own_head ? dflash_meta_.draft_logit_out_scale
+                           : dflash_meta_.logit_out_scale;
   draft_ids_.assign(static_cast<size_t>(rows) * k, 0);
   draft_logp_.assign(static_cast<size_t>(rows) * k, 0.0f);
   std::vector<uint16_t> codes(static_cast<size_t>(k));
@@ -870,7 +920,7 @@ void DFlashTokenGenerator::run_draft(
   // draft's IO is genuinely f32, so dequantize across this boundary.
   const int32_t n_block =
       std::min(static_cast<int32_t>(block_tokens.size()), B);
-  run_embedding(block_tokens.data(), n_block);
+  run_embedding(block_tokens.data(), n_block, /*draft=*/true);
   const uint16_t* emb_rows = reinterpret_cast<const uint16_t*>(emb_out_buf_);
   for (int k = 0; k < n_block; ++k) {
     for (int i = 0; i < H; ++i) {

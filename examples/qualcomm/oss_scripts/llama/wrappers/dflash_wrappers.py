@@ -118,34 +118,12 @@ class DFlashConfig:
             "target_layer_ids",
             build_target_layer_ids(self.num_target_layers, self.num_hidden_layers),
         )
-        # fc sums 12800 target-hidden values, and the target's attention-sink token
-        # carries massive activations (absmax ~16000), so the fc output can land far
-        # outside fp16. hidden_norm right after it is an RMSNorm and therefore
-        # scale-invariant, which makes folding a constant into fc.weight exactly --
-        # not approximately -- a no-op:
-        #     hidden_norm(fc(x) / S) == hidden_norm(fc(x))
-        # Measured peak |fc(x)| on a real prompt: 281074 for Qwen3-4B-DFlash-b16
-        # (needs S=256), 25188 for dflash_qwen3_4b_block7 (fits fp16, S=1).
-        self.fc_output_scale: float = float(raw.get("fc_output_scale", 1.0))
-        # Never hand the draft the sink token's hidden state.
-        #
-        # new_context is quantized per-tensor, and the sink row is the only thing
-        # stretching its range: the concatenated target hidden has p99.9 = 22.7
-        # against absmax 16391.8, all of it at token 0. Scaling cannot help (it
-        # shrinks outlier and signal alike) and rotating it into the other channels
-        # was tried and lost (QDQ-vs-fp32 cos 0.9755 -> 0.9409). Dropping the row
-        # removes the outlier rather than redistributing it, so the calibrated scale
-        # collapses toward what the remaining rows actually need.
-        #
-        # Position 0 is the attention sink -- a parking slot the model dumps
-        # attention mass into -- so it costs the whole quantization range while
-        # carrying almost no context for the draft to use.
-        #
-        # This ships in the pte metadata, not just as a build-time switch:
-        # calibration and the runner have to agree on which rows exist, and this
-        # codebase has twice been bitten by encoding mismatches that surface as
-        # degraded acceptance instead of as an error.
-        self.drop_sink: bool = bool(raw.get("drop_sink", False))
+        # Whether the sink token is excluded. Deliberately NOT read from the
+        # checkpoint or any config file: it was, and a stale `drop_sink: true`
+        # sitting at the top level of an untracked checkpoint silently decided it
+        # for every build while the command line looked like it was in charge.
+        # Set from --no_sink by whoever constructs this.
+        self.no_sink: bool = False
         # Two decode conventions, and they are off by one from each other:
         #
         #   aligned (DFlashDraftModel, e.g. Qwen3-4B-DFlash-b16)
@@ -437,7 +415,7 @@ class DFlashDraftModel(nn.Module):
             "get_dflash_prefill_ar_len": prefill_ar,
             "get_dflash_mask_token_id": int(self.cfg.mask_token_id or 0),
             "get_dflash_shifted_decode": int(self.cfg.shifted_decode),
-            "get_dflash_drop_sink": int(self.cfg.drop_sink),
+            "get_dflash_drop_sink": int(self.cfg.no_sink),
         }
 
     # -- weight loading ---------------------------------------------------
@@ -448,9 +426,8 @@ class DFlashDraftModel(nn.Module):
         the draft graph does not use them, so they are simply not read here.
         """
         with torch.no_grad():
-            # See DFlashConfig.fc_output_scale: exact, because hidden_norm is an
             # RMSNorm and RMSNorm is scale-invariant.
-            self.fc.weight.copy_(sd["fc.weight"].float() / self.cfg.fc_output_scale)
+            self.fc.weight.copy_(sd["fc.weight"].float())
             if self.lm_head is not None:
                 self.lm_head.weight.copy_(sd["lm_head.weight"].float())
             self.hidden_norm.weight.copy_(sd["hidden_norm.weight"].float())
@@ -473,26 +450,14 @@ class DFlashDraftModel(nn.Module):
                 layer.mlp.down_proj.weight.copy_(sd[p + "mlp.down_proj.weight"].float())
 
 
-def load_dflash_config(ckpt_dir: str, drop_sink: bool = False) -> DFlashConfig:
-    """`drop_sink` overrides the checkpoint's own setting when True.
-
-    It lives on the command line as well as in the checkpoint because the
-    checkpoint directory is a downloaded artifact nobody tracks: flipping it there
-    to build a variant leaves the recipe unreproducible, with the pte's metadata as
-    the only surviving record of what was built.
-    """
-    raw = json.load(open(os.path.join(ckpt_dir, "config.json")))
-    if drop_sink:
-        raw.setdefault("dflash_config", raw)["drop_sink"] = True
-    return DFlashConfig(raw)
+def load_dflash_config(ckpt_dir: str) -> DFlashConfig:
+    return DFlashConfig(json.load(open(os.path.join(ckpt_dir, "config.json"))))
 
 
-def load_dflash_checkpoint(
-    ckpt_dir: str, drop_sink: bool = False
-) -> Tuple[dict, DFlashConfig]:
+def load_dflash_checkpoint(ckpt_dir: str) -> Tuple[dict, DFlashConfig]:
     from safetensors.torch import load_file
 
-    cfg = load_dflash_config(ckpt_dir, drop_sink)
+    cfg = load_dflash_config(ckpt_dir)
     st = os.path.join(ckpt_dir, "model.safetensors")
     sd = load_file(st) if os.path.exists(st) else torch.load(
         os.path.join(ckpt_dir, "pytorch_model.bin"), map_location="cpu"
@@ -613,22 +578,24 @@ class DFlashCalibrator:
     """
 
     def __init__(self, draft, cfg, tok_embedding, lm_head, max_context_len, ar,
-                 target_ar, token_dtype, tree=False):
+                 head_ar, token_dtype, tree=False):
         self.draft = draft
         self.cfg = cfg
         self.tok_embedding = tok_embedding
         self.lm_head = lm_head
         self.ar = ar
-        # emb.pte and lm_head.pte are the target's, so their graphs are that width;
-        # only new_context / context_pos follow the draft's append length.
-        self.target_ar = target_ar
+        # Width of the emb/lm_head graphs the draft calls. With the draft-width pair
+        # compiled this is block_size, so the block fills the graph exactly and the
+        # observers see no padding; without it the draft borrows the target's decode
+        # graphs and everything past block_size is zero-padded.
+        self.head_ar = head_ar
         self.token_dtype = token_dtype
         # Whether the target verifies a tree. The draft is unaffected either way --
         # it only ever sees the accepted chain -- but the target's observers must
         # see the tree-shaped mask and repeated positions it will get at inference.
         self.tree = tree
         self.B = self.block_size = cfg.block_size
-        self.drop_sink = cfg.drop_sink
+        self.no_sink = cfg.no_sink
         self.n_draft = self.B if cfg.shifted_decode else self.B - 1
         self.hidden_row0 = 0 if cfg.shifted_decode else 1
         self.Cc = max_context_len - ar
@@ -648,7 +615,7 @@ class DFlashCalibrator:
     def _forward(self, block_tokens, rows, n_new, ctx_pos_base, block_pos_base):
         cfg = self.cfg
         B, ar = self.B, self.ar
-        ids = torch.zeros(1, self.target_ar, dtype=self.token_dtype)
+        ids = torch.zeros(1, self.head_ar, dtype=self.token_dtype)
         ids[0, :B] = torch.tensor(block_tokens, dtype=self.token_dtype)
         noise = self.tok_embedding(ids)[:, :B, :]
         atten = _draft_atten_mask(B, self.Cc, ar, self.ctx_len, n_new)
@@ -692,7 +659,7 @@ class DFlashCalibrator:
         block = [self.cfg.mask_token_id or 0] * self.B
         block[0] = committed
         hidden = self._forward(block, rows, n_new, ctx_pos_base, cur_pos)
-        padded = torch.zeros(1, self.target_ar, self.cfg.hidden_size)
+        padded = torch.zeros(1, self.head_ar, self.cfg.hidden_size)
         padded[0, : self.B] = hidden[0]
         logits = self.lm_head(padded)
         self.rounds += 1
@@ -719,7 +686,8 @@ class DFlashDraftCompiler(Component):
     ):
         self.control_args = control_args
         self.config = config
-        sd, cfg = load_dflash_checkpoint(ckpt_dir, control_args.dflash_drop_sink)
+        sd, cfg = load_dflash_checkpoint(ckpt_dir)
+        cfg.no_sink = control_args.no_sink
         self.dflash_cfg = cfg
         self.prefill_ar = prefill_ar
 
@@ -728,7 +696,7 @@ class DFlashDraftCompiler(Component):
         # equally safe on HTP: no fp32 precision mode (only kHtpQuantized/kHtpFp16),
         # conv runs on HMX with no fp32 datapath -- an fp32 fc produced byte-identical
         # device output to the fp16 one. RMSNorm fuses into the QNN native OpRmsNorm
-        # and fc_output_scale keeps the fc conv in range.
+        #.
         dtype = torch.float32
 
         # Shared architecture: the draft drops any in-graph lm_head and shares the
@@ -847,10 +815,10 @@ class DFlashDraftCompiler(Component):
             )
         self.prepared = True
 
-    def make_calibrator(self, tok_embedding, lm_head, target_ar, token_dtype, tree=False):
-        """Bind the prepared decode graph to the target's emb/lm_head for the joint
-        loop. Only the decode graph is driven: prefill's encodings are overwritten
-        from decode in `quantize`, exactly as the target does."""
+    def make_calibrator(self, tok_embedding, lm_head, head_ar, token_dtype, tree=False):
+        """Bind the prepared decode graph to the emb/lm_head graphs the draft calls,
+        for the joint loop. Only the decode graph is driven: prefill's encodings are
+        overwritten from decode in `quantize`, exactly as the target does."""
         if not self.prepared:
             return None
         self.calibrator = DFlashCalibrator(
@@ -860,7 +828,7 @@ class DFlashDraftCompiler(Component):
             lm_head,
             self.max_context_len,
             self.decode_input[2].shape[1],
-            target_ar,
+            head_ar,
             token_dtype,
             tree,
         )
@@ -1049,7 +1017,8 @@ class DFlashManager(Component):
         )
 
         ckpt = control_args.dflash_draft_checkpoint
-        cfg = load_dflash_config(ckpt, control_args.dflash_drop_sink)
+        cfg = load_dflash_config(ckpt)
+        cfg.no_sink = control_args.no_sink
         max_ctx = (
             getattr(control_args, "dflash_max_context_len", 0)
             or control_args.max_context_len
@@ -1087,6 +1056,10 @@ class DFlashManager(Component):
             apply_embedding=True,  # split token embedding into a shared emb.pte
             output_hidden_layers=capture_ids,
             apply_output=False,  # headless: lm_head moves to a shared lm_head.pte
+            # Third emb/lm_head width for the draft: its noise block and its hidden
+            # are exactly block_size rows, so borrowing the target's decode graphs
+            # both wasted the padding and mixed the two models' statistics.
+            draft_head_ar=cfg.block_size,
         )
         self.draft_compiler = DFlashDraftCompiler(
             control_args, config, ckpt, max_ctx, prefill_ar, share_lm_head=True

@@ -103,6 +103,15 @@ class DFlashTokenGenerator : public TokenGenerator {
     // it: path scores sum log-probs across depths, and this scale decides how
     // peaked a depth looks, i.e. how the budget splits between depth and breadth.
     float logit_out_scale;
+    // The draft-width lm_head graph's own encodings, when the pte carries that
+    // graph. The draft's hidden is a fifth the magnitude of the target's (measured
+    // span 117 vs 583), so quantizing it with the target's scale threw away 2.3
+    // bit; and the tree scores the DRAFT's code gaps, so it wants the scale that
+    // graph calibrated on draft logits, not the target-dominated one above.
+    // Zero means the pte predates the split -- fall back to the target's.
+    float draft_hidden_scale;
+    int32_t draft_hidden_zero_point;
+    float draft_logit_out_scale;
   };
 
   DFlashTokenGenerator(
@@ -122,6 +131,10 @@ class DFlashTokenGenerator : public TokenGenerator {
       executorch::extension::Module* lm_head_module,
       std::unique_ptr<executorch::runtime::MethodMeta> emb_kv_meta,
       std::unique_ptr<executorch::runtime::MethodMeta> lm_head_kv_meta,
+      // The block_size-wide views of the same two ptes, when they were compiled.
+      // Null on older ptes, which fall back to the kv views.
+      std::unique_ptr<executorch::runtime::MethodMeta> emb_draft_meta,
+      std::unique_ptr<executorch::runtime::MethodMeta> lm_head_draft_meta,
       float embeds_scale,
       int32_t embeds_zero_point,
       float logits_scale,
@@ -183,13 +196,15 @@ class DFlashTokenGenerator : public TokenGenerator {
   // Run one prefill_forward over the staged rows, then reset the staging count.
   void flush_stage();
 
-  // Run emb.pte kv over `n_tokens` ids (padded to the graph's AR). Output f32
-  // embeds land in `emb_out_buf_`.
-  void run_embedding(const uint64_t* tokens, int32_t n_tokens);
+  // Run emb.pte over `n_tokens` ids (padded to the graph's AR). Output f32
+  // embeds land in `emb_out_buf_`. `draft` picks the block_size-wide graph, whose
+  // AR the draft's noise block fills exactly.
+  void run_embedding(const uint64_t* tokens, int32_t n_tokens, bool draft = false);
 
-  // Run lm_head.pte kv over the u16 hidden buffer. Logits land in
-  // `lm_head_logits_buf_`.
-  void run_lm_head(std::byte* hidden_u16);
+  // Run lm_head.pte over the u16 hidden buffer. Logits land in
+  // `lm_head_logits_buf_`. `draft` picks the block_size-wide graph: the draft
+  // fills block_size rows of a tree-width one and pays for the rest.
+  void run_lm_head(std::byte* hidden_u16, bool draft = false);
 
   // Quantize `rows` draft hidden rows -> lm_head.pte -> per-depth top-k, kept as
   // log-probs in `draft_logp_` / `draft_ids_`.
@@ -231,6 +246,8 @@ class DFlashTokenGenerator : public TokenGenerator {
   executorch::extension::Module* lm_head_module_;
   std::unique_ptr<executorch::runtime::MethodMeta> emb_kv_meta_;
   std::unique_ptr<executorch::runtime::MethodMeta> lm_head_kv_meta_;
+  std::unique_ptr<executorch::runtime::MethodMeta> emb_draft_meta_;
+  std::unique_ptr<executorch::runtime::MethodMeta> lm_head_draft_meta_;
   // Boundary QDQ, read off the decoder pte getters at load time.
   float embeds_scale_;
   int32_t embeds_zero_point_;

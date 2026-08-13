@@ -815,14 +815,16 @@ def _build_parser():
         "draft is quantized to 16a4w, calibrated on the quantized target's hidden.",
     )
     parser.add_argument(
-        "--dflash_drop_sink",
+        "--no_sink",
         action="store_true",
-        help="[DFlash mode] Keep the sink token's hidden state out of the draft's "
-        "context (position 0 is where the model parks attention mass; it costs the "
-        "whole per-tensor quantization range and carries almost nothing the draft "
-        "can use). Overrides the checkpoint's own drop_sink. It is a flag and not "
-        "only a checkpoint field because the checkpoint directory is untracked: "
-        "flipping it there to build a variant leaves no reproducible recipe.",
+        help="[DFlash mode] Exclude the attention-sink token (position 0) from the "
+        "draft. The whole prompt is still processed -- the sink is only left out of "
+        "two places: the quantization statistics during calibration, and the draft's "
+        "context at inference. Measured on Qwen3-4B, position 0's captured hidden is "
+        "58x the next largest row (16391.8 vs 280.3), so a per-tensor range that "
+        "includes it costs ~5.9 effective bits on every other row. Read only from "
+        "here, never from the checkpoint: a stale field there used to decide this "
+        "silently for every build.",
     )
     parser.add_argument(
         "--dflash_tree_nodes",

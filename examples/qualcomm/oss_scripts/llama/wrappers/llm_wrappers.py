@@ -139,6 +139,7 @@ class TextDecoder(Component):
         apply_embedding: bool = False,
         output_hidden_layers: Optional[List[int]] = None,
         apply_output: bool = True,
+        draft_head_ar: Optional[int] = None,
     ):
         self.control_args = control_args
         self.config = config
@@ -147,6 +148,27 @@ class TextDecoder(Component):
         self.dep_table = get_passes_dependency_for_capture_program()
         self.meta = {}
         self.output_hidden_layers = output_hidden_layers
+        # DFlash: a third emb/lm_head width, block_size wide, for the draft. The draft
+        # produces exactly block_size rows per round, so sharing the target's
+        # decode-width graphs made the vocab projection scale with the tree size while
+        # the draft filled a fixed 16 rows of it -- measured +0.193 ms per tree node,
+        # all of it padding. Separate graphs also give the draft its own boundary
+        # encodings, calibrated on draft traffic instead of the target's.
+        self.draft_head_ar = draft_head_ar
+        self.draft_tok_embedding = None
+        self.draft_lm_head = None
+        self.draft_tok_embedding_passes_job = (
+            get_capture_program_passes() if draft_head_ar else None
+        )
+        self.draft_tok_embedding_dep_table = (
+            get_passes_dependency_for_capture_program() if draft_head_ar else None
+        )
+        self.draft_lm_head_passes_job = (
+            get_capture_program_passes() if draft_head_ar else None
+        )
+        self.draft_lm_head_dep_table = (
+            get_passes_dependency_for_capture_program() if draft_head_ar else None
+        )
         # DFlashManager sets this on the decode wrapper so the draft rides along in
         # this graph's calibration loop instead of being calibrated afterwards on a
         # separate forward through the (uncalibrated) prefill graph.
@@ -297,6 +319,8 @@ class TextDecoder(Component):
         # lm_head.
         if self.lm_head is not None:
             self.lm_head.output = decoder.output
+        if self.draft_lm_head is not None:
+            self.draft_lm_head.output = decoder.output
 
         # check dtype override
         if self.control_args.dtype_override is not None:
@@ -450,6 +474,43 @@ class TextDecoder(Component):
                 (decoder.max_batch_size, decoder.ar_len, decoder.vocab_size),
             }
 
+        # The draft-width pair. Same underlying modules as above -- only the AR
+        # differs -- so the pte weight-shares all three graphs.
+        if self.draft_head_ar:
+            if self.control_args.embedding_quantize:
+                raise RuntimeError(
+                    "--embedding_quantize with a DFlash draft-width emb graph: both "
+                    "wrap the same nn.Embedding and get_quant_embedding_transform "
+                    "would run over it twice"
+                )
+            B = self.draft_head_ar
+            self.draft_tok_embedding = TokenEmbedding(
+                decoder.tok_embeddings,
+                decoder.max_batch_size,
+                B,
+                decoder.vocab_size,
+                decoder.dim,
+                self.control_args.embedding_quantize is not None,
+            ).eval()
+            self.draft_tok_embedding_export_input = (
+                self.draft_tok_embedding.get_example_input()
+            )
+            self.draft_emb_io_shape = {(decoder.max_batch_size, B, decoder.dim)}
+            self.draft_lm_head = LmHead(
+                decoder.output,
+                decoder.max_batch_size,
+                B,
+                decoder.vocab_size,
+                decoder.dim,
+            ).eval()
+            self.draft_lm_head_export_input = (
+                self.draft_lm_head.get_example_input()
+            )
+            self.draft_lm_head_io_shape = {
+                (decoder.max_batch_size, B, decoder.dim),
+                (decoder.max_batch_size, B, decoder.vocab_size),
+            }
+
         return tok_embedding, decoder
 
     def _save_logits_quant_attrs(self):
@@ -493,6 +554,46 @@ class TextDecoder(Component):
                         out.args[2],
                     )
                     return
+
+    def _save_draft_head_quant_attrs(self):
+        """The draft-width lm_head's INPUT and OUTPUT encodings.
+
+        Both differ from the target's and both have to reach the runner. The input one
+        because the draft's hidden crosses to lm_head.pte as f32 and the runner
+        quantizes it on the host: with the target's scale it would waste the range the
+        target's much larger hidden needs (measured span 583 vs the draft's 117, i.e.
+        2.3 bit thrown away), so this graph keeps its own, calibrated on draft hidden.
+        The output one because the tree turns code gaps into nats with it, and the
+        gaps it scores are the DRAFT's -- reusing the target-calibrated
+        get_logits_out_scale scored one distribution with another's scale.
+        """
+        q_op = torch.ops.quantized_decomposed.quantize_per_tensor.default
+        dq_op = torch.ops.quantized_decomposed.dequantize_per_tensor.default
+        for node in self.draft_lm_head.graph.nodes:
+            if node.op == "placeholder":
+                for user in node.users:
+                    if user.target is q_op:
+                        self.meta["get_draft_hidden_scale"] = user.args[1]
+                        self.meta["get_draft_hidden_zero_point"] = user.args[2]
+                        break
+            if node.op == "output":
+                for out in node.args[0]:
+                    if out.target is dq_op:
+                        self.meta["get_draft_logits_out_scale"] = out.args[1]
+                        self.meta["get_draft_logits_out_zero_point"] = out.args[2]
+                        break
+        logging.info(
+            "draft-width lm_head encodings: hidden in scale=%s zp=%s, "
+            "logits out scale=%s zp=%s",
+            self.meta.get("get_draft_hidden_scale"),
+            self.meta.get("get_draft_hidden_zero_point"),
+            self.meta.get("get_draft_logits_out_scale"),
+            self.meta.get("get_draft_logits_out_zero_point"),
+        )
+        if "get_draft_hidden_scale" not in self.meta:
+            raise RuntimeError("draft lm_head input quant params not found")
+        if "get_draft_logits_out_scale" not in self.meta:
+            raise RuntimeError("draft lm_head output quant params not found")
 
     def _save_embeds_quant_attrs(self):
         # headless emb-split: read the tok_embedding output (embeds) quant scale/zp so it
@@ -595,22 +696,25 @@ class TextDecoder(Component):
         flat = list(out_node.args[0])
         return node in flat and flat.index(node) == 0
 
-    def _tag_lm_head_ios(self, node, fixed_point_type):
+    def _tag_lm_head_ios(self, node, fixed_point_type, io_shape=None):
         # standalone lm_head graph: input hidden [b, ar, dim] and output logits
-        # [b, ar, vocab] are both quantized uint16 at the pte boundary.
+        # [b, ar, vocab] are both quantized uint16 at the pte boundary. io_shape is
+        # explicit because the draft-width graph has the same roles at a different AR.
+        io_shape = self.lm_head_io_shape if io_shape is None else io_shape
         quant_io_type = None
-        if node.op == "placeholder" and node.meta["val"].size() in self.lm_head_io_shape:
+        if node.op == "placeholder" and node.meta["val"].size() in io_shape:
             quant_io_type = fixed_point_type["io_type"]
-        if is_graph_output(node) and node.meta["val"].size() in self.lm_head_io_shape:
+        if is_graph_output(node) and node.meta["val"].size() in io_shape:
             quant_io_type = fixed_point_type["io_type"]
         return quant_io_type
 
-    def _tag_emb_ios(self, node, fixed_point_type):
+    def _tag_emb_ios(self, node, fixed_point_type, io_shape=None):
         # standalone tok_embedding graph: the tokens input stays int (untagged); only
         # the embeds output [b, ar, dim] is quantized uint16 at the pte boundary, so
         # emb->decoder is a lossless uint16 boundary (scale injected onto decoder input).
+        io_shape = self.emb_io_shape if io_shape is None else io_shape
         quant_io_type = None
-        if is_graph_output(node) and node.meta["val"].size() in self.emb_io_shape:
+        if is_graph_output(node) and node.meta["val"].size() in io_shape:
             quant_io_type = fixed_point_type["io_type"]
         return quant_io_type
 
@@ -765,9 +869,12 @@ class TextDecoder(Component):
         # actually emits and its block traffic comes from real accept lengths.
         dflash_config = (
             self.dflash_draft.make_calibrator(
-                self.tok_embedding,
-                self.lm_head,
-                self.meta["get_ar_len"],
+                # The draft-width pair when it exists: those graphs are the ones the
+                # runner calls on the draft path, so their observers must see the
+                # draft's traffic and only the draft's.
+                self.draft_tok_embedding or self.tok_embedding,
+                self.draft_lm_head or self.lm_head,
+                self.draft_head_ar or self.meta["get_ar_len"],
                 torch.int64
                 if self.control_args.embedding_quantize is not None
                 else torch.int32,
@@ -1048,6 +1155,25 @@ class TextDecoder(Component):
                     self.decoder,
                     self.lm_head,
                 )
+                # The draft-width pair rides the same loop, driven by DFlashCalibrator
+                # rather than by _SplitEval: its observers must see draft traffic only.
+                if self.draft_head_ar:
+                    self.draft_tok_embedding = prepare_pt2e(
+                        torch.export.export(
+                            self.draft_tok_embedding,
+                            self.draft_tok_embedding_export_input,
+                            strict=True,
+                        ).module(),
+                        tok_embedding_quantizer,
+                    )
+                    self.draft_lm_head = prepare_pt2e(
+                        torch.export.export(
+                            self.draft_lm_head,
+                            self.draft_lm_head_export_input,
+                            strict=True,
+                        ).module(),
+                        lm_head_quantizer,
+                    )
 
             # start calibration (only for kv mode or prefill mode without kv cache)
             if self.mode == Mode.DECODE or not self.model_args.use_kv_cache:
@@ -1106,6 +1232,11 @@ class TextDecoder(Component):
             if split_lm_head:
                 self.lm_head = convert_pt2e(self.lm_head)
                 self._save_lm_head_output_quant_attrs()
+
+            if self.draft_head_ar:
+                self.draft_tok_embedding = convert_pt2e(self.draft_tok_embedding)
+                self.draft_lm_head = convert_pt2e(self.draft_lm_head)
+                self._save_draft_head_quant_attrs()
 
             # Dump the decode (AR) QDQ graphs so a host script can run the full
             # DFlash accept loop on CPU. Only the decode graphs carry the real
@@ -1191,6 +1322,27 @@ class TextDecoder(Component):
                 self._tag_lm_head_ios,
                 fixed_point_type={"io_type": fixed_point_type["io_type"]},
             )
+        # Same tagging at the draft width. The shapes differ, so these need their own
+        # partials -- the default io_shape would silently match nothing.
+        if self.draft_tok_embedding_passes_job is not None:
+            job = self.draft_tok_embedding_passes_job
+            job[TagQuantIO][QCOM_PASS_ACTIVATE_KEY] = True
+            job[TagQuantIO][QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY][
+                "get_quant_io_dtype_fn"
+            ] = partial(
+                self._tag_emb_ios,
+                fixed_point_type={"io_type": fixed_point_type["io_type"]},
+                io_shape=self.draft_emb_io_shape,
+            )
+            job = self.draft_lm_head_passes_job
+            job[TagQuantIO][QCOM_PASS_ACTIVATE_KEY] = True
+            job[TagQuantIO][QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY][
+                "get_quant_io_dtype_fn"
+            ] = partial(
+                self._tag_lm_head_ios,
+                fixed_point_type={"io_type": fixed_point_type["io_type"]},
+                io_shape=self.draft_lm_head_io_shape,
+            )
 
 
 class HybridTextDecoder(Component):
@@ -1202,7 +1354,11 @@ class HybridTextDecoder(Component):
         apply_embedding: bool = False,
         output_hidden_layers: Optional[List[int]] = None,
         apply_output: bool = True,
+        draft_head_ar: Optional[int] = None,
     ):
+        # The draft-width emb/lm_head hang off the decode wrapper: that is the one
+        # whose calibration loop drives the draft, and the one whose encodings the
+        # prefill graphs are copied from.
         self.decode = TextDecoder(
             control_args,
             config,
@@ -1210,6 +1366,7 @@ class HybridTextDecoder(Component):
             apply_embedding=apply_embedding,
             output_hidden_layers=output_hidden_layers,
             apply_output=apply_output,
+            draft_head_ar=draft_head_ar,
         )
         self.prefill = TextDecoder(
             control_args,
@@ -1354,17 +1511,52 @@ class HybridTextDecoder(Component):
                     decode_model=self.decode.tok_embedding,
                     prefill_model=self.prefill.tok_embedding,
                 )
+                # The draft-width graph reads the same table, so the right output range
+                # is the table's -- not the dozen-odd rows the draft's noise block
+                # happens to touch during calibration (mask token plus one committed
+                # token per round). Copying decode's encodings uses the larger sample
+                # and keeps a single embeds scale for the runner.
+                if self.decode.draft_tok_embedding is not None:
+                    self._encoding_override(
+                        decode_model=self.decode.tok_embedding,
+                        prefill_model=self.decode.draft_tok_embedding,
+                    )
+            # lm_head had no override at all: its prefill graph carried the encodings
+            # of one dummy randn forward (get_logits_out_scale differed 7.5x between
+            # the two graphs). The input scale is forced below either way; this fixes
+            # the weights and the output.
+            if self.decode.lm_head is not None and self.prefill.lm_head is not None:
+                self._encoding_override(
+                    decode_model=self.decode.lm_head,
+                    prefill_model=self.prefill.lm_head,
+                )
 
         # prepare lowering tok_embedding if applicable
         if self.apply_embedding:
             tok_embedding_data = request.method_data[TOK_EMBEDDING]
-            models = [
+            emb_models = [
                 d for d in [self.decode, self.prefill] if d.tok_embedding is not None
             ]
+            tok_embedding_modules = [m.tok_embedding for m in emb_models]
             tok_embedding_example_inputs = [
-                m.tok_embedding_export_input for m in models if m is not None
+                m.tok_embedding_export_input for m in emb_models
             ]  # tokens
-            tok_embedding_graph_names = TOK_EMBEDDING_GRAPH_NAMES[: len(models)]
+            tok_embedding_dep_tables = [m.tok_embedding_dep_table for m in emb_models]
+            tok_embedding_passes_jobs = [m.tok_embedding_passes_job for m in emb_models]
+            if self.decode.draft_tok_embedding is not None:
+                tok_embedding_modules.append(self.decode.draft_tok_embedding)
+                tok_embedding_example_inputs.append(
+                    self.decode.draft_tok_embedding_export_input
+                )
+                tok_embedding_dep_tables.append(
+                    self.decode.draft_tok_embedding_dep_table
+                )
+                tok_embedding_passes_jobs.append(
+                    self.decode.draft_tok_embedding_passes_job
+                )
+            tok_embedding_graph_names = TOK_EMBEDDING_GRAPH_NAMES[
+                : len(tok_embedding_modules)
+            ]
 
         # prepare lowering decoder
         data = request.method_data[TEXT_DECODER]
@@ -1375,12 +1567,7 @@ class HybridTextDecoder(Component):
         # start lowering
         if self.apply_embedding:
             tok_embedding_edge_prog_mgr = to_edge_transform_and_lower_to_qnn(
-                module=dict(
-                    zip(
-                        tok_embedding_graph_names,
-                        [model.tok_embedding for model in models],
-                    )
-                ),
+                module=dict(zip(tok_embedding_graph_names, tok_embedding_modules)),
                 inputs=dict(
                     zip(tok_embedding_graph_names, tok_embedding_example_inputs)
                 ),
@@ -1388,16 +1575,10 @@ class HybridTextDecoder(Component):
                     zip(tok_embedding_graph_names, tok_embedding_data.compile_spec)
                 ),
                 dep_table=dict(
-                    zip(
-                        tok_embedding_graph_names,
-                        [model.tok_embedding_dep_table for model in models],
-                    )
+                    zip(tok_embedding_graph_names, tok_embedding_dep_tables)
                 ),
                 passes_job=dict(
-                    zip(
-                        tok_embedding_graph_names,
-                        [model.tok_embedding_passes_job for model in models],
-                    )
+                    zip(tok_embedding_graph_names, tok_embedding_passes_jobs)
                 ),
             )
             if self.control_args.verbose:
@@ -1434,35 +1615,36 @@ class HybridTextDecoder(Component):
             ]
             hidden_scale = self.decode.meta["get_logits_scale"]
             hidden_zp = self.decode.meta["get_logits_zero_point"]
+            lm_head_modules = [m.lm_head for m in lm_head_models]
             lm_head_example_inputs = [m.lm_head_export_input for m in lm_head_models]
-            lm_head_graph_names = LM_HEAD_GRAPH_NAMES[: len(lm_head_models)]
+            lm_head_dep_tables = [m.lm_head_dep_table for m in lm_head_models]
+            lm_head_passes_jobs = [m.lm_head_passes_job for m in lm_head_models]
+            # Only the graphs the DECODER feeds get their input scale forced. That
+            # boundary is a raw uint16 buffer with no requant, so producer and consumer
+            # must agree. The draft-width graph's producer is the runner, which
+            # quantizes the draft's f32 hidden on the host and can therefore use
+            # whatever scale this graph calibrated for itself.
             for m in lm_head_models:
                 m._override_lm_head_input_scale(hidden_scale, hidden_zp)
+            if self.decode.draft_lm_head is not None:
+                lm_head_modules.append(self.decode.draft_lm_head)
+                lm_head_example_inputs.append(self.decode.draft_lm_head_export_input)
+                lm_head_dep_tables.append(self.decode.draft_lm_head_dep_table)
+                lm_head_passes_jobs.append(self.decode.draft_lm_head_passes_job)
+            lm_head_graph_names = LM_HEAD_GRAPH_NAMES[: len(lm_head_modules)]
             if getattr(self.control_args, "verify_split", False):
                 # headless split path: real generation tokens -> [emb] -> decoder ->
                 # lm_head -> logits, logging the decoded text for coherence check.
                 self.decode._verify_generate()
 
             lm_head_edge_prog_mgr = to_edge_transform_and_lower_to_qnn(
-                module=dict(
-                    zip(lm_head_graph_names, [m.lm_head for m in lm_head_models])
-                ),
+                module=dict(zip(lm_head_graph_names, lm_head_modules)),
                 inputs=dict(zip(lm_head_graph_names, lm_head_example_inputs)),
                 compiler_specs=dict(
                     zip(lm_head_graph_names, lm_head_data.compile_spec)
                 ),
-                dep_table=dict(
-                    zip(
-                        lm_head_graph_names,
-                        [m.lm_head_dep_table for m in lm_head_models],
-                    )
-                ),
-                passes_job=dict(
-                    zip(
-                        lm_head_graph_names,
-                        [m.lm_head_passes_job for m in lm_head_models],
-                    )
-                ),
+                dep_table=dict(zip(lm_head_graph_names, lm_head_dep_tables)),
+                passes_job=dict(zip(lm_head_graph_names, lm_head_passes_jobs)),
             )
             if self.control_args.verbose:
                 for ep in lm_head_edge_prog_mgr._edge_programs.values():

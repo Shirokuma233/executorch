@@ -41,12 +41,20 @@ MODALITY_INPUT_FLAG_MAP = {
 TOK_EMBEDDING_GRAPH_NAMES = [
     "tok_embedding_kv_forward",
     "tok_embedding_prefill_forward",
+    # DFlash: the draft's noise block is exactly block_size tokens wide, so it needs
+    # its own graph rather than borrowing the target's decode-width one and paying
+    # for the padding.
+    "tok_embedding_draft_forward",
 ]
 # Standalone lm_head graph names (headless decoder: vocab projection in its own
 # shared pte). Same decode/prefill (AR8/AR32) split as the decoder.
 LM_HEAD_GRAPH_NAMES = [
     "lm_head_kv_forward",
     "lm_head_prefill_forward",
+    # DFlash: projects the draft's block_size hidden rows. The draft fills only
+    # block_size of the target's decode width, so borrowing that graph makes the
+    # whole vocab projection scale with the tree size for no reason.
+    "lm_head_draft_forward",
 ]
 # Decoder graph names
 DECODER_GRAPH_NAMES = ["kv_forward", "prefill_forward"]
