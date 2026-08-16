@@ -422,27 +422,41 @@ def _prefill_chunking(
     with torch.no_grad():
         num_prompt_tokens = len(total_token_list)
         pos = 0  # Tracks how many prompt tokens have been processed.
-        # --no_sink: position 0 still runs -- the rest of the prompt has to be able
-        # to attend to it -- but its captured hidden may not widen the range the draft
-        # inherits. Measured on Qwen3-4B that row is 58x the next largest (16391.8 vs
-        # 280.3) and costs ~5.9 effective bits on every other one. Skipping the row
-        # (what the old drop_sink did) does NOT achieve this: the captured-hidden
-        # observer sees the prompt through THIS loop whatever the draft is fed.
+        # --no_sink: position 0 still runs -- everything after it has to attend to the
+        # sink -- but its captured hidden must not widen the range the draft inherits.
+        # Measured on Qwen3-4B, that row runs 58x the next largest and costs the four
+        # deep captures 5.5 to 8.9 bits each.
         #
-        # The flag must not otherwise perturb this graph's calibration, so the chunking
-        # is left alone: the first chunk runs full width exactly as it does with the
-        # sink kept, and afterwards the captured observers are rewound and re-fed rows
-        # 1.. by hand. Giving position 0 a chunk of its own would have been simpler but
-        # changes both the chunk boundaries and the number of forwards, which every
-        # other observer in the graph would see.
+        # This is only safe because static_llama forks the captured hiddens through
+        # `captured_gain` first. Without that fork the observer below is the residual
+        # stream's own, shared with the next layer, and narrowing it clamps the model
+        # (verify with ddtree/workspace/probe_captured_sharing.py: one consumer, not
+        # three). Calibration cannot detect the difference -- observers are identity
+        # here -- so the check has to be on the compiled graph.
+        #
+        # The chunking is left alone so nothing else in the graph sees the flag: the
+        # first chunk runs full width exactly as it does with the sink kept, and the
+        # captured observers are afterwards rewound and re-fed rows 1.. by hand. That
+        # rewind is exact for MinMax and only for MinMax, since min/max over a subset
+        # is the same whether or not the superset was seen first.
         withhold_sink = dflash_config is not None and dflash_config.no_sink
+        n_captured = (
+            len(dflash_config.cfg.target_layer_ids) if dflash_config is not None else 0
+        )
         while pos < num_prompt_tokens:
             chunk_start_idx, chunk_end_idx = pos, min(num_prompt_tokens, pos + ar_len)
-            snap = (_observer_snapshot(_hidden_output_observers(module))
-                    if (withhold_sink and pos == 0) else None)
+            snap = (
+                _observer_snapshot(_captured_hidden_observers(module, n_captured))
+                if (withhold_sink and pos == 0) else None
+            )
             if snap is not None:
-                # Logged because the count is the whole correctness condition: it must
-                # be the number of captured layers, not every rank-3 output in sight.
+                # Hard-fail: a wrong count means the flag silently does nothing, which
+                # is how a useless build once got all the way to the device.
+                if len(snap) != n_captured:
+                    raise RuntimeError(
+                        f"--no_sink selected {len(snap)} captured-hidden observers, "
+                        f"expected {n_captured}"
+                    )
                 logging.info(
                     "no_sink: sink row withheld from %d captured-hidden observers",
                     len(snap),
@@ -577,41 +591,41 @@ def _prefill_chunking(
         return pos, last_input_sample
 
 
-def _hidden_output_observers(module):
-    """The observers on the CAPTURED layer hiddens -- the raw residual-stream tensors
-    this graph hands to the draft, and nothing else.
+def _captured_hidden_observers(module, n):
+    """The observers on the LAST `n` graph outputs of the decoder -- the captured
+    hiddens the draft consumes, and nothing else.
 
-    The decoder returns (final_hidden, k_caches..., v_caches..., *captured) and the
-    calibration module is _SplitEval(emb, decoder, lm_head), so "every rank-3 output"
-    reaches three tensors that are not the draft's: emb's embeds, lm_head's logits and
-    the final hidden. Flat output 0 is the primary output of whichever graph we are in
-    (_is_primary_output's convention), and skipping it excludes all three -- emb and
-    lm_head return one tensor each.
+    Positional on purpose. The decoder returns
+    (final_hidden, k_caches..., v_caches..., *captured), so the captured ones are the
+    tail -- the same slice the caller unpacks as `*_eagle_extra`, which is what makes
+    the two zip correctly. `n` comes from that convention, not from inspection.
 
-    Not cosmetic. Only the captured hiddens are pre-norm, and only there does the sink
-    dominate: measured 58.5x the next row, against 0.17x / 0.36x / 0.68x for the other
-    three, which sit after the final RMSNorm or are a table lookup
-    (ddtree/workspace/probe_sink_two_tensors.py). Withholding the sink from emb would
-    clip the sink token's own embedding, and every later token attends to its K/V --
-    the same reason the rank-4 outputs are left alone here.
+    Selecting by rank instead (rank-3 outputs past index 0) found ZERO on the real
+    graph: prepare_pt2e's inserted observer nodes carry no meta['val'], so every
+    candidate was skipped. It passed a unit test only because the hand-built graphs
+    there set meta['val'] explicitly. Shape metadata is not dependable on inserted
+    nodes; output position is.
     """
-    found = []
+    # _SplitEval holds three graphs; the decoder is the one with the many outputs.
+    best, best_len = None, 0
     for sub in module.modules():
         g = getattr(sub, "graph", None)
         if g is None:
             continue
-        for node in g.nodes:
-            if node.op != "output":
-                continue
-            for out in list(node.args[0])[1:]:
-                if not hasattr(out, "op") or out.op != "call_module":
-                    continue
-                val = out.meta.get("val")
-                if val is None or val.dim() != 3:  # rank 4 == K/V cache, leave alone
-                    continue
-                obs = getattr(sub, out.target, None)
-                if obs is not None:
-                    found.append(obs)
+        out_node = next((x for x in g.nodes if x.op == "output"), None)
+        if out_node is None:
+            continue
+        outs = list(out_node.args[0])
+        if len(outs) > best_len:
+            best, best_len = (sub, outs), len(outs)
+    if best is None or best_len <= n:
+        return []
+    sub, outs = best
+    found = []
+    for out in outs[-n:]:
+        obs = getattr(sub, out.target, None) if out.op == "call_module" else None
+        if obs is not None:
+            found.append(obs)
     return found
 
 

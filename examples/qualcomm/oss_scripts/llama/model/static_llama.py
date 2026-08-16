@@ -671,6 +671,25 @@ class LlamaModel(nn.Module):
         self.kv_io_bit_width = config.kv_io_bit_width
         self.logits_scaling = config.logits_scaling
         self.output_hidden_layers = kwargs.get("output_hidden_layers", None)
+        # Forks the captured hiddens onto their own quantization point. Appending
+        # `hidden_states` itself exports the residual tensor, and PT2E annotates the
+        # PRODUCER, so one quantize node ends up serving the graph output AND the next
+        # layer -- measured 3 consumers apiece. Anything done to that encoding (e.g.
+        # --no_sink narrowing it to the non-sink range) then clamps the model's own
+        # residual at runtime, which calibration cannot see because observers are
+        # identity there. A build that did exactly that looked perfect at compile time
+        # and emitted EOS as its first token on device.
+        #
+        # A multiply gets its own output_qspec from annotate_binary, unlike the
+        # movement ops (clone/chunk) which take a SharedQuantizationSpec and would
+        # change nothing. Once the two sides carry different encodings the op is no
+        # longer an identity, so it cannot be folded away; if the backend does collapse
+        # it, what is left is a requantize, which is the semantics we wanted anyway.
+        self.fork_captured_hiddens = kwargs.get("fork_captured_hiddens", False)
+        if self.output_hidden_layers is not None and self.fork_captured_hiddens:
+            # persistent=False: it is graph structure, not a weight, and load_state_dict
+            # runs with strict=True against a checkpoint that has never heard of it.
+            self.register_buffer("captured_gain", torch.ones(1), persistent=False)
         # apply_output=False -> "headless": skip lm_head (self.output), return the
         # final normed hidden instead of logits, so lm_head can live in a separate
         # shared pte. The returned hidden is exactly what self.output consumes.
@@ -705,6 +724,17 @@ class LlamaModel(nn.Module):
             )
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+    def _capture(self, hidden_states):
+        """The tensor handed to the draft. Forked onto its own quantization point only
+        when --no_sink will narrow it: PT2E annotates the producer, so exporting the
+        residual itself gives one quantize node three consumers (the graph output plus
+        the next layer), and narrowing that clamps the model's own residual at runtime.
+        Costs a multiply and a requant, so keep-sink builds skip it entirely.
+        """
+        if not self.fork_captured_hiddens:
+            return hidden_states
+        return hidden_states * self.captured_gain
 
     def prepare_output_conv(self):
         def forward_output_conv(x):
@@ -744,7 +774,7 @@ class LlamaModel(nn.Module):
         captured_hiddens = [] if self.output_hidden_layers is not None else None
         for ind, decoder_layer in enumerate(self.layers):
             if captured_hiddens is not None and ind in self.output_hidden_layers:
-                captured_hiddens.append(hidden_states)
+                captured_hiddens.append(self._capture(hidden_states))
 
             k_caches = None
             v_caches = None
@@ -889,7 +919,7 @@ class LlamaModelWithoutEmbedding(LlamaModel):
         captured_hiddens = [] if self.output_hidden_layers is not None else None
         for ind, decoder_layer in enumerate(self.layers):
             if captured_hiddens is not None and ind in self.output_hidden_layers:
-                captured_hiddens.append(hidden_states)
+                captured_hiddens.append(self._capture(hidden_states))
 
             k_caches = None
             v_caches = None
@@ -1061,7 +1091,7 @@ class MultiScopeAwareLlamaModel(LlamaModel):
         captured_hiddens = [] if self.output_hidden_layers is not None else None
         for ind, decoder_layer in enumerate(self.layers):
             if captured_hiddens is not None and ind in self.output_hidden_layers:
-                captured_hiddens.append(hidden_states)
+                captured_hiddens.append(self._capture(hidden_states))
 
             k_caches = None
             v_caches = None

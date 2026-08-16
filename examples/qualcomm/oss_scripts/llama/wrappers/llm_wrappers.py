@@ -140,6 +140,7 @@ class TextDecoder(Component):
         output_hidden_layers: Optional[List[int]] = None,
         apply_output: bool = True,
         draft_head_ar: Optional[int] = None,
+        fork_captured_hiddens: bool = False,
     ):
         self.control_args = control_args
         self.config = config
@@ -148,6 +149,10 @@ class TextDecoder(Component):
         self.dep_table = get_passes_dependency_for_capture_program()
         self.meta = {}
         self.output_hidden_layers = output_hidden_layers
+        # Only --no_sink needs the captured hiddens on their own quantization point,
+        # and the fork is not free (five elementwise muls plus a requant per forward),
+        # so keep-sink builds export the residual tensor directly as they always did.
+        self.fork_captured_hiddens = fork_captured_hiddens
         # DFlash: a third emb/lm_head width, block_size wide, for the draft. The draft
         # produces exactly block_size rows per round, so sharing the target's
         # decode-width graphs made the vocab projection scale with the tree size while
@@ -394,6 +399,7 @@ class TextDecoder(Component):
             output_cache=True,
             use_i64_token=use_i64_token,
             output_hidden_layers=self.output_hidden_layers,
+            fork_captured_hiddens=self.fork_captured_hiddens,
             apply_output=self.apply_output,
             **get_model_specific_kwargs(self.control_args, self.config),
         )
@@ -556,16 +562,15 @@ class TextDecoder(Component):
                     return
 
     def _save_draft_head_quant_attrs(self):
-        """The draft-width lm_head's INPUT and OUTPUT encodings.
+        """The draft-width lm_head's INPUT and OUTPUT encodings, for the runner.
 
-        Both differ from the target's and both have to reach the runner. The input one
-        because the draft's hidden crosses to lm_head.pte as f32 and the runner
-        quantizes it on the host: with the target's scale it would waste the range the
-        target's much larger hidden needs (measured span 583 vs the draft's 117, i.e.
-        2.3 bit thrown away), so this graph keeps its own, calibrated on draft hidden.
-        The output one because the tree turns code gaps into nats with it, and the
-        gaps it scores are the DRAFT's -- reusing the target-calibrated
-        get_logits_out_scale scored one distribution with another's scale.
+        It needs both because the draft's hidden crosses to lm_head.pte as f32 and is
+        quantized on the host, and because the tree turns code gaps into nats.
+
+        Called twice: once here in quantize(), which records what this graph calibrated
+        on draft traffic, and again in compile() after those encodings are overridden
+        from decode. The second call wins; the first survives only as a log line, which
+        is how the two are compared.
         """
         q_op = torch.ops.quantized_decomposed.quantize_per_tensor.default
         dq_op = torch.ops.quantized_decomposed.dequantize_per_tensor.default
@@ -869,12 +874,20 @@ class TextDecoder(Component):
         # actually emits and its block traffic comes from real accept lengths.
         dflash_config = (
             self.dflash_draft.make_calibrator(
-                # The draft-width pair when it exists: those graphs are the ones the
-                # runner calls on the draft path, so their observers must see the
-                # draft's traffic and only the draft's.
-                self.draft_tok_embedding or self.tok_embedding,
-                self.draft_lm_head or self.lm_head,
-                self.draft_head_ar or self.meta["get_ar_len"],
+                # Deliberately the decode-width graphs, NOT the draft-width pair, even
+                # though the pair is what the runner calls. The pair takes decode's
+                # encodings by override in compile(), so it needs no traffic of its
+                # own -- and routing this loop through it perturbed the target:
+                # decoder.output is a Conv2d after convert_linear_to_conv2d, a 16-wide
+                # fp32 conv rounds differently from a 32-wide one, and an occasional
+                # flipped token in a REJECTED tree slot still trains the decoder's
+                # observers (the tree feeds the target 32 rows; ~6 are walked, all 32
+                # are observed). Measured: identical accept (211/248 over 37 rounds)
+                # but get_logits_scale moved 5.6%, which is enough to move device
+                # acceptance ~9% and make the two builds incomparable.
+                self.tok_embedding,
+                self.lm_head,
+                self.meta["get_ar_len"],
                 torch.int64
                 if self.control_args.embedding_quantize is not None
                 else torch.int32,
@@ -1234,6 +1247,12 @@ class TextDecoder(Component):
                 self._save_lm_head_output_quant_attrs()
 
             if self.draft_head_ar:
+                # Never driven by the calibration loop, so convert_pt2e still needs one
+                # forward apiece to clear the affine observer. Their encodings come
+                # from decode by override in compile(), so what these see is irrelevant.
+                with torch.no_grad():
+                    self.draft_tok_embedding(*self.draft_tok_embedding_export_input)
+                    self.draft_lm_head(*self.draft_lm_head_export_input)
                 self.draft_tok_embedding = convert_pt2e(self.draft_tok_embedding)
                 self.draft_lm_head = convert_pt2e(self.draft_lm_head)
                 self._save_draft_head_quant_attrs()
@@ -1355,6 +1374,7 @@ class HybridTextDecoder(Component):
         output_hidden_layers: Optional[List[int]] = None,
         apply_output: bool = True,
         draft_head_ar: Optional[int] = None,
+        fork_captured_hiddens: bool = False,
     ):
         # The draft-width emb/lm_head hang off the decode wrapper: that is the one
         # whose calibration loop drives the draft, and the one whose encodings the
@@ -1367,6 +1387,7 @@ class HybridTextDecoder(Component):
             output_hidden_layers=output_hidden_layers,
             apply_output=apply_output,
             draft_head_ar=draft_head_ar,
+            fork_captured_hiddens=fork_captured_hiddens,
         )
         self.prefill = TextDecoder(
             control_args,
@@ -1375,6 +1396,7 @@ class HybridTextDecoder(Component):
             apply_embedding=apply_embedding,
             output_hidden_layers=output_hidden_layers,
             apply_output=apply_output,
+            fork_captured_hiddens=fork_captured_hiddens,
         )
         self.control_args = control_args
         self.config = config
@@ -1619,14 +1641,22 @@ class HybridTextDecoder(Component):
             lm_head_example_inputs = [m.lm_head_export_input for m in lm_head_models]
             lm_head_dep_tables = [m.lm_head_dep_table for m in lm_head_models]
             lm_head_passes_jobs = [m.lm_head_passes_job for m in lm_head_models]
-            # Only the graphs the DECODER feeds get their input scale forced. That
-            # boundary is a raw uint16 buffer with no requant, so producer and consumer
-            # must agree. The draft-width graph's producer is the runner, which
-            # quantizes the draft's f32 hidden on the host and can therefore use
-            # whatever scale this graph calibrated for itself.
             for m in lm_head_models:
                 m._override_lm_head_input_scale(hidden_scale, hidden_zp)
             if self.decode.draft_lm_head is not None:
+                # The draft-width graph takes decode's encodings wholesale rather than
+                # keeping the ones it calibrated on draft traffic. Its own were finer
+                # (hidden 0.58x, logits 0.65x of the target's), but device A/B showed
+                # them to be decision-neutral -- same pte, 72 rounds and 437 tokens
+                # either way -- so keeping them only adds a variable to every
+                # comparison. Run AFTER the input injection above so the draft graph
+                # inherits that too, and re-read the getters, which quantize() filled
+                # from the pre-override graph.
+                self._encoding_override(
+                    decode_model=self.decode.lm_head,
+                    prefill_model=self.decode.draft_lm_head,
+                )
+                self.decode._save_draft_head_quant_attrs()
                 lm_head_modules.append(self.decode.draft_lm_head)
                 lm_head_example_inputs.append(self.decode.draft_lm_head_export_input)
                 lm_head_dep_tables.append(self.decode.draft_lm_head_dep_table)

@@ -1060,6 +1060,9 @@ class DFlashManager(Component):
             # are exactly block_size rows, so borrowing the target's decode graphs
             # both wasted the padding and mixed the two models' statistics.
             draft_head_ar=cfg.block_size,
+            # Only --no_sink narrows the captured encodings, and only then do they
+            # need to be off the residual's quantization point.
+            fork_captured_hiddens=cfg.no_sink,
         )
         self.draft_compiler = DFlashDraftCompiler(
             control_args, config, ckpt, max_ctx, prefill_ar, share_lm_head=True
