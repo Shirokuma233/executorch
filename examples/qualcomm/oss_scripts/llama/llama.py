@@ -827,6 +827,17 @@ def _build_parser():
         "silently for every build.",
     )
     parser.add_argument(
+        "--sink_split",
+        action="store_true",
+        help="[DFlash mode] Keep feeding the sink to the draft, but calibrate the "
+        "draft-facing encodings separately per phase. Only the prefill graph ever "
+        "processes position 0 at runtime, so its captured/new_context ranges are "
+        "banked at the end of the prompt (covering the sink) and the observers are "
+        "then reset, leaving the speculative loop to calibrate the decode graphs on "
+        "generation rows alone. Gets --no_sink's ~4.4 bits on every generation row "
+        "without giving up the sink's context. Mutually exclusive with --no_sink.",
+    )
+    parser.add_argument(
         "--dflash_tree_nodes",
         default=0,
         type=int,

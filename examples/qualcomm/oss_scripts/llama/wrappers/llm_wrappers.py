@@ -160,6 +160,9 @@ class TextDecoder(Component):
         # all of it padding. Separate graphs also give the draft its own boundary
         # encodings, calibrated on draft traffic instead of the target's.
         self.draft_head_ar = draft_head_ar
+        # Filled at the prompt/generation boundary under --sink_split; compile()
+        # stamps it back onto the prefill graph after the decode override.
+        self.sink_split_qparams = None
         self.draft_tok_embedding = None
         self.draft_lm_head = None
         self.draft_tok_embedding_passes_job = (
@@ -921,6 +924,11 @@ class TextDecoder(Component):
                 dflash_config=dflash_config,
             )
             input_samples.extend(input_sample)
+        # Hand the phase-banked prefill encodings to compile(), which stamps them back
+        # after the decode->prefill override has overwritten them. dflash_config is
+        # local to this method, which is why the assignment lives here.
+        if dflash_config is not None:
+            self.sink_split_qparams = dflash_config.prefill_qparams
         return input_samples
 
     def _override_lm_head_input_scale(self, scale, zero_point):
@@ -1408,6 +1416,43 @@ class HybridTextDecoder(Component):
     # Static so the DFlash draft can reuse it: its two graphs share one KV cache
     # too, so they need identical encodings for the same reason hybrid does.
     @staticmethod
+    def _stamp_tail_output_encoding(model, n, qparams, what):
+        """Force the encodings of the LAST `n` graph outputs.
+
+        Runs AFTER _encoding_override, whose whole job is to copy decode's encodings
+        onto prefill -- these are the two tensors that must NOT inherit them. The
+        draft-facing captured hiddens are the only outputs whose prefill and decode
+        ranges legitimately differ, because prefill is the only graph that ever sees
+        position 0 and because that boundary crosses to the draft as f32, not as a
+        shared uint16 buffer like the KV cache.
+
+        Positional, matching _captured_hidden_observers: the decoder returns
+        (final_hidden, k..., v..., *captured), so the captured ones are the tail.
+        """
+        out_node = next(x for x in model.graph.nodes if x.op == "output")
+        outs = list(out_node.args[0])[-n:]
+        q_op = torch.ops.quantized_decomposed.quantize_per_tensor.default
+        dq_op = torch.ops.quantized_decomposed.dequantize_per_tensor.default
+        patched = 0
+        for out, (scale, zp) in zip(outs, qparams):
+            if out.target is not dq_op:
+                continue
+            out.args = (out.args[0], scale, zp, *out.args[3:])
+            src = out.args[0]
+            if getattr(src, "target", None) is q_op:
+                src.args = (src.args[0], scale, zp, *src.args[3:])
+            patched += 1
+        model.recompile()
+        logging.info(
+            "sink_split: stamped prefill encoding onto %d/%d %s outputs -> %s",
+            patched, n, what, [f"{s:.8f}" for s, _ in qparams],
+        )
+        if patched != n:
+            raise RuntimeError(
+                f"sink_split stamped {patched} of {n} {what} outputs"
+            )
+
+    @staticmethod
     def _encoding_override(decode_model, prefill_model):  # noqa: C901
         pbq_target = {
             torch.ops.torchao.dequantize_affine,
@@ -1528,6 +1573,11 @@ class HybridTextDecoder(Component):
                 decode_model=self.decode.decoder,
                 prefill_model=self.prefill.decoder,
             )
+            qp = getattr(self.decode, "sink_split_qparams", None)
+            if qp:
+                self._stamp_tail_output_encoding(
+                    self.prefill.decoder, len(qp), qp, "captured-hidden"
+                )
             if self.apply_embedding:
                 self._encoding_override(
                     decode_model=self.decode.tok_embedding,

@@ -124,6 +124,11 @@ class DFlashConfig:
         # for every build while the command line looked like it was in charge.
         # Set from --no_sink by whoever constructs this.
         self.no_sink: bool = False
+        # --sink_split: keep feeding the sink row to the draft, but calibrate the
+        # draft-facing encodings PER PHASE -- prefill's range covers the sink (it is
+        # the only graph that ever processes position 0), decode's is banked fresh
+        # from the generation rows. Mutually exclusive with no_sink.
+        self.sink_split: bool = False
         # Two decode conventions, and they are off by one from each other:
         #
         #   aligned (DFlashDraftModel, e.g. Qwen3-4B-DFlash-b16)
@@ -553,6 +558,37 @@ def _draft_atten_mask(B, Cc, AR, n_past, n_new):
     return row.view(1, 1, W).expand(1, B, W).contiguous()
 
 
+def _stamp_input_encoding(model, ph_idx, qparams, what):
+    """Force the encoding of placeholder `ph_idx`'s quantize/dequantize pair.
+
+    The mirror of HybridTextDecoder._stamp_tail_output_encoding, for an INPUT rather
+    than an output. Runs after _encoding_override, which would otherwise give the
+    prefill graph decode's (sink-free) range for a tensor that does carry the sink
+    during seeding.
+    """
+    import logging
+
+    phs = [n for n in model.graph.nodes if n.op == "placeholder"]
+    q_op = torch.ops.quantized_decomposed.quantize_per_tensor.default
+    dq_op = torch.ops.quantized_decomposed.dequantize_per_tensor.default
+    scale, zp = qparams
+    patched = 0
+    for user in list(phs[ph_idx].users):
+        if user.target is q_op:
+            user.args = (user.args[0], scale, zp, *user.args[3:])
+            patched += 1
+            for dq in list(user.users):
+                if dq.target is dq_op:
+                    dq.args = (dq.args[0], scale, zp, *dq.args[3:])
+    model.recompile()
+    logging.info(
+        "sink_split: stamped prefill encoding onto %s (patched=%d scale=%.8f zp=%d)",
+        what, patched, scale, zp,
+    )
+    if patched == 0:
+        raise RuntimeError(f"sink_split found no quantize node on {what}")
+
+
 class DFlashCalibrator:
     """Drives the draft inside the target's calibration loop, so both graphs'
     observers see the traffic they actually get at inference.
@@ -596,6 +632,12 @@ class DFlashCalibrator:
         self.tree = tree
         self.B = self.block_size = cfg.block_size
         self.no_sink = cfg.no_sink
+        self.sink_split = cfg.sink_split
+        # --no_sink withholds the row from the draft entirely; --sink_split feeds it
+        # and separates the encodings by phase instead.
+        self.drop_sink_row = cfg.no_sink
+        self.prefill_qparams = None        # target's 5 captured, banked at the boundary
+        self.draft_prefill_qparams = None  # the draft's new_context, same boundary
         self.n_draft = self.B if cfg.shifted_decode else self.B - 1
         self.hidden_row0 = 0 if cfg.shifted_decode else 1
         self.Cc = max_context_len - ar
@@ -608,6 +650,32 @@ class DFlashCalibrator:
         # First block's worth of (rows, committed) kept for the QDQ-vs-fp32 verify,
         # which used to re-derive them from the dumped hidden.
         self.verify_sample = None
+
+    def new_context_observer(self):
+        """The observer on the draft's new_context input.
+
+        Placeholder index 2 -- the draft graph takes
+        (noise, atten_mask, new_context, context_pos, block_pos, past_k..., past_v...),
+        see DFlashDraftModel.get_example_inputs. prepare_pt2e inserts the observer as
+        that placeholder's call_module user.
+        """
+        phs = [n for n in self.draft.graph.nodes if n.op == "placeholder"]
+        for user in phs[2].users:
+            if user.op == "call_module":
+                obs = getattr(self.draft, user.target, None)
+                if obs is not None:
+                    return obs
+        raise RuntimeError("draft new_context observer not found")
+
+    def bank_draft_prefill_qparams(self):
+        """Bank + reset the draft's new_context encoding at the prompt/generation
+        boundary, mirroring what kv_inference does for the target's captured five."""
+        if not self.sink_split:
+            return
+        from executorch.examples.qualcomm.oss_scripts.llama.decoder_utils import (
+            _bank_and_reset,
+        )
+        self.draft_prefill_qparams = _bank_and_reset([self.new_context_observer()])[0]
 
     def can_append(self, n_new: int) -> bool:
         return self.ctx_len + n_new <= self.Cc
@@ -688,6 +756,7 @@ class DFlashDraftCompiler(Component):
         self.config = config
         sd, cfg = load_dflash_checkpoint(ckpt_dir)
         cfg.no_sink = control_args.no_sink
+        cfg.sink_split = getattr(control_args, "sink_split", False)
         self.dflash_cfg = cfg
         self.prefill_ar = prefill_ar
 
@@ -865,6 +934,13 @@ class DFlashDraftCompiler(Component):
         HybridTextDecoder._encoding_override(
             decode_model=self.decode, prefill_model=self.prefill
         )
+        # Same exception as the target's captured hiddens: new_context is an f32
+        # INPUT, not shared state, so the two graphs may carry different ranges --
+        # prefill's covers the sink, decode's was banked fresh from generation rows.
+        # The KV encodings above must stay identical and are untouched.
+        qp = getattr(self.calibrator, "draft_prefill_qparams", None)
+        if qp is not None:
+            _stamp_input_encoding(self.prefill, 2, qp, "draft new_context")
         logging.info(
             "DFlash draft quantized over %d speculative rounds "
             "(16a4w; fc/down_proj/lm_head 16a8w protected)",
@@ -1019,6 +1095,7 @@ class DFlashManager(Component):
         ckpt = control_args.dflash_draft_checkpoint
         cfg = load_dflash_config(ckpt)
         cfg.no_sink = control_args.no_sink
+        cfg.sink_split = getattr(control_args, "sink_split", False)
         max_ctx = (
             getattr(control_args, "dflash_max_context_len", 0)
             or control_args.max_context_len
@@ -1062,7 +1139,7 @@ class DFlashManager(Component):
             draft_head_ar=cfg.block_size,
             # Only --no_sink narrows the captured encodings, and only then do they
             # need to be off the residual's quantization point.
-            fork_captured_hiddens=cfg.no_sink,
+            fork_captured_hiddens=cfg.no_sink or cfg.sink_split,
         )
         self.draft_compiler = DFlashDraftCompiler(
             control_args, config, ckpt, max_ctx, prefill_ar, share_lm_head=True

@@ -422,45 +422,25 @@ def _prefill_chunking(
     with torch.no_grad():
         num_prompt_tokens = len(total_token_list)
         pos = 0  # Tracks how many prompt tokens have been processed.
-        # --no_sink: position 0 still runs -- everything after it has to attend to the
-        # sink -- but its captured hidden must not widen the range the draft inherits.
-        # Measured on Qwen3-4B, that row runs 58x the next largest and costs the four
-        # deep captures 5.5 to 8.9 bits each.
+        # --sink_split keeps position 0 in the draft's context but stops it from
+        # setting the range the GENERATION rows are quantized to. Measured on
+        # Qwen3-4B the sink row runs 58x the next largest (16391.8 vs 280.3), and a
+        # per-tensor encoding that has to cover it costs every other row ~4.4 bits.
         #
-        # This is only safe because static_llama forks the captured hiddens through
-        # `captured_gain` first. Without that fork the observer below is the residual
-        # stream's own, shared with the next layer, and narrowing it clamps the model
-        # (verify with ddtree/workspace/probe_captured_sharing.py: one consumer, not
-        # three). Calibration cannot detect the difference -- observers are identity
-        # here -- so the check has to be on the compiled graph.
+        # The split is possible because prefill and decode are different graphs and
+        # only prefill ever sees position 0 at runtime (eval_mode 4 wires
+        # prompt_processor=prefill_forward, token_generator=kv_forward). So the phase
+        # boundary here IS the graph boundary: whatever the captured observers hold
+        # when the prompt finishes is what the PREFILL graph should carry, and they
+        # are then reset so the speculative loop alone calibrates the DECODE graph.
+        # kv_inference snapshots and resets them between the two phases; nothing is
+        # needed inside this loop.
         #
-        # The chunking is left alone so nothing else in the graph sees the flag: the
-        # first chunk runs full width exactly as it does with the sink kept, and the
-        # captured observers are afterwards rewound and re-fed rows 1.. by hand. That
-        # rewind is exact for MinMax and only for MinMax, since min/max over a subset
-        # is the same whether or not the superset was seen first.
-        withhold_sink = dflash_config is not None and dflash_config.no_sink
-        n_captured = (
-            len(dflash_config.cfg.target_layer_ids) if dflash_config is not None else 0
-        )
+        # Splitting by phase rather than by "exclude row 0" also means a sink that
+        # re-fires mid-sequence (documented on the 8B) widens the decode range by
+        # itself instead of being clipped.
         while pos < num_prompt_tokens:
             chunk_start_idx, chunk_end_idx = pos, min(num_prompt_tokens, pos + ar_len)
-            snap = (
-                _observer_snapshot(_captured_hidden_observers(module, n_captured))
-                if (withhold_sink and pos == 0) else None
-            )
-            if snap is not None:
-                # Hard-fail: a wrong count means the flag silently does nothing, which
-                # is how a useless build once got all the way to the device.
-                if len(snap) != n_captured:
-                    raise RuntimeError(
-                        f"--no_sink selected {len(snap)} captured-hidden observers, "
-                        f"expected {n_captured}"
-                    )
-                logging.info(
-                    "no_sink: sink row withheld from %d captured-hidden observers",
-                    len(snap),
-                )
 
             # Take a chunk of prompt tokens, up to ar_len length.
             if inputs.input_ids is not None:
@@ -543,13 +523,6 @@ def _prefill_chunking(
                             *v_caches,
                         )
 
-            if snap is not None:
-                # Rewind the captured observers over this chunk and re-feed it without
-                # row 0. Everything else in the graph keeps what the full chunk gave it.
-                _observer_restore(snap)
-                for (obs, _), h in zip(snap, _eagle_extra):
-                    obs(h[:, 1:])
-
             # Seed the DFlash draft from the same chunk. `_eagle_extra` carries the
             # selected hidden layers this graph exports; they were being dropped on
             # the floor while the draft recomputed a worse copy of them elsewhere.
@@ -560,7 +533,7 @@ def _prefill_chunking(
                 rows = torch.cat(
                     [h[0, :num_tokens_in_chunk] for h in _eagle_extra], dim=-1
                 )
-                skip = 1 if (dflash_config.no_sink and pos == 0) else 0
+                skip = 1 if (dflash_config.drop_sink_row and pos == 0) else 0
                 # The draft's new_context is [1, draft_ar, .], so it cannot swallow
                 # a target chunk in one call once the two ar's diverge -- which they
                 # do as soon as the target widens for a tree.
@@ -627,6 +600,23 @@ def _captured_hidden_observers(module, n):
         if obs is not None:
             found.append(obs)
     return found
+
+
+def _bank_and_reset(observers):
+    """Read each observer's qparams, then clear it back to its initial state.
+
+    Used at the prompt/generation boundary: the range accumulated so far belongs to
+    the prefill graph (the only one that sees position 0 at runtime), and the range
+    accumulated after belongs to the decode graph. Splitting by phase rather than by
+    "exclude row 0" also lets a sink that re-fires mid-sequence widen the decode
+    range on its own instead of being clipped.
+    """
+    banked = []
+    for obs in observers:
+        scale, zp = obs.calculate_qparams()
+        banked.append((float(scale.reshape(-1)[0]), int(zp.reshape(-1)[0])))
+        obs.reset_min_max_vals()
+    return banked
 
 
 def _observer_snapshot(observers):
@@ -1185,6 +1175,28 @@ def kv_inference(  # noqa: C901
             total_token_list,
             dflash_config=dflash_config,
         )
+
+        # The prompt is done, so whatever the draft-facing observers hold right now is
+        # exactly what the PREFILL graphs will carry at runtime -- prefill is the only
+        # graph that ever processes position 0. Bank those qparams and reset, so the
+        # speculative loop below calibrates the DECODE graphs on generation rows alone.
+        # compile() stamps the banked values back onto the prefill graphs after the
+        # usual decode->prefill override has run.
+        if dflash_config is not None and dflash_config.sink_split:
+            n_cap = len(dflash_config.cfg.target_layer_ids)
+            obs = _captured_hidden_observers(module, n_cap)
+            if len(obs) != n_cap:
+                raise RuntimeError(
+                    f"sink_split found {len(obs)} captured-hidden observers, "
+                    f"expected {n_cap}"
+                )
+            dflash_config.prefill_qparams = _bank_and_reset(obs)
+            dflash_config.bank_draft_prefill_qparams()
+            logging.info(
+                "sink_split: banked prefill qparams for %d captured hiddens "
+                "+ the draft's new_context, observers reset for the decode phase",
+                len(obs),
+            )
 
         # Phase 2: Generate tokens until the EOS token is generated or max_seq_len is reached.
         # When run on wikitext for ppl evaluation, this while-loop is not expected to run.
