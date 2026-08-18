@@ -1434,22 +1434,34 @@ class HybridTextDecoder(Component):
         q_op = torch.ops.quantized_decomposed.quantize_per_tensor.default
         dq_op = torch.ops.quantized_decomposed.dequantize_per_tensor.default
         patched = 0
+        # Every consumer of the quantize, not just the one on the output path. Without
+        # the captured_gain fork this node is the residual stream's own and has THREE
+        # dequantize users (graph output, next layer, residual add); leaving two of
+        # them on the decode scale while the tensor is stored on the prefill scale
+        # multiplies the residual by their ratio -- a silent corruption that compiles
+        # clean and shows up on device as EOS from the first token.
+        deqs = 0
         for out, (scale, zp) in zip(outs, qparams):
             if out.target is not dq_op:
                 continue
-            out.args = (out.args[0], scale, zp, *out.args[3:])
             src = out.args[0]
-            if getattr(src, "target", None) is q_op:
-                src.args = (src.args[0], scale, zp, *src.args[3:])
+            if getattr(src, "target", None) is not q_op:
+                continue
+            src.args = (src.args[0], scale, zp, *src.args[3:])
+            for user in list(src.users):
+                if user.target is dq_op:
+                    user.args = (user.args[0], scale, zp, *user.args[3:])
+                    deqs += 1
             patched += 1
         model.recompile()
         logging.info(
-            "sink_split: stamped prefill encoding onto %d/%d %s outputs -> %s",
-            patched, n, what, [f"{s:.8f}" for s, _ in qparams],
+            "sink_split: stamped prefill encoding onto %d/%d %s outputs "
+            "(%d dequantize users) -> %s",
+            patched, n, what, deqs, [f"{s:.8f}" for s, _ in qparams],
         )
-        if patched != n:
+        if patched != n or deqs < patched:
             raise RuntimeError(
-                f"sink_split stamped {patched} of {n} {what} outputs"
+                f"sink_split stamped {patched} of {n} {what} outputs, {deqs} dequantizes"
             )
 
     @staticmethod
