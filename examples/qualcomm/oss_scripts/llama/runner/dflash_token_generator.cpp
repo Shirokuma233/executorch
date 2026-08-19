@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <limits>
@@ -796,42 +797,193 @@ void DFlashTokenGenerator::draft_topk(
 // one argmax per depth, `depth_limit` nodes, single path. That is the whole
 // tree_budget == 0 path, so the chain runs the same code as the tree.
 // ---------------------------------------------------------------------------
+void DFlashTokenGenerator::note_committed(uint64_t token) {
+  const int32_t n = static_cast<int32_t>(committed_tail_.size());
+  for (int32_t lag = 1; lag <= std::min(n, kRepLag); ++lag) {
+    if (committed_tail_[n - lag] == token) {
+      repeat_seen_[lag].insert(token);
+    }
+  }
+  committed_tail_.push_back(token);
+  if (static_cast<int32_t>(committed_tail_.size()) > kRepLag) {
+    committed_tail_.erase(committed_tail_.begin());
+  }
+}
+
+bool DFlashTokenGenerator::token_is_numeric(uint64_t token) {
+  const auto it = numeric_cache_.find(token);
+  if (it != numeric_cache_.end()) {
+    return it->second;
+  }
+  bool numeric = false;
+  auto piece = tokenizer_->decode(token, token);
+  if (piece.ok()) {
+    for (const char ch : piece.get()) {
+      if (ch >= '0' && ch <= '9') {
+        numeric = true;
+        break;
+      }
+    }
+  }
+  numeric_cache_.emplace(token, numeric);
+  return numeric;
+}
+
+float DFlashTokenGenerator::repeat_penalty(
+    uint64_t token,
+    const uint64_t* path,
+    int32_t path_len) {
+  // Nearest occurrence wins: a token two slots back that is also five slots back
+  // is charged as lag 2, matching how the table was measured.
+  ++rep_scored_;
+  for (int32_t lag = 1; lag <= std::min(path_len, kRepLag); ++lag) {
+    if (path[path_len - lag] == token) {
+      const bool gated = repeat_seen_[lag].count(token) > 0;
+      ++rep_charged_;
+      rep_lag1_ += (lag == 1);
+      rep_gated_ += gated;
+      return kRepPenalty[gated ? 1 : 0][lag - 1];
+    }
+  }
+  return 0.0f;
+}
+
+void DFlashTokenGenerator::fill_candidates(
+    int32_t node,
+    int32_t depth,
+    int32_t k,
+    bool calib) {
+  const size_t base = static_cast<size_t>(depth - 1) * k;
+  const float* lp = draft_logp_.data() + base;
+  const uint64_t* id = draft_ids_.data() + base;
+  float* sc = cand_score_.data() + static_cast<size_t>(node) * k;
+  uint64_t* tk = cand_token_.data() + static_cast<size_t>(node) * k;
+  const uint64_t* path = path_tail_.data() + static_cast<size_t>(node) * kRepLag;
+  const int32_t plen = path_len_[node];
+  bool charged = false;
+  for (int32_t c = 0; c < k; ++c) {
+    const float pen = calib ? repeat_penalty(id[c], path, plen) : 0.0f;
+    charged |= (pen != 0.0f);
+    sc[c] = lp[c] - pen;
+    tk[c] = id[c];
+  }
+  if (!charged) {
+    return; // draft_topk left the row descending, so it is already sorted
+  }
+  cand_order_.resize(k);
+  cand_tmp_score_.resize(k);
+  cand_tmp_token_.resize(k);
+  for (int32_t c = 0; c < k; ++c) {
+    cand_order_[c] = c;
+  }
+  std::stable_sort(
+      cand_order_.begin(), cand_order_.end(), [sc](int32_t a, int32_t b) {
+        return sc[a] > sc[b];
+      });
+  for (int32_t c = 0; c < k; ++c) {
+    cand_tmp_score_[c] = sc[cand_order_[c]];
+    cand_tmp_token_[c] = tk[cand_order_[c]];
+  }
+  std::copy(cand_tmp_score_.begin(), cand_tmp_score_.end(), sc);
+  std::copy(cand_tmp_token_.begin(), cand_tmp_token_.end(), tk);
+}
+
+void DFlashTokenGenerator::probe_round(
+    const std::vector<uint64_t>& true_tokens,
+    int32_t n_draft) {
+  const int32_t k = draft_topk_;
+  std::vector<uint64_t> tail(committed_tail_);
+  for (size_t d = 1; d <= true_tokens.size() && d <= static_cast<size_t>(n_draft);
+       ++d) {
+    const uint64_t truth = true_tokens[d - 1];
+    const size_t base = (d - 1) * static_cast<size_t>(k);
+    const int32_t plen = static_cast<int32_t>(tail.size());
+    for (int32_t c = 0; c < k; ++c) {
+      const uint64_t z = draft_ids_[base + c];
+      const double q = std::exp(static_cast<double>(draft_logp_[base + c]));
+      size_t bucket = 0;
+      for (int32_t lag = 1; lag <= std::min(plen, kRepLag); ++lag) {
+        if (tail[plen - lag] == z) {
+          const size_t gated = repeat_seen_[lag].count(z) ? 1 : 0;
+          const size_t numeric = token_is_numeric(z) ? 1 : 0;
+          bucket = 1 + (gated * 2 + numeric) * kRepLag + (lag - 1);
+          break;
+        }
+      }
+      probe_q_[bucket] += q;
+      probe_hit_[bucket] += (z == truth) ? 1.0 : 0.0;
+      ++probe_n_[bucket];
+    }
+    tail.push_back(truth);
+    if (static_cast<int32_t>(tail.size()) > kRepLag) {
+      tail.erase(tail.begin());
+    }
+  }
+}
+
 void DFlashTokenGenerator::build_tree(int32_t budget, int32_t depth_limit) {
   struct Cand {
     float logw;
     int32_t parent; // slot
-    int32_t depth; // 1-based
-    int32_t rank;
+    int32_t ptr; // position in the PARENT's candidate ordering
     bool operator<(const Cand& o) const {
       return logw < o.logw; // priority_queue pops the greatest
     }
   };
   const int32_t k = draft_topk_;
+  const bool calib = dflash_meta_.repeat_calib && dflash_meta_.tree_budget > 0;
+  const size_t nslot = static_cast<size_t>(budget) + 1;
   tree_.clear();
-  tree_children_.assign(static_cast<size_t>(budget) + 1, {});
-  auto logp = [&](int32_t depth, int32_t rank) {
-    return draft_logp_[static_cast<size_t>(depth - 1) * k + rank];
-  };
+  tree_children_.assign(nslot, {});
+  cand_score_.resize(nslot * k);
+  cand_token_.resize(nslot * k);
+  path_tail_.resize(nslot * kRepLag);
+  path_len_.resize(nslot);
+
+  // Node 0 is the confirmed root, and its path is what has already been
+  // committed -- a depth-1 candidate equal to the root token is the single most
+  // common repeat, so this seeding is not an edge case.
+  path_len_[0] = static_cast<int32_t>(committed_tail_.size());
+  std::copy(committed_tail_.begin(), committed_tail_.end(), path_tail_.begin());
 
   std::priority_queue<Cand> heap;
-  heap.push(Cand{logp(1, 0), 0, 1, 0});
+  fill_candidates(0, 1, k, calib);
+  heap.push(Cand{cand_score_[0], 0, 0});
   while (!heap.empty() && static_cast<int32_t>(tree_.size()) < budget) {
     const Cand c = heap.top();
     heap.pop();
-    const uint64_t token =
-        draft_ids_[static_cast<size_t>(c.depth - 1) * k + c.rank];
+    const size_t pbase = static_cast<size_t>(c.parent) * k;
+    const uint64_t token = cand_token_[pbase + c.ptr];
     const int32_t slot = static_cast<int32_t>(tree_.size()) + 1;
-    tree_.push_back(TreeNode{token, c.parent, c.depth});
+    const int32_t depth =
+        c.parent == 0 ? 1 : tree_[static_cast<size_t>(c.parent) - 1].depth + 1;
+    tree_.push_back(TreeNode{token, c.parent, depth});
     tree_children_[c.parent].emplace_back(token, slot);
-    if (c.rank + 1 < k) {
-      heap.push(Cand{
-          c.logw - logp(c.depth, c.rank) + logp(c.depth, c.rank + 1),
-          c.parent,
-          c.depth,
-          c.rank + 1});
+
+    const uint64_t* ppath =
+        path_tail_.data() + static_cast<size_t>(c.parent) * kRepLag;
+    uint64_t* npath = path_tail_.data() + static_cast<size_t>(slot) * kRepLag;
+    const int32_t plen = path_len_[c.parent];
+    if (plen < kRepLag) {
+      std::copy(ppath, ppath + plen, npath);
+      npath[plen] = token;
+      path_len_[slot] = plen + 1;
+    } else {
+      std::copy(ppath + 1, ppath + kRepLag, npath);
+      npath[kRepLag - 1] = token;
+      path_len_[slot] = kRepLag;
     }
-    if (c.depth < depth_limit) {
-      heap.push(Cand{c.logw + logp(c.depth + 1, 0), slot, c.depth + 1, 0});
+
+    if (c.ptr + 1 < k) {
+      heap.push(Cand{
+          c.logw - cand_score_[pbase + c.ptr] + cand_score_[pbase + c.ptr + 1],
+          c.parent,
+          c.ptr + 1});
+    }
+    if (depth < depth_limit) {
+      fill_candidates(slot, depth + 1, k, calib);
+      heap.push(
+          Cand{c.logw + cand_score_[static_cast<size_t>(slot) * k], slot, 0});
     }
   }
 }
@@ -1245,6 +1397,17 @@ Result<int64_t> DFlashTokenGenerator::generate(
   int64_t cur_pos = start_pos; // position of the block's slot 0
   uint64_t last_committed = tokens.back();
 
+  // The repeat gate learns from the prompt too -- a code prompt hands it the
+  // indentation and separator tokens that legitimately double before the first
+  // round runs, which is exactly where a blanket repeat penalty would misfire.
+  for (auto& seen : repeat_seen_) {
+    seen.clear();
+  }
+  committed_tail_.clear();
+  for (uint64_t t : tokens) {
+    note_committed(t);
+  }
+
   // Rows staged for the next draft call: the hidden of the tokens committed by
   // the previous round. Empty on the first round — the prompt already seeded
   // Cache B, so that call appends nothing.
@@ -1276,13 +1439,18 @@ Result<int64_t> DFlashTokenGenerator::generate(
       "[DFlash] tree needs --dflash_logit_out_scale (lm_head output encoding)");
   ET_LOG(
       Info,
-      "[DFlash] draft %s: budget=%d topk=%d depth_limit=%d ar=%d logit_scale=%g",
+      "[DFlash] draft %s: budget=%d topk=%d depth_limit=%d ar=%d logit_scale=%g "
+      "repeat_calib=%d",
       dflash_meta_.tree_budget > 0 ? "tree" : "chain",
       budget,
       draft_topk_,
       n_draft,
       dflash_meta_.target_ar_len,
-      dflash_meta_.logit_out_scale);
+      dflash_meta_.logit_out_scale,
+      static_cast<int>(dflash_meta_.repeat_calib && dflash_meta_.tree_budget > 0));
+
+  repeat_probe_ = getenv("DFLASH_REPEAT_PROBE") != nullptr;
+  numeric_cache_.clear();
 
   const int64_t t_decode = time_in_us();
   while (cur_pos < static_cast<int64_t>(seq_len) - 1) {
@@ -1373,6 +1541,21 @@ Result<int64_t> DFlashTokenGenerator::generate(
 
     stage_us_[kStageCopy] += time_in_us() - t_cp;
 
+    // The gate must see committed tokens in order, and must see them before the
+    // next tree is built. The emit loop below can exit early on EOS, so this
+    // cannot ride along with it.
+    std::vector<uint64_t> committed_now;
+    for (int k = 1; k <= accepted; ++k) {
+      committed_now.push_back(tree_[static_cast<size_t>(path[k]) - 1].token);
+    }
+    committed_now.push_back(bonus);
+    if (repeat_probe_) {
+      probe_round(committed_now, n_draft);
+    }
+    for (uint64_t t : committed_now) {
+      note_committed(t);
+    }
+
     total_accepted_ += static_cast<uint64_t>(accepted);
     ET_LOG(
         Debug,
@@ -1455,13 +1638,52 @@ Result<int64_t> DFlashTokenGenerator::generate(
     // means the budget is too small to branch and the tree is just a chain.
     ET_LOG(
         Info,
-        "[DFlash] tree: budget=%d topk=%d nodes/round=%.2f max_depth/round=%.2f",
+        "[DFlash] tree: budget=%d topk=%d nodes/round=%.2f max_depth/round=%.2f"
+        " | repeat: scored=%llu charged=%llu (%.2f%%) lag1=%llu gated=%llu",
         budget,
         draft_topk_,
         static_cast<double>(total_tree_nodes_) /
             static_cast<double>(target_verify_calls_),
         static_cast<double>(total_tree_depth_) /
-            static_cast<double>(target_verify_calls_));
+            static_cast<double>(target_verify_calls_),
+        static_cast<unsigned long long>(rep_scored_),
+        static_cast<unsigned long long>(rep_charged_),
+        rep_scored_ ? 100.0 * static_cast<double>(rep_charged_) /
+                static_cast<double>(rep_scored_)
+                    : 0.0,
+        static_cast<unsigned long long>(rep_lag1_),
+        static_cast<unsigned long long>(rep_gated_));
+
+    if (repeat_probe_) {
+      for (size_t g = 0; g < 2; ++g) {
+        for (size_t nm = 0; nm < 2; ++nm) {
+          for (int32_t lag = 1; lag <= kRepLag; ++lag) {
+            const size_t b = 1 + (g * 2 + nm) * kRepLag + (lag - 1);
+            if (probe_n_[b] == 0) {
+              continue;
+            }
+            ET_LOG(
+                Info,
+                "[DFlash][probe] gated=%zu numeric=%zu lag=%d n=%llu sumq=%.2f "
+                "hit=%.0f R=%.3f",
+                g,
+                nm,
+                lag,
+                static_cast<unsigned long long>(probe_n_[b]),
+                probe_q_[b],
+                probe_hit_[b],
+                probe_hit_[b] / std::max(probe_q_[b], 1e-9));
+          }
+        }
+      }
+      ET_LOG(
+          Info,
+          "[DFlash][probe] norepeat n=%llu sumq=%.2f hit=%.0f R=%.3f",
+          static_cast<unsigned long long>(probe_n_[0]),
+          probe_q_[0],
+          probe_hit_[0],
+          probe_hit_[0] / std::max(probe_q_[0], 1e-9));
+    }
 
     // Per-round stage breakdown. One line per stage so it parses with a regex,
     // and an `other` row carrying whatever the stages failed to claim -- without

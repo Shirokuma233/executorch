@@ -15,6 +15,8 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace example {
@@ -112,6 +114,8 @@ class DFlashTokenGenerator : public TokenGenerator {
     float draft_hidden_scale;
     int32_t draft_hidden_zero_point;
     float draft_logit_out_scale;
+    // Charge the tree for repeated tokens (see kRepPenalty). Tree path only.
+    bool repeat_calib;
   };
 
   DFlashTokenGenerator(
@@ -221,7 +225,24 @@ class DFlashTokenGenerator : public TokenGenerator {
   // Fills tree_ / tree_children_ with `budget` non-root nodes. Block diffusion
   // makes this free -- depth d's distribution is a marginal that one draft
   // forward already produced, so widening the tree never costs another one.
+  //
+  // With repeat_calib the score a candidate gets depends on the PATH, so two
+  // nodes at the same depth no longer agree on an ordering and the heap can no
+  // longer walk one shared per-depth top-k list: every node carries its own
+  // sorted candidate array and a sibling is the next entry in THAT array.
   void build_tree(int32_t budget, int32_t depth_limit);
+
+  // Sorted child candidates of `node`, into cand_score_/cand_token_.
+  void fill_candidates(int32_t node, int32_t depth, int32_t k, bool calib);
+
+  // Nats to subtract from `token` because it repeats something `path` already
+  // emitted. 0 when it does not repeat, or when this context has shown that this
+  // token legitimately repeats at that lag.
+  float repeat_penalty(uint64_t token, const uint64_t* path, int32_t path_len);
+
+
+  // Feed one committed token to the repeat gate and the rolling tail.
+  void note_committed(uint64_t token);
 
   // Slot of `token` under `parent`, or -1. Linear over the children a node
   // actually has, which the budget bounds well below any threshold where a map
@@ -306,6 +327,87 @@ class DFlashTokenGenerator : public TokenGenerator {
   };
   std::vector<TreeNode> tree_;
   std::vector<std::vector<std::pair<uint64_t, int32_t>>> tree_children_;
+
+  // ---- repeat calibration (ddtree/workspace/REPCAL.md) ----
+  //
+  // Block diffusion denoises all B-1 slots in ONE bidirectional pass, so p_d is
+  // a marginal: it never sees which token the path took above it. The model is
+  // therefore unsure WHICH slot a token belongs in, and the same z scores high
+  // at depth d and d+1 -- so the product of marginals happily spends nodes on
+  // paths that emit z twice, which the true joint almost never does.
+  //
+  // Measured on 30 host traces, 2.76M candidates, as R = sum(hit)/sum(q) with
+  // the prefix conditioned correct (which is exactly what q(node) means): a
+  // candidate equal to the token one slot back is overstated 10.4x, two slots
+  // back 2.2x, and by six slots the draft is right again.
+  //
+  // That 10.4x is an average over two populations, and the context separates
+  // them for nothing: has this token ALREADY been seen repeating at this lag,
+  // in the prompt or in what has been generated? Split that way R becomes 0.030
+  // (never seen -> charge 3.52 nats) and 1.031 (seen -> the draft was right,
+  // charge nothing). Penalties below are -log R.
+  //
+  // A finer split by whether the token's text is numeric was tried and dropped:
+  // digits are the one class that legitimately doubles, and on the host traces
+  // that argued for charging them only 0.78 at lag 1 -- but measured on the
+  // DEPLOYED pte (DFLASH_REPEAT_PROBE, probe_device_R.py) numeric lag-1 repeats
+  // hit 0 of 258 as well, so the milder charge was wrong here. Host LODO and the
+  // device A/B separated the two variants by less than either can resolve
+  // (+2.1% vs +1.6% host, +0.67% vs +0.73% device), so the simpler table wins.
+  //
+  // Out-of-sample accept at budget 32: +1.6% fp32 (leave-one-dataset-out),
+  // +4.8% on 16a4w traces whose table was fitted on fp32 only, and +0.73%
+  // measured on device against the same pte.
+  static constexpr int32_t kRepLag = 8;
+  // [seen repeating here?][lag-1], nats.
+  static constexpr float kRepPenalty[2][kRepLag] = {
+      // never seen repeating at this lag in this context
+      {3.52f, 1.76f, 0.75f, 0.52f, 0.37f, 0.06f, 0.10f, 0.20f},
+      // seen -- the draft is calibrated here, and over-charging it costs accept
+      {-0.03f, -0.26f, -0.01f, -0.05f, -0.08f, -0.06f, 0.00f, -0.09f}};
+  // repeat_seen_[lag] holds the tokens observed repeating at exactly that lag.
+  // Indexed from 1; slot 0 unused so the lag arithmetic reads straight.
+  std::array<std::unordered_set<uint64_t>, kRepLag + 1> repeat_seen_;
+  // The last kRepLag committed tokens, oldest first. Doubles as node 0's path.
+  std::vector<uint64_t> committed_tail_;
+  // How often the correction actually fires, so a table that silently does
+  // nothing (a bad token classifier, an empty gate) is visible in the summary
+  // instead of looking like "the mechanism does not transfer".
+  uint64_t rep_scored_{0};
+  uint64_t rep_charged_{0};
+  uint64_t rep_lag1_{0};
+  uint64_t rep_gated_{0};
+
+  // On-device measurement of the very statistic the penalty table encodes.
+  // Every round the target hands back the truth for depths 1..accepted+1 -- the
+  // accepted path's tokens plus the bonus -- and that is exactly the "prefix is
+  // correct" conditioning q(node) assumes. So R = sum(hit)/sum(q) per bucket can
+  // be accumulated from real device traffic, with no host replay and no
+  // assumption that the exported qdq graphs match the deployed pte.
+  // Indexed [seen-repeating?][numeric?][lag-1]; bucket 0 holds the
+  // non-repeating candidates. The probe keeps the numeric dimension even though
+  // the table dropped it -- that split is exactly what it was used to refute.
+  bool repeat_probe_{false};
+  std::array<double, 2 * 2 * kRepLag + 1> probe_q_{};
+  std::array<double, 2 * 2 * kRepLag + 1> probe_hit_{};
+  std::array<uint64_t, 2 * 2 * kRepLag + 1> probe_n_{};
+  // Accumulate one round's truth (depths 1..n_true) into the buckets above.
+  void probe_round(const std::vector<uint64_t>& true_tokens, int32_t n_draft);
+  // Probe-only: whether the token's text contains a digit, cached. The shipped
+  // table does not split on this; the probe keeps the dimension so the split can
+  // be re-tested against a future build without another code change.
+  bool token_is_numeric(uint64_t token);
+  std::unordered_map<uint64_t, bool> numeric_cache_;
+  // Per-node sorted candidates, [(budget+1) * draft_topk_].
+  std::vector<float> cand_score_;
+  std::vector<uint64_t> cand_token_;
+  // Per-node tail of its path, [(budget+1) * kRepLag], oldest first.
+  std::vector<uint64_t> path_tail_;
+  std::vector<int32_t> path_len_;
+  // Scratch for the one sort per node; kept here so a round allocates nothing.
+  std::vector<int32_t> cand_order_;
+  std::vector<float> cand_tmp_score_;
+  std::vector<uint64_t> cand_tmp_token_;
   // Per-depth top-k of the drafted block, row-major [depth][k].
   std::vector<float> draft_logp_;
   std::vector<uint64_t> draft_ids_;

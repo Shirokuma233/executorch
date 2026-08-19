@@ -143,6 +143,14 @@ DEFINE_int32(
     "[DFlash Decoding] Non-root nodes in the draft tree (DDTree). 0 keeps the "
     "chain: one argmax per block position, first miss ends the round. Capped at "
     "target_ar_len - 1, since the verify window is compiled, not configurable.");
+DEFINE_bool(
+    dflash_repeat_calib,
+    true,
+    "[DFlash Decoding] Charge the draft tree for repeated tokens. Block "
+    "diffusion smears a token across neighbouring slots, so a candidate equal "
+    "to one the path just emitted is overstated ~10x unless this context has "
+    "already shown that token doubling. Tree path only; see "
+    "ddtree/workspace/REPCAL.md.");
 DEFINE_double(
     dflash_logit_out_scale,
     0.0,
@@ -340,7 +348,8 @@ void start_runner(
       std::move(dflash_emb_module),
       std::move(dflash_lm_head_module),
       FLAGS_dflash_tree_budget,
-      static_cast<float>(FLAGS_dflash_logit_out_scale));
+      static_cast<float>(FLAGS_dflash_logit_out_scale),
+      FLAGS_dflash_repeat_calib);
   auto decoder_model_version = runner.get_decoder_model_version();
   std::vector<char> buf;
   buf.reserve(5 * FLAGS_seq_len); // assume each token is around 5 char
