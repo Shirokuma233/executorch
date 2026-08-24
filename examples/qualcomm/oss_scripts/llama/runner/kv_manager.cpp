@@ -409,17 +409,31 @@ void KVManager::update_key(
         true_indices[j++] = i;
       }
     }
-    for (int i = 0; i < n_iter; ++i) {
-      auto wp = write_ptr, rp = read_ptr;
-      for (auto ind : true_indices) {
-        std::memmove(
-            wp,
-            rp + ind * getDtypeSize(kv_cache_dtype_),
-            getDtypeSize(kv_cache_dtype_));
-        wp += getDtypeSize(kv_cache_dtype_);
+    // n_iter is head_dim * num_heads and runs once per layer, so a per-element
+    // memmove here is 36 * 1024 * n_update calls a round. The 1-byte case is the
+    // only one a KV cache actually uses; give it a plain gather loop and leave
+    // the general path for anything else.
+    const int32_t elem_size = getDtypeSize(kv_cache_dtype_);
+    if (elem_size == 1) {
+      for (int i = 0; i < n_iter; ++i) {
+        auto* wp = reinterpret_cast<uint8_t*>(write_ptr);
+        const auto* rp = reinterpret_cast<const uint8_t*>(read_ptr);
+        for (int j = 0; j < n_update; ++j) {
+          wp[j] = rp[true_indices[j]];
+        }
+        write_ptr += iter_size;
+        read_ptr += out_size;
       }
-      write_ptr += iter_size;
-      read_ptr += out_size;
+    } else {
+      for (int i = 0; i < n_iter; ++i) {
+        auto wp = write_ptr, rp = read_ptr;
+        for (auto ind : true_indices) {
+          std::memcpy(wp, rp + ind * elem_size, elem_size);
+          wp += elem_size;
+        }
+        write_ptr += iter_size;
+        read_ptr += out_size;
+      }
     }
   }
 }

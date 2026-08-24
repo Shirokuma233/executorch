@@ -13,6 +13,10 @@
 #include <executorch/extension/llm/runner/util.h>
 #include <executorch/runtime/platform/log.h>
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -75,7 +79,40 @@ inline int64_t time_in_us() {
 // every row it expands all 151936 codes into a float vector (608 KB of stores)
 // through a per-element dtype switch, then rescans that vector. Measured on
 // device at 0.42 ms/row against 0.080 ms/row here.
+// The scalar form below carries the index in a loop-carried dependency behind a
+// data-dependent branch, which no compiler will vectorise. Splitting it into a
+// max reduction and a first-match search makes both halves pure SIMD and keeps
+// the result identical: strict `>` means the answer is the FIRST position
+// holding the maximum, which is what the second pass looks for. Starting the
+// reduction at 0 mirrors `best = 0`, so an all-zero row still answers 0.
 inline uint64_t argmax_u16_row(const uint16_t* row, size_t vocab) {
+#if defined(__ARM_NEON)
+  uint16x8_t acc = vdupq_n_u16(0);
+  size_t v = 0;
+  for (; v + 8 <= vocab; v += 8) {
+    acc = vmaxq_u16(acc, vld1q_u16(row + v));
+  }
+  uint16_t best = vmaxvq_u16(acc);
+  for (size_t t = v; t < vocab; ++t) {
+    best = row[t] > best ? row[t] : best;
+  }
+  const uint16x8_t want = vdupq_n_u16(best);
+  for (v = 0; v + 8 <= vocab; v += 8) {
+    if (vmaxvq_u16(vceqq_u16(vld1q_u16(row + v), want)) != 0) {
+      for (size_t t = v; t < v + 8; ++t) {
+        if (row[t] == best) {
+          return static_cast<uint64_t>(t);
+        }
+      }
+    }
+  }
+  for (; v < vocab; ++v) {
+    if (row[v] == best) {
+      return static_cast<uint64_t>(v);
+    }
+  }
+  return 0;
+#else
   uint16_t best = 0;
   uint64_t arg = 0;
   for (size_t v = 0; v < vocab; ++v) {
@@ -85,6 +122,7 @@ inline uint64_t argmax_u16_row(const uint16_t* row, size_t vocab) {
     }
   }
   return arg;
+#endif
 }
 
 // Top-k of one row, descending, into `codes`/`ids` (both at least k long).
@@ -111,7 +149,37 @@ inline void topk_u16_row(
     codes[j + 1] = c;
     ids[j + 1] = d;
   }
-  for (size_t v = static_cast<size_t>(k); v < vocab; ++v) {
+  size_t v = static_cast<size_t>(k);
+#if defined(__ARM_NEON)
+  // Almost every element loses to the threshold, so the scan is one compare and
+  // a branch per element -- exactly what a SIMD pre-filter is for. A block that
+  // holds no candidate is skipped whole; a block that does falls through to the
+  // scalar body below, element by element in increasing v, re-reading the
+  // threshold each time. That keeps insertion order and tie-breaking identical
+  // to the pure scalar loop, which matters because the threshold rises as
+  // elements go in.
+  uint16x8_t thr = vdupq_n_u16(codes[k - 1]);
+  for (; v + 8 <= vocab; v += 8) {
+    if (vmaxvq_u16(vcgtq_u16(vld1q_u16(row + v), thr)) == 0) {
+      continue;
+    }
+    for (size_t u = v; u < v + 8; ++u) {
+      const uint16_t c = row[u];
+      if (c <= codes[k - 1]) {
+        continue;
+      }
+      int j = k - 2;
+      for (; j >= 0 && codes[j] < c; --j) {
+        codes[j + 1] = codes[j];
+        ids[j + 1] = ids[j];
+      }
+      codes[j + 1] = c;
+      ids[j + 1] = static_cast<uint64_t>(u);
+    }
+    thr = vdupq_n_u16(codes[k - 1]);
+  }
+#endif
+  for (; v < vocab; ++v) {
     const uint16_t c = row[v];
     if (c <= codes[k - 1]) {
       continue;
@@ -183,6 +251,63 @@ inline void write_float(std::byte* dst, ScalarType dtype, size_t i, float v) {
 
 // 0xFBFF is -65504, the most negative finite fp16. 0xFC00 would be -inf, which
 // makes softmax produce NaN whenever a query row is fully masked.
+// Bulk forms of the two accessors above. The scalar versions carry a runtime
+// dtype switch, and the callers use them over runs of thousands of elements --
+// one draft prep writes n_new * 12800 of them. Deciding the conversion once per
+// run and then walking a typed pointer is the same arithmetic with the dispatch
+// hoisted; the default arms fall back element by element so the ET_CHECK on an
+// unsupported dtype still fires exactly where it used to.
+inline void read_scalars(
+    const std::byte* data,
+    ScalarType dtype,
+    size_t off,
+    size_t n,
+    float* dst) {
+  switch (dtype) {
+    case ScalarType::Float:
+      std::memcpy(dst, reinterpret_cast<const float*>(data) + off, n * sizeof(float));
+      break;
+    case ScalarType::Half: {
+      const uint16_t* src = reinterpret_cast<const uint16_t*>(data) + off;
+      for (size_t i = 0; i < n; ++i) {
+        dst[i] = fp16_to_fp32(src[i]);
+      }
+      break;
+    }
+    default:
+      for (size_t i = 0; i < n; ++i) {
+        dst[i] = read_scalar(data, dtype, off + i);
+      }
+      break;
+  }
+}
+
+inline void write_floats(
+    std::byte* dst,
+    ScalarType dtype,
+    size_t off,
+    size_t n,
+    const float* src) {
+  switch (dtype) {
+    case ScalarType::Float:
+      std::memcpy(reinterpret_cast<float*>(dst) + off, src, n * sizeof(float));
+      break;
+    case ScalarType::Half:
+    case ScalarType::UInt16: {
+      uint16_t* d = reinterpret_cast<uint16_t*>(dst) + off;
+      for (size_t i = 0; i < n; ++i) {
+        d[i] = fp32_to_fp16(src[i]);
+      }
+      break;
+    }
+    default:
+      for (size_t i = 0; i < n; ++i) {
+        write_float(dst, dtype, off + i, src[i]);
+      }
+      break;
+  }
+}
+
 inline void write_mask(std::byte* dst, ScalarType dtype, size_t i, bool vis) {
   switch (dtype) {
     case ScalarType::Float:
@@ -1074,42 +1199,80 @@ void DFlashTokenGenerator::run_draft(
       std::min(static_cast<int32_t>(block_tokens.size()), B);
   run_embedding(block_tokens.data(), n_block, /*draft=*/true);
   const uint16_t* emb_rows = reinterpret_cast<const uint16_t*>(emb_out_buf_);
-  for (int k = 0; k < n_block; ++k) {
-    for (int i = 0; i < H; ++i) {
-      const size_t idx = static_cast<size_t>(k) * H + i;
-      const float v = (static_cast<float>(emb_rows[idx]) -
-                       static_cast<float>(embeds_zero_point_)) *
-          embeds_scale_;
-      write_float(noise_buf, n_meta.scalar_type(), idx, v);
+  {
+    const ScalarType ndt = n_meta.scalar_type();
+    const size_t n_elem = static_cast<size_t>(n_block) * H;
+    const float zp = static_cast<float>(embeds_zero_point_);
+    if (ndt == ScalarType::Float) {
+      float* d = reinterpret_cast<float*>(noise_buf);
+      for (size_t idx = 0; idx < n_elem; ++idx) {
+        d[idx] = (static_cast<float>(emb_rows[idx]) - zp) * embeds_scale_;
+      }
+    } else {
+      for (size_t idx = 0; idx < n_elem; ++idx) {
+        write_float(
+            noise_buf,
+            ndt,
+            idx,
+            (static_cast<float>(emb_rows[idx]) - zp) * embeds_scale_);
+      }
     }
   }
 
   // atten_mask [B, Cc + ar + B]: every block query sees the committed cache, the
   // valid new-context rows, and the whole block (bidirectional denoising).
-  for (int q = 0; q < B; ++q) {
-    std::byte* row = mask_buf +
-        static_cast<size_t>(q) * mask_w * dtype_size(m_meta.scalar_type());
-    for (int col = 0; col < mask_w; ++col) {
-      bool vis;
-      if (col < Cc) {
-        vis = col < n_past;
-      } else if (col < Cc + ar) {
-        vis = (col - Cc) < n_new;
-      } else {
-        vis = true;
+  // Visibility depends only on the column, so every query row is the same row of
+  // bytes: lay down five contiguous runs once and copy it B-1 times, instead of
+  // B * mask_w calls each re-deciding the dtype.
+  {
+    const ScalarType mdt = m_meta.scalar_type();
+    const size_t row_bytes = static_cast<size_t>(mask_w) * dtype_size(mdt);
+    auto fill = [&](int from, int to, bool vis) {
+      if (to <= from) {
+        return;
       }
-      write_mask(row, m_meta.scalar_type(), static_cast<size_t>(col), vis);
+      switch (mdt) {
+        case ScalarType::Float: {
+          float* r = reinterpret_cast<float*>(mask_buf);
+          std::fill(r + from, r + to, vis ? 0.0f : -65504.0f);
+          break;
+        }
+        case ScalarType::Half:
+        case ScalarType::UInt16: {
+          uint16_t* r = reinterpret_cast<uint16_t*>(mask_buf);
+          std::fill(
+              r + from, r + to, static_cast<uint16_t>(vis ? 0x0000 : 0xFBFF));
+          break;
+        }
+        default:
+          for (int c = from; c < to; ++c) {
+            write_mask(mask_buf, mdt, static_cast<size_t>(c), vis);
+          }
+          break;
+      }
+    };
+    const int vis_ctx = std::min(n_past, Cc);
+    const int vis_new = Cc + std::min(n_new, ar);
+    fill(0, vis_ctx, true);
+    fill(vis_ctx, Cc, false);
+    fill(Cc, vis_new, true);
+    fill(vis_new, Cc + ar, false);
+    fill(Cc + ar, mask_w, true);
+    for (int q = 1; q < B; ++q) {
+      std::memcpy(
+          mask_buf + static_cast<size_t>(q) * row_bytes, mask_buf, row_bytes);
     }
   }
 
   // new_context + its RoPE positions. Padded rows stay zero and are masked out;
   // update_cache only commits the first n_new of them.
   for (int j = 0; j < n_new; ++j) {
-    const float* src = stage_buf_.data() + static_cast<size_t>(j) * LH;
-    for (size_t i = 0; i < LH; ++i) {
-      write_float(
-          ctx_buf, c_meta.scalar_type(), static_cast<size_t>(j) * LH + i, src[i]);
-    }
+    write_floats(
+        ctx_buf,
+        c_meta.scalar_type(),
+        static_cast<size_t>(j) * LH,
+        LH,
+        stage_buf_.data() + static_cast<size_t>(j) * LH);
     reinterpret_cast<int32_t*>(cpos_buf)[j] =
         static_cast<int32_t>(ctx_pos_base + j);
   }
@@ -1215,12 +1378,12 @@ void DFlashTokenGenerator::run_draft(
 
   if (out_hidden != nullptr) {
     out_hidden->assign(static_cast<size_t>(B) * H, 0.0f);
-    for (int k = 0; k < B; ++k) {
-      for (int i = 0; i < H; ++i) {
-        (*out_hidden)[static_cast<size_t>(k) * H + i] = read_scalar(
-            hidden_buf, h_meta.scalar_type(), static_cast<size_t>(k) * H + i);
-      }
-    }
+    read_scalars(
+        hidden_buf,
+        h_meta.scalar_type(),
+        0,
+        static_cast<size_t>(B) * H,
+        out_hidden->data());
   }
   // The block's logits are no longer produced in-graph (this build's draft emits
   // only hidden + K/V). The caller runs lm_head.pte over the returned hidden via
@@ -1275,12 +1438,12 @@ void DFlashTokenGenerator::stage_prompt_hidden(
     float* dst = stage_buf_.data() + static_cast<size_t>(stage_count_) * LH;
     const int64_t t_cp = time_in_us();
     for (int l = 0; l < L; ++l) {
-      for (int h = 0; h < H; ++h) {
-        dst[l * H + h] = read_scalar(
-            extra_outputs[l].data,
-            extra_outputs[l].dtype,
-            static_cast<size_t>(j) * H + h);
-      }
+      read_scalars(
+          extra_outputs[l].data,
+          extra_outputs[l].dtype,
+          static_cast<size_t>(j) * H,
+          H,
+          dst + static_cast<size_t>(l) * H);
     }
     stage_us_[kStageCopy] += time_in_us() - t_cp;
     if (++stage_count_ == dflash_meta_.prefill_ar_len) {
@@ -1530,12 +1693,12 @@ Result<int64_t> DFlashTokenGenerator::generate(
       const size_t src_row = static_cast<size_t>(path[k]);
       float* dst = stage_buf_.data() + static_cast<size_t>(k) * LH;
       for (int l = 0; l < L; ++l) {
-        for (int h = 0; h < H; ++h) {
-          dst[l * H + h] = read_scalar(
-              target_hidden_bufs_[l].data(),
-              target_hidden_dtypes_[l],
-              src_row * H + h);
-        }
+        read_scalars(
+            target_hidden_bufs_[l].data(),
+            target_hidden_dtypes_[l],
+            src_row * H,
+            H,
+            dst + static_cast<size_t>(l) * H);
       }
     }
 
