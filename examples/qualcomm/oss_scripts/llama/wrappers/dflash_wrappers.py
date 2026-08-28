@@ -129,6 +129,8 @@ class DFlashConfig:
         # the only graph that ever processes position 0), decode's is banked fresh
         # from the generation rows. Mutually exclusive with no_sink.
         self.sink_split: bool = False
+        # --dflash_draft_w8: 8-bit draft weights instead of 4-bit.
+        self.draft_w8: bool = False
         # Two decode conventions, and they are off by one from each other:
         #
         #   aligned (DFlashDraftModel, e.g. Qwen3-4B-DFlash-b16)
@@ -757,6 +759,7 @@ class DFlashDraftCompiler(Component):
         sd, cfg = load_dflash_checkpoint(ckpt_dir)
         cfg.no_sink = control_args.no_sink
         cfg.sink_split = getattr(control_args, "sink_split", False)
+        cfg.draft_w8 = getattr(control_args, "dflash_draft_w8", False)
         self.dflash_cfg = cfg
         self.prefill_ar = prefill_ar
 
@@ -869,14 +872,15 @@ class DFlashDraftCompiler(Component):
         for name, ex in (("decode", self.decode_input), ("prefill", self.prefill_input)):
             model = getattr(self, name).float()
             self.fp_ref[name] = model
+            w8 = getattr(self.dflash_cfg, "draft_w8", False)
             quantizer = make_quantizer(
-                quant_dtype=QuantDtype.use_16a4w,
+                quant_dtype=QuantDtype.use_16a8w if w8 else QuantDtype.use_16a4w,
                 per_channel_conv=True,
                 per_channel_linear=True,
                 backend=data.backend,
                 soc_model=data.soc_model,
             )
-            quantizer.set_recipe(DFlashDraftQuantRecipe().recipe)
+            quantizer.set_recipe(DFlashDraftQuantRecipe(w8=w8).recipe)
             setattr(
                 self,
                 name,
@@ -942,9 +946,11 @@ class DFlashDraftCompiler(Component):
         if qp is not None:
             _stamp_input_encoding(self.prefill, 2, qp, "draft new_context")
         logging.info(
-            "DFlash draft quantized over %d speculative rounds "
-            "(16a4w; fc/down_proj/lm_head 16a8w protected)",
+            "DFlash draft quantized over %d speculative rounds (%s)",
             self.calibrator.rounds,
+            "16a8w per-channel throughout"
+            if getattr(self.dflash_cfg, "draft_w8", False)
+            else "16a4w; fc/down_proj/lm_head 16a8w protected",
         )
 
         # Dump the decode (block) QDQ graph so the host accept loop can drive the
@@ -1096,6 +1102,7 @@ class DFlashManager(Component):
         cfg = load_dflash_config(ckpt)
         cfg.no_sink = control_args.no_sink
         cfg.sink_split = getattr(control_args, "sink_split", False)
+        cfg.draft_w8 = getattr(control_args, "dflash_draft_w8", False)
         max_ctx = (
             getattr(control_args, "dflash_max_context_len", 0)
             or control_args.max_context_len

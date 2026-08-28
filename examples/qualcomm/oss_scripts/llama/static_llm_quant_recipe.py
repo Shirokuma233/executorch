@@ -711,11 +711,16 @@ class DFlashDraftQuantRecipe(StaticLLMQuantRecipe):
 
     default_quant_dtype = QuantDtype.use_16a4w
 
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, w8: bool = False):
+        """w8 raises every draft weight to 8 bits (per-channel) instead of the
+        4-bit per-block default. The draft is 361 MB of a 3.23 GB round, so this
+        buys precision for ~12% more decode bandwidth -- the only place in this
+        deployment where more weight bits is even arguably affordable."""
         super().__init__()
+        base = QuantDtype.use_16a8w if w8 else self.default_quant_dtype
         self.recipe = (
             QuantRecipe(
-                self.default_quant_dtype,
+                base,
                 False,
                 act_observer=MinMaxObserver,
                 granularity=QuantGranularity.PER_TENSOR,
@@ -725,11 +730,13 @@ class DFlashDraftQuantRecipe(StaticLLMQuantRecipe):
                 {
                     torch.ops.aten.conv2d.default,
                 },
-                QuantDtype.use_16a4w_block,
+                QuantDtype.use_16a8w if w8 else QuantDtype.use_16a4w_block,
                 False,
                 act_observer=MinMaxObserver,
-                granularity=QuantGranularity.PER_BLOCK,
-                extra_kwargs={"block_size": (1, 16, 1, 1)},
+                granularity=(
+                    QuantGranularity.PER_CHANNEL if w8 else QuantGranularity.PER_BLOCK
+                ),
+                extra_kwargs=None if w8 else {"block_size": (1, 16, 1, 1)},
             )
             .add_regex(
                 {

@@ -809,6 +809,15 @@ def _build_parser():
         help="[DFlash mode] Path to the DFlash draft checkpoint dir (config.json + model.safetensors).",
     )
     parser.add_argument(
+        "--dflash_draft_w8",
+        action="store_true",
+        help="[DFlash mode] Quantize the draft's weights to 8 bits per-channel "
+        "instead of the 4-bit per-block default. The draft is 361 MB of a 3.23 GB "
+        "round, so this costs ~12% more decode bandwidth; whether it pays for "
+        "itself depends on how much of the measured weight-quantization accept "
+        "loss sits in the draft rather than the target.",
+    )
+    parser.add_argument(
         "--dflash_draft_no_ptq",
         action="store_true",
         help="[DFlash mode] Skip draft PTQ (run the draft in fp16). By default the "
