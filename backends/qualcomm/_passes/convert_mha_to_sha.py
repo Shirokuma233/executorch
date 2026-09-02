@@ -128,6 +128,8 @@ class ConvertMhaToSha(ExportPass):
         edge_program: torch.export.ExportedProgram,
         verbose=False,
         dflash_mode=False,
+        dflash_deep=False,
+        dflash_batched_cat=False,
     ):
         super().__init__()
         self.edge_program = edge_program
@@ -137,6 +139,18 @@ class ConvertMhaToSha(ExportPass):
         # GQA. This produces the HTP-runnable, non-causal-safe topology (no QNN 1003)
         # while still copying the shared MHA activation scale to every head.
         self.dflash_mode = dflash_mode
+        # 依照 target 的拆法拆草稿：递归一路走到 q/k/v 投影并劈开权重，K/V 的 cat
+        # 也按头重建（slice->cat）。只有 index_select GQA 仍需草稿专用 visitor ——
+        # 通用 pass 没有它，落到 _visit_default 会递归进那个常量 buffer。
+        # 这是实验开关，不是要上线的东西：设备上它会 1007，本分支就是在查为什么。
+        self.dflash_deep = dflash_deep and dflash_mode
+        # 深拆时仍然保住批量三段 cat（cat->slice）。深拆投影必须递归穿过 cat，
+        # 而通用 _visit_cat 会把 past_k/past_v 这两个 uint8 图输入切成逐头
+        # slice_copy 再逐头拼——正是 _visit_cat_dflash 当初要避开的形态。
+        # 打开这个之后：Q 的投影/norm/RoPE 被劈开，K/V 侧保持批量、只在 cat
+        # 输出上切片。拓扑因此不对称，而"不对称必崩"这条归因已经不可靠
+        # （1003/1007 都是 QNN_COMMON_ERROR_SYSTEM*，不是拓扑校验）。
+        self.dflash_batched_cat = dflash_batched_cat and self.dflash_deep
 
     def _nodes(self, graph_module, wanted_sources, node_checker=None):
         nodes = []
@@ -653,7 +667,12 @@ class ConvertMhaToSha(ExportPass):
                 exir_ops.edge.aten.convolution.default: _visit_linear_conv,
                 exir_ops.edge.aten.mm.default: _visit_linear_conv,
                 exir_ops.edge.aten.cat.default: (
-                    _visit_cat_dflash if self.dflash_mode else _visit_cat
+                    _visit_cat_dflash
+                    if (
+                        self.dflash_mode
+                        and (not self.dflash_deep or self.dflash_batched_cat)
+                    )
+                    else _visit_cat
                 ),
                 exir_ops.edge.aten.add.Tensor: _visit_binary,
                 exir_ops.edge.aten.mul.Tensor: _visit_binary,
@@ -661,8 +680,9 @@ class ConvertMhaToSha(ExportPass):
             }
             if self.dflash_mode:
                 visitors[exir_ops.edge.aten.index_select.default] = _visit_index_select
-                visitors[exir_ops.edge.aten.matmul.default] = _visit_matmul_dflash
-                visitors[exir_ops.edge.aten.bmm.default] = _visit_matmul_dflash
+                if not self.dflash_deep:
+                    visitors[exir_ops.edge.aten.matmul.default] = _visit_matmul_dflash
+                    visitors[exir_ops.edge.aten.bmm.default] = _visit_matmul_dflash
 
             target = node.target if _is_call(node) else node.op
             visited[node] = visitors.get(target, _visit_default)(node, sha)

@@ -82,7 +82,9 @@ class Runner : public executorch::extension::llm::IRunner {
           nullptr,
       int dflash_tree_budget = 0,
       float dflash_logit_out_scale = 0.0f,
-      bool dflash_repeat_calib = true);
+      bool dflash_repeat_calib = true,
+      float dflash_ctx_scale = 1.0f,
+      float dflash_draft_mask_neg = -65504.0f);
 
   bool is_loaded() const override;
   executorch::runtime::Error load() override;
@@ -142,6 +144,8 @@ class Runner : public executorch::extension::llm::IRunner {
   int dflash_tree_budget_{0};
   float dflash_logit_out_scale_{0.0f};
   bool dflash_repeat_calib_{true};
+  float dflash_ctx_scale_{1.0f};
+  float dflash_draft_mask_neg_{-65504.0f};
 
   int ngram_{0};
   int window_{0};

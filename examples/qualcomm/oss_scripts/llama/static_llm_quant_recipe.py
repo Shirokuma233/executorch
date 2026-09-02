@@ -711,13 +711,21 @@ class DFlashDraftQuantRecipe(StaticLLMQuantRecipe):
 
     default_quant_dtype = QuantDtype.use_16a4w
 
-    def __init__(self, verbose: bool = False, w8: bool = False):
-        """w8 raises every draft weight to 8 bits (per-channel) instead of the
-        4-bit per-block default. The draft is 361 MB of a 3.23 GB round, so this
-        buys precision for ~12% more decode bandwidth -- the only place in this
-        deployment where more weight bits is even arguably affordable."""
+    WBITS = {
+        4: (QuantDtype.use_16a4w, QuantDtype.use_16a4w_block),
+        8: (QuantDtype.use_16a8w, QuantDtype.use_16a8w),
+        16: (QuantDtype.use_16a16w, QuantDtype.use_16a16w),
+    }
+
+    def __init__(self, verbose: bool = False, wbits: int = 4):
+        """wbits sets the draft's weight width; activations stay uint16 in all
+        three, so this is a single-variable sweep. 4 keeps the per-block default;
+        8 and 16 go per-channel. Note 16 lands at the same ~1 GB as an fp16
+        draft but stays on the quantized path, which is the one that runs."""
         super().__init__()
-        base = QuantDtype.use_16a8w if w8 else self.default_quant_dtype
+        if wbits not in self.WBITS:
+            raise ValueError(f"draft wbits must be one of {sorted(self.WBITS)}")
+        base, conv_dtype = self.WBITS[wbits]
         self.recipe = (
             QuantRecipe(
                 base,
@@ -730,15 +738,23 @@ class DFlashDraftQuantRecipe(StaticLLMQuantRecipe):
                 {
                     torch.ops.aten.conv2d.default,
                 },
-                QuantDtype.use_16a8w if w8 else QuantDtype.use_16a4w_block,
+                conv_dtype,
                 False,
                 act_observer=MinMaxObserver,
                 granularity=(
-                    QuantGranularity.PER_CHANNEL if w8 else QuantGranularity.PER_BLOCK
+                    QuantGranularity.PER_BLOCK
+                    if wbits == 4
+                    else QuantGranularity.PER_CHANNEL
                 ),
-                extra_kwargs=None if w8 else {"block_size": (1, 16, 1, 1)},
+                extra_kwargs={"block_size": (1, 16, 1, 1)} if wbits == 4 else None,
             )
-            .add_regex(
+        )
+        # The outlier-heavy projections are PROTECTED at 8 bits, so the rule only
+        # belongs on a 4-bit base. At wbits >= 8 the base already meets or beats
+        # it, and re-applying it would silently DOWNGRADE fc/down_proj to 8 bits
+        # in the 16-bit build -- turning the sweep's high end into a mixed recipe.
+        if wbits == 4:
+            self.recipe = self.recipe.add_regex(
                 {
                     r"fc\.conv",
                     r"layers\..*\.mlp\.down_proj\.conv",
@@ -749,7 +765,6 @@ class DFlashDraftQuantRecipe(StaticLLMQuantRecipe):
                 act_observer=MinMaxObserver,
                 granularity=QuantGranularity.PER_CHANNEL,
             )
-        )
         # Quantize the K/V cache to 8-bit IN-GRAPH (same as Qwen3_4BQuantRecipe).
         # Without this the draft's KV is 16a4w's default 16-bit activation, and
         # tagging the pte's KV IO as u8 at lower time then reuses the 16-bit scale

@@ -314,7 +314,11 @@ class QnnPassManager(PassManager):
             # softmax attention; the target uses repeat_kv (no index_select). Route
             # the draft to DFlashMhaToSha (non-causal, symmetric shallow split) and
             # everything else to the causal ConvertMhaToSha.
-            is_dflash = use_dflash_mha2sha or (
+            import os as _os
+
+            is_dflash = (
+                _os.environ.get("DFLASH_FORCE_DFLASH_PASS") == "1"
+            ) or use_dflash_mha2sha or (
                 exir_ops.edge.aten.index_select.default in targets
                 and (
                     exir_ops.edge.aten._softmax.default in targets
@@ -322,11 +326,27 @@ class QnnPassManager(PassManager):
                 )
             )
             if is_dflash:
+                import os
+
                 from executorch.backends.qualcomm._passes.dflash_mha_to_sha import (
                     DFlashMhaToSha,
+                    DFlashMhaToShaDeep,
+                    DFlashMhaToShaDeepProj,
                 )
 
-                self.add_pass(DFlashMhaToSha(exported_program))
+                # 实验开关，故意用环境变量而不是 compile spec 字段：spec 是序列化
+                # schema，而这个开关是为了在 mha2sha 分支上做对照，不是要上线。
+                # DFLASH_FORCE_DFLASH_PASS=1：即使图里没有 index_select（repeat_kv
+                # 那版）也强制走草稿的浅拆 pass，用来单独测 repeat_kv 本身能不能跑。
+                # 0/未设=浅拆（现状）  1=全深拆  proj=半深拆（劈投影+批量 cat）
+                mode = os.environ.get("DFLASH_MHA2SHA_DEEP", "0")
+                deep = mode == "1"
+                variant = {
+                    "1": DFlashMhaToShaDeep,
+                    "proj": DFlashMhaToShaDeepProj,
+                }.get(mode, DFlashMhaToSha)
+                print(f"[DFlash] MHA->SHA: {variant.__name__}", flush=True)
+                self.add_pass(variant(exported_program))
             else:
                 self.add_pass(ConvertMhaToSha(exported_program))
         self.add_pass(InsertRequantize())

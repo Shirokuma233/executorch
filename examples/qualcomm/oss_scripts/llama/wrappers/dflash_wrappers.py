@@ -129,8 +129,9 @@ class DFlashConfig:
         # the only graph that ever processes position 0), decode's is banked fresh
         # from the generation rows. Mutually exclusive with no_sink.
         self.sink_split: bool = False
-        # --dflash_draft_w8: 8-bit draft weights instead of 4-bit.
-        self.draft_w8: bool = False
+        # --dflash_draft_wbits: draft weight width (4/8/16). Activations stay
+        # uint16 in all three, so the sweep has one variable.
+        self.draft_wbits: int = 4
         # Two decode conventions, and they are off by one from each other:
         #
         #   aligned (DFlashDraftModel, e.g. Qwen3-4B-DFlash-b16)
@@ -174,6 +175,19 @@ def _precompute_rope(head_dim: int, max_pos: int, theta: float):
     freqs = torch.outer(t, inv_freq)  # [max_pos, head_dim/2]
     emb = torch.cat([freqs, freqs], dim=-1)  # [max_pos, head_dim]
     return emb.cos(), emb.sin()
+
+
+# mha2sha 分支实验开关，见 DFlashAttention.forward。环境变量而非 config 字段：
+# 这是为了做对照，不是要上线的配置。
+_GQA_REPEAT_KV = os.environ.get("DFLASH_GQA_REPEAT_KV") == "1"
+# mha2sha 分支实验开关：把 q_norm / k_norm 从"折叠的 3D"挪到"摊开的 4D"之上。
+# 数值逐位相同（RMSNorm 只归一化最后一维 D，reshape 不动它，实测 max|Δ|=0），
+# 但对 ConvertMhaToSha 不等价：_visit_reshape 的非 GQA 分支把 sha 原样透传，
+# 不重映射头轴。target 的图里那个 reshape 和 q_proj 之间什么都没有，陈旧的
+# sha.axis 从没被用过（劈权重那条分支的 slicer 写死 axis=1）；草稿在中间插了
+# norm，于是错误的 axis 落地成真实 meta —— 实测拆出 (1,512,4) 和 (1,16,80)
+# 这种形状，norm 在 4 个元素上归一化而不是 128 个。
+_NORM_4D = os.environ.get("DFLASH_NORM_4D") == "1"
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -237,28 +251,59 @@ class DFlashAttention(nn.Module):
         bsz, B = block_h.shape[:2]
         AR = ctx_h.shape[1]
         # queries from the block
-        q = self.q_proj(block_h).reshape(bsz, B * self.nH, self.D)
-        q = self.q_norm(q).reshape(bsz, B, self.nH, self.D).transpose(1, 2)  # [1,nH,B,D]
+        if _NORM_4D:
+            q = self.q_proj(block_h).reshape(bsz, B, self.nH, self.D).transpose(1, 2)
+            q = self.q_norm(q)                                           # [1,nH,B,D]
+        else:
+            q = self.q_proj(block_h).reshape(bsz, B * self.nH, self.D)
+            q = self.q_norm(q).reshape(bsz, B, self.nH, self.D).transpose(1, 2)
         q = _apply_rope(q, cos_blk, sin_blk)
 
         # NEW context K/V (to cache)
-        kc = self.k_norm(self.k_proj(ctx_h).reshape(bsz, AR * self.nKV, self.D))
-        kc = kc.reshape(bsz, AR, self.nKV, self.D).transpose(1, 2)           # [1,nKV,AR,D]
+        if _NORM_4D:
+            kc = self.k_proj(ctx_h).reshape(bsz, AR, self.nKV, self.D).transpose(1, 2)
+            kc = self.k_norm(kc)                                             # [1,nKV,AR,D]
+        else:
+            kc = self.k_norm(self.k_proj(ctx_h).reshape(bsz, AR * self.nKV, self.D))
+            kc = kc.reshape(bsz, AR, self.nKV, self.D).transpose(1, 2)
         kc = _apply_rope(kc, cos_ctx, sin_ctx)
         k_new = kc.transpose(2, 3)                                           # [1,nKV,D,AR]
         v_new = self.v_proj(ctx_h).reshape(bsz, AR, self.nKV, self.D).transpose(1, 2)  # [1,nKV,AR,D]
 
         # block K/V (transient, not cached)
-        kb = self.k_norm(self.k_proj(block_h).reshape(bsz, B * self.nKV, self.D))
-        kb = kb.reshape(bsz, B, self.nKV, self.D).transpose(1, 2)
+        if _NORM_4D:
+            kb = self.k_proj(block_h).reshape(bsz, B, self.nKV, self.D).transpose(1, 2)
+            kb = self.k_norm(kb)
+        else:
+            kb = self.k_norm(self.k_proj(block_h).reshape(bsz, B * self.nKV, self.D))
+            kb = kb.reshape(bsz, B, self.nKV, self.D).transpose(1, 2)
         kb = _apply_rope(kb, cos_blk, sin_blk).transpose(2, 3)               # [1,nKV,D,B]
         vb = self.v_proj(block_h).reshape(bsz, B, self.nKV, self.D).transpose(1, 2)  # [1,nKV,B,D]
 
         # assemble full K/V: [cached ctx ; new ctx ; block]
         k = torch.cat([past_k, k_new, kb], dim=3)   # [1,nKV,D, Cc+AR+B]
         v = torch.cat([past_v, v_new, vb], dim=2)   # [1,nKV, Cc+AR+B, D]
-        k = k.index_select(1, self.kv_rep_idx)
-        v = v.index_select(1, self.kv_rep_idx)
+        if _GQA_REPEAT_KV:
+            # mha2sha 分支的实验臂 B：发 target 的 repeat_kv 形态
+            # (unsqueeze -> 5D expand -> view) 而不是 index_select。图里没有
+            # index_select 之后，QnnPassManager 的自动识别会把草稿路由到**通用**
+            # ConvertMhaToSha —— 和 target 字面同一条代码路径，从而排除
+            # "是不是 _visit_index_select 自己有问题"。
+            #
+            # 选 index_select 的原始理由（repeat_kv 的 5D expand/view 量化后不
+            # 委托）只在 mha2sha 不生效时成立：_visit_reshape 认出这个三件套之后
+            # 会整组删掉，5D 算子根本到不了后端。
+            T = k.shape[3]
+            n_rep = self.nH // self.nKV
+            k = k[:, :, None].expand(bsz, self.nKV, n_rep, self.D, T).reshape(
+                bsz, self.nH, self.D, T
+            )
+            v = v[:, :, None].expand(bsz, self.nKV, n_rep, T, self.D).reshape(
+                bsz, self.nH, T, self.D
+            )
+        else:
+            k = k.index_select(1, self.kv_rep_idx)
+            v = v.index_select(1, self.kv_rep_idx)
         scores = torch.matmul(q, k) * self.scaling  # q[1,nH,B,D] @ k[1,nH,D,T] -> [1,nH,B,T]
         scores = scores + atten_mask.unsqueeze(1)
         attn = torch.softmax(scores, dim=-1)
@@ -759,7 +804,7 @@ class DFlashDraftCompiler(Component):
         sd, cfg = load_dflash_checkpoint(ckpt_dir)
         cfg.no_sink = control_args.no_sink
         cfg.sink_split = getattr(control_args, "sink_split", False)
-        cfg.draft_w8 = getattr(control_args, "dflash_draft_w8", False)
+        cfg.draft_wbits = int(getattr(control_args, "dflash_draft_wbits", 4))
         self.dflash_cfg = cfg
         self.prefill_ar = prefill_ar
 
@@ -872,15 +917,20 @@ class DFlashDraftCompiler(Component):
         for name, ex in (("decode", self.decode_input), ("prefill", self.prefill_input)):
             model = getattr(self, name).float()
             self.fp_ref[name] = model
-            w8 = getattr(self.dflash_cfg, "draft_w8", False)
+            wbits = int(getattr(self.dflash_cfg, "draft_wbits", 4))
+            base_dtype = {
+                4: QuantDtype.use_16a4w,
+                8: QuantDtype.use_16a8w,
+                16: QuantDtype.use_16a16w,
+            }[wbits]
             quantizer = make_quantizer(
-                quant_dtype=QuantDtype.use_16a8w if w8 else QuantDtype.use_16a4w,
+                quant_dtype=base_dtype,
                 per_channel_conv=True,
                 per_channel_linear=True,
                 backend=data.backend,
                 soc_model=data.soc_model,
             )
-            quantizer.set_recipe(DFlashDraftQuantRecipe(w8=w8).recipe)
+            quantizer.set_recipe(DFlashDraftQuantRecipe(wbits=wbits).recipe)
             setattr(
                 self,
                 name,
@@ -948,9 +998,12 @@ class DFlashDraftCompiler(Component):
         logging.info(
             "DFlash draft quantized over %d speculative rounds (%s)",
             self.calibrator.rounds,
-            "16a8w per-channel throughout"
-            if getattr(self.dflash_cfg, "draft_w8", False)
-            else "16a4w; fc/down_proj/lm_head 16a8w protected",
+            f"16a{int(getattr(self.dflash_cfg, 'draft_wbits', 4))}w"
+            + (
+                "; fc/down_proj/lm_head 16a8w protected"
+                if int(getattr(self.dflash_cfg, "draft_wbits", 4)) == 4
+                else " per-channel throughout"
+            ),
         )
 
         # Dump the decode (block) QDQ graph so the host accept loop can drive the
@@ -1102,7 +1155,7 @@ class DFlashManager(Component):
         cfg = load_dflash_config(ckpt)
         cfg.no_sink = control_args.no_sink
         cfg.sink_split = getattr(control_args, "sink_split", False)
-        cfg.draft_w8 = getattr(control_args, "dflash_draft_w8", False)
+        cfg.draft_wbits = int(getattr(control_args, "dflash_draft_wbits", 4))
         max_ctx = (
             getattr(control_args, "dflash_max_context_len", 0)
             or control_args.max_context_len

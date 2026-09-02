@@ -143,6 +143,22 @@ DEFINE_int32(
     "[DFlash Decoding] Non-root nodes in the draft tree (DDTree). 0 keeps the "
     "chain: one argmax per block position, first miss ends the round. Capped at "
     "target_ar_len - 1, since the verify window is compiled, not configurable.");
+DEFINE_double(
+    dflash_draft_mask_neg,
+    -65504.0,
+    "[DFlash Decoding] Additive mask fill for the draft. The default is fp16's "
+    "most negative finite value, which an fp16 draft overflows to -inf on "
+    "scores + mask; a row whose visible columns all land there softmaxes 0/0 "
+    "into NaN. Use something like -30000 for an fp16 draft.");
+DEFINE_double(
+    dflash_ctx_scale,
+    1.0,
+    "[DFlash Decoding] Divide the target's captured hidden by this before it "
+    "reaches the draft. For an fp16 draft: the sink row runs ~16k and fc sums "
+    "num_ctx_layers*H of them, so fc's output hits ~5e5 and overflows fp16 into "
+    "inf. fc is bias-free and hidden_norm(fc(x)) follows it, so the RMSNorm "
+    "divides the rescale straight back out -- exact, it only moves where fp16 "
+    "has headroom. 256 is the value used for the fp16 draft build.");
 DEFINE_bool(
     dflash_repeat_calib,
     true,
@@ -349,7 +365,9 @@ void start_runner(
       std::move(dflash_lm_head_module),
       FLAGS_dflash_tree_budget,
       static_cast<float>(FLAGS_dflash_logit_out_scale),
-      FLAGS_dflash_repeat_calib);
+      FLAGS_dflash_repeat_calib,
+      static_cast<float>(FLAGS_dflash_ctx_scale),
+      static_cast<float>(FLAGS_dflash_draft_mask_neg));
   auto decoder_model_version = runner.get_decoder_model_version();
   std::vector<char> buf;
   buf.reserve(5 * FLAGS_seq_len); // assume each token is around 5 char

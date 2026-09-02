@@ -116,6 +116,20 @@ class DFlashTokenGenerator : public TokenGenerator {
     float draft_logit_out_scale;
     // Charge the tree for repeated tokens (see kRepPenalty). Tree path only.
     bool repeat_calib;
+    // Divide the target's captured hidden by this before handing it to the
+    // draft. Exists for an fp16 draft: the sink row runs ~16k and fc sums
+    // num_ctx_layers*H of them, so fc's output reaches ~5e5 and overflows fp16's
+    // 65504 into inf. The draft applies hidden_norm(fc(x)) with fc bias-free, so
+    // an input rescale is divided straight back out by the RMSNorm -- exact in
+    // real arithmetic, and it only moves where fp16 has headroom. 1.0 disables.
+    float ctx_scale;
+    // Additive mask fill for the draft. -65504 is fp16's most negative FINITE
+    // value, so an fp16 draft computes scores + mask -> -inf for any negative
+    // score, and a row whose visible columns all land there softmaxes 0/0 into
+    // NaN. The quantized draft never sees this: its add happens in fixed point.
+    // Any finite value large enough to zero the softmax term works, and an
+    // all-masked row then yields a uniform row instead of NaN.
+    float draft_mask_neg;
   };
 
   DFlashTokenGenerator(
@@ -365,6 +379,10 @@ class DFlashTokenGenerator : public TokenGenerator {
       {3.52f, 1.76f, 0.75f, 0.52f, 0.37f, 0.06f, 0.10f, 0.20f},
       // seen -- the draft is calibrated here, and over-charging it costs accept
       {-0.03f, -0.26f, -0.01f, -0.05f, -0.08f, -0.06f, 0.00f, -0.09f}};
+  bool ctx_scale_logged_{false};
+  bool hidden_range_logged_{false};
+  // Scratch for the ctx_scale rescale; empty when ctx_scale == 1.
+  std::vector<float> ctx_scaled_;
   // repeat_seen_[lag] holds the tokens observed repeating at exactly that lag.
   // Indexed from 1; slot 0 unused so the lag arithmetic reads straight.
   std::array<std::unordered_set<uint64_t>, kRepLag + 1> repeat_seen_;

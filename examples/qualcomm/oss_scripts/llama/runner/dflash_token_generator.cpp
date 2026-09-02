@@ -596,6 +596,26 @@ void DFlashTokenGenerator::init_io(
         draft_in_nbytes_[i],
         draft_prefill_meta_->input_tensor_meta(i).get());
   }
+  for (size_t i = 0; i < kNumDraftNonKvInputs; ++i) {
+    auto km = draft_kv_meta_->input_tensor_meta(i).get();
+    auto pm = draft_prefill_meta_->input_tensor_meta(i).get();
+    ET_LOG(
+        Info,
+        "[DFlash] draft in[%zu]: kv dtype=%s nbytes=%zu | prefill dtype=%s nbytes=%zu",
+        i,
+        ::executorch::runtime::toString(km.scalar_type()),
+        tensor_nbytes(km),
+        ::executorch::runtime::toString(pm.scalar_type()),
+        tensor_nbytes(pm));
+  }
+  {
+    auto om = draft_kv_meta_->output_tensor_meta(0).get();
+    ET_LOG(
+        Info,
+        "[DFlash] draft out[0]: dtype=%s nbytes=%zu",
+        ::executorch::runtime::toString(om.scalar_type()),
+        tensor_nbytes(om));
+  }
   draft_hidden_nbytes_ = std::max(
       tensor_nbytes(draft_kv_meta_->output_tensor_meta(0).get()),
       tensor_nbytes(draft_prefill_meta_->output_tensor_meta(0).get()));
@@ -863,6 +883,33 @@ void DFlashTokenGenerator::draft_topk(
   // draft hidden, which spans a fifth of the target's, so the target's scale
   // would spend 2.3 bit of the u16 range on values that never appear here.
   const bool own_head = lm_head_draft_meta_ != nullptr;
+  if (!hidden_range_logged_) {
+    hidden_range_logged_ = true;
+    float lo = hidden[0], hi = hidden[0];
+    size_t nz = 0;
+    const size_t n = static_cast<size_t>(rows) * H;
+    for (size_t i = 0; i < n; ++i) {
+      lo = std::min(lo, hidden[i]);
+      hi = std::max(hi, hidden[i]);
+      nz += (hidden[i] != hidden[i] || std::abs(hidden[i]) > 1e30f) ? 1 : 0;
+    }
+    const float sc = own_head ? dflash_meta_.draft_hidden_scale : logits_scale_;
+    const int32_t zp =
+        own_head ? dflash_meta_.draft_hidden_zero_point : logits_zero_point_;
+    ET_LOG(
+        Info,
+        "[DFlash] draft hidden range [%g, %g] nan/inf=%zu/%zu | u16 encoding "
+        "covers [%g, %g] (scale=%g zp=%d own_head=%d)",
+        static_cast<double>(lo),
+        static_cast<double>(hi),
+        nz,
+        n,
+        static_cast<double>(-zp * sc),
+        static_cast<double>((65535 - zp) * sc),
+        static_cast<double>(sc),
+        zp,
+        static_cast<int>(own_head));
+  }
   quantize_f32_to_u16(
       hidden,
       reinterpret_cast<uint16_t*>(draft_hidden_u16_buf_),
@@ -1234,7 +1281,7 @@ void DFlashTokenGenerator::run_draft(
       switch (mdt) {
         case ScalarType::Float: {
           float* r = reinterpret_cast<float*>(mask_buf);
-          std::fill(r + from, r + to, vis ? 0.0f : -65504.0f);
+          std::fill(r + from, r + to, vis ? 0.0f : dflash_meta_.draft_mask_neg);
           break;
         }
         case ScalarType::Half:
@@ -1266,13 +1313,35 @@ void DFlashTokenGenerator::run_draft(
 
   // new_context + its RoPE positions. Padded rows stay zero and are masked out;
   // update_cache only commits the first n_new of them.
+  const bool rescale = dflash_meta_.ctx_scale != 1.0f;
+  if (!ctx_scale_logged_) {
+    ctx_scale_logged_ = true;
+    ET_LOG(
+        Info,
+        "[DFlash] ctx_scale=%g rescale=%d n_new=%d LH=%zu stage[0]=%g",
+        static_cast<double>(dflash_meta_.ctx_scale),
+        static_cast<int>(rescale),
+        n_new,
+        LH,
+        n_new > 0 ? static_cast<double>(stage_buf_[0]) : 0.0);
+  }
+  if (rescale) {
+    // Both producers -- stage_prompt_hidden and the decode-side accept scatter --
+    // land in stage_buf_, so scaling here is the one place that covers both.
+    ctx_scaled_.resize(static_cast<size_t>(n_new) * LH);
+    const float inv = 1.0f / dflash_meta_.ctx_scale;
+    for (size_t i = 0; i < ctx_scaled_.size(); ++i) {
+      ctx_scaled_[i] = stage_buf_[i] * inv;
+    }
+  }
+  const float* ctx_src = rescale ? ctx_scaled_.data() : stage_buf_.data();
   for (int j = 0; j < n_new; ++j) {
     write_floats(
         ctx_buf,
         c_meta.scalar_type(),
         static_cast<size_t>(j) * LH,
         LH,
-        stage_buf_.data() + static_cast<size_t>(j) * LH);
+        ctx_src + static_cast<size_t>(j) * LH);
     reinterpret_cast<int32_t*>(cpos_buf)[j] =
         static_cast<int32_t>(ctx_pos_base + j);
   }
@@ -1576,6 +1645,17 @@ Result<int64_t> DFlashTokenGenerator::generate(
   // Cache B, so that call appends nothing.
   int32_t pending_rows = 0;
   int64_t pending_pos_base = 0;
+  // 诊断开关（mha2sha 分支）：深拆之后 prefill_forward 在 DSP 上跑得通，只有
+  // kv_forward 首轮即 1007。两张图的形状差异（AR / Cc）已经抬平验证过，不是原因。
+  // 剩下的怀疑是首轮 n_new=0 —— new_context 整块为零、对应的 mask 列全不可见。
+  // n_new 只影响输入值（memcpy 几行、mask 哪几列），buffer 恒定尺寸且先 memset，
+  // 所以图的形状不变，这一改是干净的单变量。
+  // 代价：草稿缓存会错位一行，accept 变垃圾。只用来判断崩不崩。
+  if (getenv("DFLASH_FIRST_PENDING") != nullptr) {
+    pending_rows = 1;
+    pending_pos_base = draft_ctx_len_;
+    ET_LOG(Info, "[DFlash] diag: 首轮强制 pending_rows=1");
+  }
 
   std::vector<float> block_hidden;
 
