@@ -118,7 +118,14 @@ Runner::Runner(
     std::unique_ptr<executorch::extension::Module> dflash_lm_head_module,
     int dflash_tree_budget,
     float dflash_logit_out_scale,
-    bool dflash_repeat_calib)
+    bool dflash_repeat_calib,
+    std::unique_ptr<executorch::extension::Module> dflash_sparse_head_module,
+    const std::string& dflash_sparse_table_path,
+    const std::string& dflash_sparse_scale_path,
+    int32_t dflash_sparse_k,
+    int32_t dflash_sparse_hot_rows,
+    int32_t dflash_sparse_threads,
+    bool dflash_sparse_check)
     : module_(std::move(module)),
       attention_sink_rope_module_(std::move(attention_sink_rope_module)),
       eagle_head_module_(std::move(eagle_head_module)),
@@ -132,6 +139,13 @@ Runner::Runner(
       dflash_draft_module_(std::move(dflash_draft_module)),
       dflash_emb_module_(std::move(dflash_emb_module)),
       dflash_lm_head_module_(std::move(dflash_lm_head_module)),
+      dflash_sparse_head_module_(std::move(dflash_sparse_head_module)),
+      dflash_sparse_table_path_(dflash_sparse_table_path),
+      dflash_sparse_scale_path_(dflash_sparse_scale_path),
+      dflash_sparse_k_(dflash_sparse_k),
+      dflash_sparse_hot_rows_(dflash_sparse_hot_rows),
+      dflash_sparse_threads_(dflash_sparse_threads),
+      dflash_sparse_check_(dflash_sparse_check),
       block_size_(block_size),
       dflash_max_context_len_(dflash_max_context_len),
       dflash_tree_budget_(dflash_tree_budget),
@@ -441,6 +455,15 @@ Error Runner::load() {
     const size_t prompt_aux = in0(*dflash_emb_prefill_meta) +
         out0(*dflash_emb_prefill_meta) + out0(*dflash_lm_prefill_meta);
     dflash_aux_io_size_ = tok_gen_aux + prompt_aux;
+    if (dflash_sparse_k_ > 0 && dflash_sparse_head_module_ != nullptr) {
+      ET_CHECK_MSG(
+          dflash_sparse_head_module_->load_method("forward") == Error::Ok,
+          "[DFlash] sparse head pte has no forward method");
+      const auto m =
+          ET_UNWRAP(dflash_sparse_head_module_->method_meta("forward"));
+      dflash_aux_io_size_ += m.input_tensor_meta(0)->nbytes() +
+          m.input_tensor_meta(1)->nbytes() + m.output_tensor_meta(0)->nbytes();
+    }
     ET_LOG(
         Info,
         "[DFlash] headless decoder: vocab=%d | embeds scale=%g zp=%d | logits "
@@ -861,6 +884,18 @@ Error Runner::load() {
         dflash_embeds_zp,
         dflash_logits_scale,
         dflash_logits_zp);
+    if (dflash_sparse_k_ > 0 && dflash_sparse_head_module_ != nullptr) {
+      dflash_gen->enable_sparse_verify(
+          dflash_sparse_head_module_.get(),
+          std::make_unique<MethodMeta>(
+              std::move(dflash_sparse_head_module_->method_meta("forward").get())),
+          dflash_sparse_table_path_,
+          dflash_sparse_scale_path_,
+          dflash_sparse_k_,
+          dflash_sparse_hot_rows_,
+          dflash_sparse_threads_,
+          dflash_sparse_check_);
+    }
     token_generator_ = std::move(dflash_gen);
   } else {
     token_generator_ = std::make_unique<TokenGenerator>(

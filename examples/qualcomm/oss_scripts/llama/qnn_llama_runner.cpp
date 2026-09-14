@@ -172,6 +172,51 @@ DEFINE_string(
     "[DFlash Decoding] Path to the compiled lm_head pte (headless decoder emits "
     "hidden, not logits). "
     "Default: <dflash_draft dir>/lm_head_qnn.pte");
+DEFINE_int32(
+    dflash_sparse_k,
+    0,
+    "[DFlash Decoding] Verify only the drafter's top-K per depth instead of "
+    "streaming all of lm_head. 0 keeps the full head. The full head is "
+    "bandwidth-bound (389 MB every round), so this is the knob that turns it "
+    "into a D*K-row gather. Lossy: the target's pick is restricted to those "
+    "candidates.");
+DEFINE_string(
+    dflash_sparse_head_pte_path,
+    "",
+    "[DFlash Decoding] Path to the sparse verify head pte (zero weights; the "
+    "candidate rows arrive as a runtime input). "
+    "Default: <dflash_draft dir>/sparse_lm_head_qnn.pte");
+DEFINE_string(
+    dflash_sparse_table_path,
+    "",
+    "[DFlash Decoding] Row-major int8 lm_head table for the CPU-side gather. "
+    "lm_head_qnn.pte cannot be used directly -- QNN interleaves it for the HTP "
+    "dataflow. Produce this with sparse/deinterleave_lm_head.py. "
+    "Default: <dflash_draft dir>/lm_head_rowmajor.bin");
+DEFINE_string(
+    dflash_sparse_scale_path,
+    "",
+    "[DFlash Decoding] Per-channel fp32 weight scales, one per vocab row. "
+    "lm_head is per-channel quantized, so candidates cannot be ranked without "
+    "them. Default: <dflash_draft dir>/lm_head_pc_scale.f32");
+DEFINE_int32(
+    dflash_sparse_hot_rows,
+    4096,
+    "[DFlash Decoding] Rows of the table pinned resident. The rest are ordinary "
+    "file-backed pages.");
+DEFINE_bool(
+    dflash_sparse_check,
+    false,
+    "[DFlash Decoding] Run the full head alongside the sparse one and report "
+    "how often they pick the same token. A wrong IO boundary is otherwise "
+    "silent -- the logits stay finite, only the ranking is nonsense.");
+DEFINE_int32(
+    dflash_sparse_threads,
+    1,
+    "[DFlash Decoding] Threads for the gather. Warm, one thread does the whole "
+    "round in ~1 ms and more threads are slower -- the pool handshake costs more "
+    "than it saves at this size. They only pay off cold, where 16 threads take "
+    "the first round from 144 ms to 33 ms by raising the flash queue depth.");
 
 std::vector<std::string> CollectPrompts(int argc, char** argv) {
   // Collect all prompts from command line, example usage:
@@ -314,7 +359,10 @@ void start_runner(
     const std::string& eagle_embed_path,
     std::unique_ptr<executorch::extension::Module> dflash_draft_module,
     std::unique_ptr<executorch::extension::Module> dflash_emb_module,
-    std::unique_ptr<executorch::extension::Module> dflash_lm_head_module) {
+    std::unique_ptr<executorch::extension::Module> dflash_lm_head_module,
+    std::unique_ptr<executorch::extension::Module> dflash_sparse_head_module,
+    const std::string& dflash_sparse_table_path,
+    const std::string& dflash_sparse_scale_path) {
   bool use_tokenized_prompt =
       gflags::GetCommandLineFlagInfoOrDie("tokenized_prompt").is_default ? false
                                                                          : true;
@@ -349,7 +397,14 @@ void start_runner(
       std::move(dflash_lm_head_module),
       FLAGS_dflash_tree_budget,
       static_cast<float>(FLAGS_dflash_logit_out_scale),
-      FLAGS_dflash_repeat_calib);
+      FLAGS_dflash_repeat_calib,
+      std::move(dflash_sparse_head_module),
+      dflash_sparse_table_path,
+      dflash_sparse_scale_path,
+      FLAGS_dflash_sparse_k,
+      FLAGS_dflash_sparse_hot_rows,
+      FLAGS_dflash_sparse_threads,
+      FLAGS_dflash_sparse_check);
   auto decoder_model_version = runner.get_decoder_model_version();
   std::vector<char> buf;
   buf.reserve(5 * FLAGS_seq_len); // assume each token is around 5 char
@@ -444,6 +499,9 @@ int main(int argc, char** argv) {
   std::unique_ptr<executorch::extension::Module> dflash_draft_module;
   std::unique_ptr<executorch::extension::Module> dflash_emb_module;
   std::unique_ptr<executorch::extension::Module> dflash_lm_head_module;
+  std::unique_ptr<executorch::extension::Module> dflash_sparse_head_module;
+  std::string sparse_table;
+  std::string sparse_scale;
   if (!FLAGS_dflash_draft_path.empty()) {
     dflash_draft_module = std::make_unique<executorch::extension::Module>(
         FLAGS_dflash_draft_path.c_str(),
@@ -462,6 +520,21 @@ int main(int argc, char** argv) {
     dflash_lm_head_module = std::make_unique<executorch::extension::Module>(
         lm_head_pte.c_str(),
         executorch::extension::Module::LoadMode::MmapUseMlockIgnoreErrors);
+    if (FLAGS_dflash_sparse_k > 0) {
+      std::string sparse_pte = FLAGS_dflash_sparse_head_pte_path.empty()
+          ? sibling_path(FLAGS_dflash_draft_path, "sparse_lm_head_qnn.pte")
+          : FLAGS_dflash_sparse_head_pte_path;
+      sparse_table = FLAGS_dflash_sparse_table_path.empty()
+          ? sibling_path(FLAGS_dflash_draft_path, "lm_head_rowmajor.bin")
+          : FLAGS_dflash_sparse_table_path;
+      sparse_scale = FLAGS_dflash_sparse_scale_path.empty()
+          ? sibling_path(FLAGS_dflash_draft_path, "lm_head_pc_scale.f32")
+          : FLAGS_dflash_sparse_scale_path;
+      dflash_sparse_head_module =
+          std::make_unique<executorch::extension::Module>(
+              sparse_pte.c_str(),
+              executorch::extension::Module::LoadMode::MmapUseMlockIgnoreErrors);
+    }
   }
 
   start_runner(
@@ -474,7 +547,10 @@ int main(int argc, char** argv) {
       embed_path,
       std::move(dflash_draft_module),
       std::move(dflash_emb_module),
-      std::move(dflash_lm_head_module));
+      std::move(dflash_lm_head_module),
+      std::move(dflash_sparse_head_module),
+      sparse_table,
+      sparse_scale);
 
   return 0;
 }

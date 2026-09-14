@@ -560,7 +560,139 @@ AMD EPYC 7Y43,192 逻辑核,**只有 AVX2,无 AVX512-BF16 / AMX**。
 
 ---
 
-## 12. 未决问题
+## 12. 稀疏 lm_head 图:已导出并设备实测(2026-09-08)
+
+分支 `dflash_sparse_verify`,`examples/qualcomm/oss_scripts/llama/sparse/`:
+
+| 文件 | 作用 |
+|---|---|
+| `lm_head_ref.py` | 从 build 自己的 `qdq_lm_head.pt2` 读权重 / per-channel scale / 两端编码。**刻意不依赖 QNN**,主机侧校验环境装不了 `backends.qualcomm` |
+| `sparse_lm_head.py` | 导出稀疏图 |
+| `verify_sparse_numerics.py` | 排序一致性校验 |
+| `deinterleave_lm_head.py` | depth32 → 行主序 |
+
+### 图
+
+```
+logits[1,32,1920] = (hidden[1,32,2560] @ cand_w[1920,2560].T) * cand_scale[1920]
+
+pte 0.08 MiB       图内零权重
+算子             matmul / mul / permute / view，全部 lower 到 QNN
+```
+
+`hidden` 的编码 `0.00416819890961/32020` 从 qdq 图读出后**注入**(照抄
+`llm_wrappers._override_lm_head_input_scale`),不靠校准 —— 边界解释错会静默出错。
+
+### per-channel scale 必须一起 gather
+
+lm_head 是 per-channel 权重量化(`_scale_0` 151936 维,零点全 0,极差 **5.5×**),
+候选之间比大小依赖各自的 scale。
+
+> 早前"argmax 对常数 scale 不变,不用管量化"那句话**只在 per-tensor 下成立**。
+
+scale 乘在**输出侧**(`[32,1920]` 6 万元素)而非权重侧(`[1920,2560]` 490 万),
+且大操作数保持纯整数,边界才有机会压到 8bit。
+
+主机校验(200 行,滤掉 96 个 padding 行):
+
+```
+带 per-channel scale   200/200 = 100.00%      logits 相对误差 中位 1.48e-07
+漏掉 scale              69/200 =  34.50%      ← 三分之二排错
+```
+
+### 设备实测(SM8750,同一次会话交替 5 轮)
+
+```
+全读   9.797 ± 0.061 ms    392 MB / 40.0 GB/s   ← 与部署 10.18 ms 吻合
+稀疏   2.080 ± 0.101 ms    省 7.72 ms，4.71x
+
+端到端        轮 76 → 68.0 ms   1.118x
+含 6.3% 回退       68.6 ms      1.108x
+```
+
+> 早前一次测到全读 16.55 ms,是设备降频态;9.8 ms 才是常态。**跨会话的绝对值不可比,
+> 只有同一次会话内交替测的比值可用。**
+
+**2.08 ms 是上界,还有约 17 倍余量**:
+
+```
+权重流   392 MB / 9.797 ms = 40.0 GB/s
+输入流   19.7 MB / 2.080 ms =  9.5 GB/s    ← 每字节贵 4.2 倍
+```
+
+差距来自 `qnn_executor_runner` 每次推理把输入 memcpy 进 QNN 缓冲;真 runner 走
+`rpc_mem` 预注册缓冲没有这一步。再把输入从 fp32 换成 uint8(19.7 → 4.92 MB),
+理论下界 `4.92/40 = 0.12 ms`。
+
+---
+
+## 13. runner 侧实现(分支 dflash_sparse_verify)
+
+### 改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `runner/sparse_verify.{h,cpp}` | **新增**。mmap 行主序表 + mlock 热区前缀 + 线程池;在 verify_exec 的窗口里把候选行 int8→fp32 写进共享缓冲 |
+| `runner/dflash_token_generator.{h,cpp}` | `enable_sparse_verify()` / `run_sparse_head()` / `sparse_pick()`;init_io 分配三块缓冲;`draft_topk_` 提到 ≥ K;draft_topk 之后启动 gather;verify 换头;走查按节点深度取 K 宽切片 |
+| `runner/runner.{h,cpp}` | 透传配置(**参数加在签名末尾**,不能插在中间——会打乱位置实参);新缓冲计入 `dflash_aux_io_size_` |
+| `qnn_llama_runner.cpp` | 六个 `--dflash_sparse_*`,`k=0` 默认关 |
+| `CMakeLists.txt` | 加入新源文件 |
+
+### 三个必须做对的地方
+
+**ION 预算**。新缓冲从 `buffer_manager->allocate()` 取,必须计进 `dflash_aux_io_size_`
+——`RpcMem` 是无边界检查的 bump 分配器,漏计会让缓冲落在 ION 区外,**DSP DMA 失败 (QNN 6002)**。
+
+**深度上限回退是叠加的**。深度 15 的节点没有候选行,那一轮要补跑全头。
+> 全头是把整张 lm_head 流一遍,**为一行跑和为全部行跑一样贵**。
+> 所以不存在"只为 bonus 那行跑全头"这种省法。回退率打进 summary 日志。
+
+**候选行取自 `draft_ids_` 而不是 `cand_token_`**。后者被重复门控重排过,但两者是
+同一个集合,而引理只要求"子节点 ⊆ S"。深度索引:`fill_candidates(node, depth)` 用
+`draft_ids_[(depth-1)*k]`,所以**深度 d 的节点用第 d 行**,根节点用第 0 行,d=15 无行。
+
+### 线程数默认 1
+
+设备实测(热态,1920 行,含 int8→fp32):
+
+```
+thr=1  0.957 ms      thr=2  1.079 ms      thr=8  1.188 ms
+```
+
+**多线程在热态更慢** —— 每轮线程池握手的开销压过收益。多线程只在冷启动有意义
+(全冷首轮 144 → 33 ms,靠提高 flash 队列深度)。所以默认 1,冷启动才调大。
+
+单纯取行是 0.352 ms,转换加了 0.6 ms(490 万次 int8→float + 写 18.75 MiB)。
+边界若能压到 int8,这 0.6 ms 和 NPU 侧 3/4 的输入流量一起消失。
+
+### 待验证
+
+1. **稀疏头输出 dtype**。元数据说 float32,但本 codebase 有"声明 Float 实际写 uint16"
+   的先例(probe 和 method_meta 都会误导)。已挂 `check_payload_dtype`,首跑暴露。
+2. **mlock**。非 root 下 `RLIMIT_MEMLOCK` 通常 64 KB,10 MB 会失败。代码是记日志继续,
+   不崩,但热区固定不生效,退化成纯 page cache 托管。
+
+### 构建树的坑
+
+`build-android` 的 `full_portable_ops_lib` 依赖表里记了 codegen 当时加载过的每个
+python 文件,其中 **234,958 行指向另一个用户的 home 目录**,还有已被更新掉的 snap
+revision。缺一个就 `No rule to make target`,而**任何 CMake 重新配置都会重新生成**。
+
+绕法(改的是构建树不是源码,`build.make.bak` 有备份):
+
+```bash
+cd build-android/examples/qualcomm
+python3 -c "
+import os,re,sys
+f='CMakeFiles/full_portable_ops_lib.dir/build.make'
+dep=re.compile(r'^(\S+\.(cpp|h|yaml)):\s+(/\S+)\s*\$')
+keep=[l for l in open(f) if not ((m:=dep.match(l)) and not os.path.exists(m.group(3)))]
+open(f,'w').writelines(keep)"
+```
+
+---
+
+## 14. 未决问题
 
 1. **设备侧的满接受率**是估计不是实测(§4.4)。runner 里加一行计数就能坐实,
    下次上机顺手做。

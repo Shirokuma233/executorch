@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/sparse_verify.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/token_generator.h>
 #include <executorch/extension/module/module.h>
 
@@ -146,6 +147,18 @@ class DFlashTokenGenerator : public TokenGenerator {
 
   ~DFlashTokenGenerator() override = default;
 
+  // Swap the verify head for one that only scores the drafter's candidates.
+  // Must be called before init_io: it decides whether the extra IO is allocated.
+  void enable_sparse_verify(
+      executorch::extension::Module* module,
+      std::unique_ptr<executorch::runtime::MethodMeta> meta,
+      const std::string& table_path,
+      const std::string& scale_path,
+      int32_t k,
+      int32_t hot_rows,
+      int32_t threads,
+      bool check);
+
   // Bind target IO (incl. the L extra hidden outputs) + draft scratch buffers.
   void init_io(
       IMemAlloc* buffer_manager,
@@ -209,6 +222,16 @@ class DFlashTokenGenerator : public TokenGenerator {
   // `lm_head_logits_buf_`. `draft` picks the block_size-wide graph: the draft
   // fills block_size rows of a tree-width one and pays for the rest.
   void run_lm_head(std::byte* hidden_u16, bool draft = false);
+
+  // Joins the gather started after draft_topk, then runs the candidate-only
+  // head. Leaves lm_head_logits_buf_ untouched, so the depth-limit fallback
+  // still has to run the full head for that one node.
+  void run_sparse_head(std::byte* hidden_u16);
+
+  // The target's pick at `slot`, restricted to that node's depth candidates.
+  // False when the node sits past the drafter's last slot, which is the one
+  // case with no candidate row.
+  bool sparse_pick(int32_t slot, uint64_t* out) const;
 
   // Quantize `rows` draft hidden rows -> lm_head.pte -> per-depth top-k, kept as
   // log-probs in `draft_logp_` / `draft_ids_`.
@@ -286,6 +309,34 @@ class DFlashTokenGenerator : public TokenGenerator {
   std::byte* emb_out_buf_ = nullptr; // f32 embeds out of emb.pte
   size_t emb_out_nbytes_ = 0;
   std::byte* lm_head_logits_buf_ = nullptr; // f32 logits out of lm_head.pte
+
+  // ---- sparse verify head ----
+  SparseGather sparse_gather_;
+  executorch::extension::Module* sparse_head_module_ = nullptr;
+  std::unique_ptr<executorch::runtime::MethodMeta> sparse_head_meta_;
+  std::string sparse_table_path_;
+  std::string sparse_scale_path_;
+  int32_t sparse_k_ = 0; // 0 disables; the head is the stock full one
+  int32_t sparse_hot_rows_ = 0;
+  // Runs the full head alongside and reports how often the two agree on the
+  // node the walk actually reads. A wrong IO boundary is silent otherwise: the
+  // logits stay finite, only the ranking is nonsense.
+  bool sparse_check_ = false;
+  uint64_t sparse_check_hit_ = 0;
+  uint64_t sparse_check_tot_ = 0;
+  int32_t sparse_threads_ = 1;
+  int32_t sparse_depths_ = 0; // n_draft, latched when the gather starts
+  std::byte* sparse_w_buf_ = nullptr; // f32 [D*K, hidden]
+  std::byte* sparse_scale_buf_ = nullptr; // f32 [D*K]
+  std::byte* sparse_logits_buf_ = nullptr; // f32 [ar, D*K]
+  std::byte* sparse_hidden_buf_ = nullptr; // f32 [1, ar, hidden]
+  size_t sparse_w_nbytes_ = 0;
+  size_t sparse_scale_nbytes_ = 0;
+  size_t sparse_logits_nbytes_ = 0;
+  size_t sparse_hidden_nbytes_ = 0;
+  std::vector<uint64_t> sparse_ids_;
+  std::byte* verify_hidden_ = nullptr; // for the depth-limit fallback
+  uint64_t sparse_fallback_rounds_ = 0;
   size_t lm_head_logits_nbytes_ = 0;
   // TODO(dflash-uint16): 临时桥接。draft block_hidden 目前是 f32(编译端边界没做成
   // uint16),故先 host quantize 进此 u16 buffer 再喂 lm_head。日后编译端把 draft

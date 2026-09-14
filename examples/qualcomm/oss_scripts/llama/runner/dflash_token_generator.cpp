@@ -682,6 +682,48 @@ void DFlashTokenGenerator::init_io(
       emb_draft_meta_ ? "yes" : "no (falls back to the tree-width graph)",
       lm_head_draft_meta_ ? "yes" : "no (falls back to the tree-width graph)");
 
+  if (sparse_k_ > 0) {
+    sparse_w_nbytes_ = sparse_head_meta_->input_tensor_meta(1)->nbytes();
+    sparse_scale_nbytes_ = static_cast<size_t>(dflash_meta_.block_size) * 4096;
+    sparse_logits_nbytes_ = sparse_head_meta_->output_tensor_meta(0)->nbytes();
+    sparse_w_buf_ = buffer_manager->allocate(sparse_w_nbytes_);
+    sparse_scale_buf_ = buffer_manager->allocate(sparse_scale_nbytes_);
+    sparse_logits_buf_ = buffer_manager->allocate(sparse_logits_nbytes_);
+    sparse_hidden_nbytes_ = sparse_head_meta_->input_tensor_meta(0)->nbytes();
+    sparse_hidden_buf_ = buffer_manager->allocate(sparse_hidden_nbytes_);
+    buffer_manager->add_memory_info(
+        sparse_w_buf_,
+        sparse_w_nbytes_,
+        sparse_head_meta_->input_tensor_meta(1).get());
+    buffer_manager->add_memory_info(
+        sparse_logits_buf_,
+        sparse_logits_nbytes_,
+        sparse_head_meta_->output_tensor_meta(0).get());
+    buffer_manager->add_memory_info(
+        sparse_hidden_buf_,
+        sparse_hidden_nbytes_,
+        sparse_head_meta_->input_tensor_meta(0).get());
+    ET_CHECK_MSG(
+        sparse_gather_.open(
+            sparse_table_path_.c_str(),
+            sparse_scale_path_.c_str(),
+            static_cast<int32_t>(
+                lm_head_kv_meta_->output_tensor_meta(0)->sizes()[2]),
+            dflash_meta_.hidden_dim,
+            sparse_hot_rows_,
+            sparse_threads_),
+        "[DFlash] sparse gather: cannot open the row-major table");
+    ET_LOG(
+        Info,
+        "[DFlash] sparse verify: K=%d, cand IO %.2f MB declared / %.2f MB "
+        "written as uint16 (w_scale %g), logits %.2f MB",
+        sparse_k_,
+        static_cast<double>(sparse_w_nbytes_) / (1 << 20),
+        static_cast<double>(sparse_w_nbytes_) / 2 / (1 << 20),
+        sparse_gather_.w_scale(),
+        static_cast<double>(sparse_logits_nbytes_) / (1 << 20));
+  }
+
   lm_head_vocab_size_ =
       static_cast<int32_t>(lm_head_kv_meta_->output_tensor_meta(0)->sizes()[2]);
   ET_LOG(
@@ -847,6 +889,85 @@ void DFlashTokenGenerator::check_payload_dtype(
 
 // Quantize `rows` draft hidden rows to the lm_head's u16 input encoding, run
 // lm_head.pte, then keep each row's top-k as log-probs.
+void DFlashTokenGenerator::enable_sparse_verify(
+    executorch::extension::Module* module,
+    std::unique_ptr<executorch::runtime::MethodMeta> meta,
+    const std::string& table_path,
+    const std::string& scale_path,
+    int32_t k,
+    int32_t hot_rows,
+    int32_t threads,
+    bool check) {
+  sparse_head_module_ = module;
+  sparse_head_meta_ = std::move(meta);
+  sparse_table_path_ = table_path;
+  sparse_scale_path_ = scale_path;
+  sparse_k_ = k;
+  sparse_hot_rows_ = hot_rows;
+  sparse_threads_ = threads;
+  sparse_check_ = check;
+}
+
+void DFlashTokenGenerator::run_sparse_head(std::byte* hidden_u16) {
+  sparse_gather_.wait();
+  // The decoder emits hidden as uint16 codes and the full head's pte is tagged
+  // to read them that way. This graph's boundary is plain float32, so the codes
+  // are dequantized here; its own quantize node then maps them back to the same
+  // codes with the injected encoding, which makes the round trip exact.
+  {
+    auto in0_meta = sparse_head_meta_->input_tensor_meta(0).get();
+    const size_t n = in0_meta.nbytes() / sizeof(float);
+    const uint16_t* src = reinterpret_cast<const uint16_t*>(hidden_u16);
+    float* dst = reinterpret_cast<float*>(sparse_hidden_buf_);
+    for (size_t i = 0; i < n; ++i) {
+      dst[i] = (static_cast<float>(src[i]) - static_cast<float>(logits_zero_point_)) *
+          logits_scale_;
+    }
+  }
+  auto in0 = sparse_head_meta_->input_tensor_meta(0).get();
+  auto in1 = sparse_head_meta_->input_tensor_meta(1).get();
+  auto out0 = sparse_head_meta_->output_tensor_meta(0).get();
+  TensorImpl h_impl = make_impl(in0, sparse_hidden_buf_);
+  TensorImpl w_impl = make_impl(in1, sparse_w_buf_);
+  TensorImpl o_impl = make_impl(out0, sparse_logits_buf_);
+  std::vector<EValue> ins{EValue(Tensor(&h_impl)), EValue(Tensor(&w_impl))};
+  std::vector<EValue> outs{EValue(Tensor(&o_impl))};
+  ET_CHECK_MSG(
+      sparse_head_module_->set_outputs("forward", outs) == Error::Ok,
+      "[DFlash] sparse head set_outputs failed");
+  auto res = sparse_head_module_->execute("forward", ins);
+  ET_CHECK_MSG(res.ok(), "[DFlash] sparse head execute failed");
+  static bool sparse_checked = false;
+  if (!sparse_checked) {
+    sparse_checked = true;
+    check_payload_dtype(
+        "sparse_head.pte out",
+        sparse_logits_buf_,
+        static_cast<size_t>(out0.sizes()[1]) * out0.sizes()[2],
+        out0.scalar_type());
+  }
+}
+
+bool DFlashTokenGenerator::sparse_pick(int32_t slot, uint64_t* out) const {
+  const int32_t depth =
+      slot == 0 ? 0 : tree_[static_cast<size_t>(slot) - 1].depth;
+  if (depth >= sparse_depths_) {
+    return false;
+  }
+  const int32_t k = sparse_k_;
+  const size_t ncand = static_cast<size_t>(sparse_depths_) * k;
+  const float* row = reinterpret_cast<const float*>(sparse_logits_buf_) +
+      static_cast<size_t>(slot) * ncand + static_cast<size_t>(depth) * k;
+  int32_t best = 0;
+  for (int32_t i = 1; i < k; ++i) {
+    if (row[i] > row[best]) {
+      best = i;
+    }
+  }
+  *out = sparse_ids_[static_cast<size_t>(depth) * k + best];
+  return true;
+}
+
 void DFlashTokenGenerator::draft_topk(
     const float* hidden,
     int32_t rows,
@@ -1521,7 +1642,12 @@ void DFlashTokenGenerator::target_verify_tree(
   stage_us_[kVerifyExec] += time_in_us() - t_exec;
   ET_CHECK_MSG(step_res.ok(), "[DFlash] target verify step failed");
   const int64_t t_head = time_in_us();
-  run_lm_head(logits_.data);
+  verify_hidden_ = logits_.data;
+  if (sparse_k_ > 0) {
+    run_sparse_head(verify_hidden_);
+  } else {
+    run_lm_head(verify_hidden_);
+  }
   stage_us_[kVerifyHead] += time_in_us() - t_head;
   target_verify_time_ms_ += static_cast<double>(time_in_ms() - start_ms);
   ++target_verify_calls_;
@@ -1597,6 +1723,9 @@ Result<int64_t> DFlashTokenGenerator::generate(
       ? std::min(dflash_meta_.tree_budget, dflash_meta_.target_ar_len - 1)
       : n_draft;
   draft_topk_ = dflash_meta_.tree_budget > 0 ? std::min(budget, 64) : 1;
+  // The sparse head scores the drafter's top-K per depth, so the top-K has to
+  // exist. Widening it costs one more pass over the same draft logits row.
+  draft_topk_ = std::max(draft_topk_, sparse_k_);
   ET_CHECK_MSG(
       dflash_meta_.tree_budget <= 0 || dflash_meta_.logit_out_scale > 0.0f,
       "[DFlash] tree needs --dflash_logit_out_scale (lm_head output encoding)");
@@ -1635,6 +1764,25 @@ Result<int64_t> DFlashTokenGenerator::generate(
     // first predicting row (0 shifted, H aligned) and n_draft the count.
     draft_topk(block_hidden.data() + hidden_row0, n_draft, draft_topk_);
 
+    // The candidates are settled here, and the head that needs them does not run
+    // until after tree_build and the target forward -- 46 ms of NPU time with the
+    // CPU idle. So the gather rides along instead of sitting on the critical path.
+    if (sparse_k_ > 0) {
+      sparse_depths_ = n_draft;
+      const size_t ncand = static_cast<size_t>(n_draft) * sparse_k_;
+      sparse_ids_.resize(ncand);
+      for (int d = 0; d < n_draft; ++d) {
+        std::copy_n(
+            draft_ids_.data() + static_cast<size_t>(d) * draft_topk_,
+            sparse_k_,
+            sparse_ids_.data() + static_cast<size_t>(d) * sparse_k_);
+      }
+      sparse_gather_.start(
+          sparse_ids_.data(),
+          static_cast<int32_t>(ncand),
+          reinterpret_cast<uint16_t*>(sparse_w_buf_));
+    }
+
     const int64_t t_tree = time_in_us();
     build_tree(budget, n_draft);
     stage_us_[kTreeBuild] += time_in_us() - t_tree;
@@ -1653,11 +1801,36 @@ Result<int64_t> DFlashTokenGenerator::generate(
     const size_t V = static_cast<size_t>(lm_head_vocab_size_);
     const uint16_t* lg = reinterpret_cast<const uint16_t*>(lm_head_logits_buf_);
     std::vector<int32_t> path{0};
-    uint64_t bonus = argmax_u16_row(lg, V);
+    bool full_head_valid = sparse_k_ == 0;
+    if (sparse_check_) {
+      run_lm_head(verify_hidden_);
+      full_head_valid = true;
+    }
+    auto pick = [&](int32_t slot) -> uint64_t {
+      uint64_t tok = 0;
+      if (sparse_k_ > 0 && sparse_pick(slot, &tok)) {
+        if (sparse_check_) {
+          ++sparse_check_tot_;
+          sparse_check_hit_ +=
+              (tok == argmax_u16_row(lg + static_cast<size_t>(slot) * V, V));
+        }
+        return tok;
+      }
+      // Past the drafter's last slot there is no candidate row, so this one node
+      // has to see the whole vocabulary. The full head streams all of lm_head,
+      // so it costs the same whether one row needs it or all of them.
+      if (!full_head_valid) {
+        run_lm_head(verify_hidden_);
+        full_head_valid = true;
+        ++sparse_fallback_rounds_;
+      }
+      return argmax_u16_row(lg + static_cast<size_t>(slot) * V, V);
+    };
+    uint64_t bonus = pick(0);
     for (int32_t child = tree_child(0, bonus); child >= 0;
          child = tree_child(path.back(), bonus)) {
       path.push_back(child);
-      bonus = argmax_u16_row(lg + static_cast<size_t>(child) * V, V);
+      bonus = pick(child);
     }
     const int accepted = static_cast<int>(path.size()) - 1;
     stage_us_[kVerifyPick] += time_in_us() - t_acc;
@@ -1769,6 +1942,33 @@ Result<int64_t> DFlashTokenGenerator::generate(
     // accept_len is the metric that matters: tokens committed per target forward.
     // 1.0 means the draft bought nothing. accept_rate (accepted/drafted) makes the
     // same run look bad simply because block_size is large.
+    if (sparse_k_ > 0) {
+      // The fallback is the one structural cost of the sparse head: a node at
+      // the depth limit has no candidate row, so that round pays for the full
+      // head on top. Offline it lands near 6% of rounds.
+      if (sparse_check_) {
+        ET_LOG(
+            Info,
+            "[DFlash] sparse check: pick matches the full head on %llu/%llu "
+            "walked nodes (%.2f%%)",
+            static_cast<unsigned long long>(sparse_check_hit_),
+            static_cast<unsigned long long>(sparse_check_tot_),
+            sparse_check_tot_ ? 100.0 * static_cast<double>(sparse_check_hit_) /
+                    static_cast<double>(sparse_check_tot_)
+                              : 0.0);
+      }
+      ET_LOG(
+          Info,
+          "[DFlash] sparse verify: K=%d, full-head fallback %llu/%llu rounds "
+          "(%.2f%%)",
+          sparse_k_,
+          static_cast<unsigned long long>(sparse_fallback_rounds_),
+          static_cast<unsigned long long>(target_verify_calls_),
+          target_verify_calls_ ? 100.0 *
+                  static_cast<double>(sparse_fallback_rounds_) /
+                  static_cast<double>(target_verify_calls_)
+                              : 0.0);
+    }
     ET_LOG(
         Info,
         "[DFlash] done: drafted=%llu accepted=%llu accept_rate=%.3f "

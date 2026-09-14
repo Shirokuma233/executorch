@@ -82,7 +82,16 @@ class Runner : public executorch::extension::llm::IRunner {
           nullptr,
       int dflash_tree_budget = 0,
       float dflash_logit_out_scale = 0.0f,
-      bool dflash_repeat_calib = true);
+      bool dflash_repeat_calib = true,
+      // Sparse verify head. Off unless a K > 0 and a row-major table arrive.
+      std::unique_ptr<executorch::extension::Module> dflash_sparse_head_module =
+          nullptr,
+      const std::string& dflash_sparse_table_path = "",
+      const std::string& dflash_sparse_scale_path = "",
+      int32_t dflash_sparse_k = 0,
+      int32_t dflash_sparse_hot_rows = 0,
+      int32_t dflash_sparse_threads = 1,
+      bool dflash_sparse_check = false);
 
   bool is_loaded() const override;
   executorch::runtime::Error load() override;
@@ -137,6 +146,13 @@ class Runner : public executorch::extension::llm::IRunner {
   std::unique_ptr<executorch::extension::Module> dflash_draft_module_;
   std::unique_ptr<executorch::extension::Module> dflash_emb_module_;
   std::unique_ptr<executorch::extension::Module> dflash_lm_head_module_;
+  std::unique_ptr<executorch::extension::Module> dflash_sparse_head_module_;
+  std::string dflash_sparse_table_path_;
+  std::string dflash_sparse_scale_path_;
+  int32_t dflash_sparse_k_ = 0;
+  int32_t dflash_sparse_hot_rows_ = 0;
+  int32_t dflash_sparse_threads_ = 1;
+  bool dflash_sparse_check_ = false;
   int block_size_{16};
   int dflash_max_context_len_{0};
   int dflash_tree_budget_{0};
