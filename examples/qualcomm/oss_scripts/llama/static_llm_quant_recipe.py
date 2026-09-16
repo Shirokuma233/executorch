@@ -44,6 +44,16 @@ class StaticLLMQuantRecipe:
             # If quantized but not 8a8w or mix_quantization, it has to be 16bit kv io.
             return 16
 
+    def get_lm_head_quant_dtype(self) -> QuantDtype:
+        """Weight/activation width for a SPLIT lm_head.
+
+        When the decoder is headless the lm_head is a separate module with its own
+        quantizer (llm_wrappers), so it never sees `self.recipe` -- the `output.conv`
+        regex only applies when the head is in-graph. This hook is the only knob
+        that reaches it.
+        """
+        return QuantDtype.use_16a8w
+
     def get_logits_output_bit_width(self) -> int:
         # We use 16bit logits for all quant config
         return 32 if self.default_quant_dtype is None else 16
@@ -694,6 +704,70 @@ class Qwen3_4BQuantRecipe(StaticLLMQuantRecipe):
             )
         )
         self.recipe.custom_quant_annotations.append(annotate_kv_8bit)
+
+
+class Qwen3_4B_Head4wQuantRecipe(StaticLLMQuantRecipe):
+    """Qwen3-4B with lm_head at 16a4w instead of 16a8w.
+
+    Identical to Qwen3_4BQuantRecipe except that `output.conv` keeps 4-bit
+    weights. It is annotated explicitly rather than dropped from the 16a8w regex:
+    dropping it would fall through to the conv2d PER_BLOCK rule, which adds 160
+    scales per row (~48.6 MB) and changes granularity as well as bit width.
+    Keeping PER_CHANNEL makes bit width the only variable against the 16a8w build.
+
+    lm_head is 9.7% of the parameters but 19.5% of the weight bytes, because it
+    is the one large tensor the recipe protects at 8-bit while the body runs at
+    4-bit. DFlash reads it twice per round (draft marginals, then verification),
+    so this build exists to price that asymmetry against sparse verification,
+    which removes the same bytes without touching accuracy.
+    """
+
+    default_quant_dtype = QuantDtype.use_16a4w
+
+    def __init__(self, verbose: bool = False):
+        super().__init__()
+
+        self.recipe = (
+            QuantRecipe(
+                self.default_quant_dtype,
+                False,
+                act_observer=MinMaxObserver,
+                granularity=QuantGranularity.PER_TENSOR,
+                verbose=verbose,
+            )
+            .add_node_target(
+                {
+                    torch.ops.aten.conv2d.default,
+                },
+                QuantDtype.use_16a4w_block,
+                False,
+                act_observer=MinMaxObserver,
+                granularity=QuantGranularity.PER_BLOCK,
+                extra_kwargs={"block_size": (1, 16, 1, 1)},
+            )
+            .add_regex(
+                {
+                    r"layers\..*\.feed_forward\.w2_conv",
+                },
+                QuantDtype.use_16a8w,
+                False,
+                act_observer=MinMaxObserver,
+                granularity=QuantGranularity.PER_CHANNEL,
+            )
+            .add_regex(
+                {
+                    r"output\.conv",
+                },
+                QuantDtype.use_16a4w,
+                False,
+                act_observer=MinMaxObserver,
+                granularity=QuantGranularity.PER_CHANNEL,
+            )
+        )
+        self.recipe.custom_quant_annotations.append(annotate_kv_8bit)
+
+    def get_lm_head_quant_dtype(self) -> QuantDtype:
+        return QuantDtype.use_16a4w
 
 
 class DFlashDraftQuantRecipe(StaticLLMQuantRecipe):

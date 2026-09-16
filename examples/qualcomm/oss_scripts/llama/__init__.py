@@ -83,6 +83,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.static_llm_quant_recipe impo
     Qwen2_5_1_5BQuantRecipe,
     Qwen3_0_6BQuantRecipe,
     Qwen3_1_7BQuantRecipe,
+    Qwen3_4B_Head4wQuantRecipe,
     Qwen3_4BQuantRecipe,
     Smollm2QuantRecipe,
     Smollm3QuantRecipe,
@@ -546,6 +547,29 @@ class Qwen3_4B(LLMModelConfig):
     # Dedicated 4B 16a4w recipe: protects lm_head + MLP down_proj at 16a8w to
     # preserve the residual-stream hidden states DFlash's draft consumes.
     quant_recipe = Qwen3_4BQuantRecipe
+
+
+@register_llm_model("qwen3-4b-h4w")
+@dataclass(init=False, frozen=True)
+class Qwen3_4B_H4W(LLMModelConfig):
+    # qwen3-4b with lm_head at 4-bit. lm_head is read twice per DFlash round and
+    # is the one large tensor the base recipe protects at 8-bit, so halving it is
+    # the cheapest cut to round traffic -- at some accuracy cost. Exists to price
+    # that against sparse verification, which cuts the same bytes losslessly.
+    repo_id: str = "Qwen/Qwen3-4B"
+    params_path: str = os.path.join(
+        BASE_DIR, "../../../models/qwen3/config/4b_config.json"
+    )
+    convert_weights = convert_qwen3_weights
+    transform_weight = False
+    instruct_model = True
+    num_sharding = 4
+    masked_softmax = True
+    seq_mse_candidates = 0
+    r1 = False
+    r2 = False
+    r3 = True
+    quant_recipe = Qwen3_4B_Head4wQuantRecipe
 
 
 @register_llm_model("smollm2_135m")

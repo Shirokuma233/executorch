@@ -1160,7 +1160,7 @@ class TextDecoder(Component):
             calib_model = self.decoder
             if split_lm_head:
                 lm_head_quantizer = make_quantizer(
-                    quant_dtype=QuantDtype.use_16a8w,
+                    quant_dtype=self.quant_recipe.get_lm_head_quant_dtype(),
                     per_channel_conv=True,
                     per_channel_linear=True,
                     act_observer=MinMaxObserver,
