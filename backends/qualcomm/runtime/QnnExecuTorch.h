@@ -26,6 +26,23 @@
 #define QNN_RUNTIME_LPAI_AFFINITY "qnn_runtime_lpai_affinity"
 #define QNN_RUNTIME_LPAI_CORE_SELECTION "qnn_runtime_lpai_core_selection"
 #define QNN_RUNTIME_HEAP_PROFILING_PATH "qnn_runtime_heap_profiling_path"
+// HTP power knobs. These have no AOT counterpart in the compiler spec: the
+// values below are chosen per performance mode inside HtpDevice, and these keys
+// let a runner override them without recompiling the model. kHtpBurst -- what
+// generate_htp_compiler_spec defaults to -- pins sleep latency at 40 us and RPC
+// polling at 9999 us, which is the latency end of the trade.
+#define QNN_RUNTIME_HTP_SLEEP_LATENCY "qnn_runtime_htp_sleep_latency"
+#define QNN_RUNTIME_HTP_RPC_POLLING_TIME "qnn_runtime_htp_rpc_polling_time"
+#define QNN_RUNTIME_HTP_RPC_CONTROL_LATENCY \
+  "qnn_runtime_htp_rpc_control_latency"
+// Bus and core voltage corners. HtpDevice pins both to the same value per
+// performance mode, but the SDK votes them separately: the bus corner gates
+// DDR/interconnect, the core corner gates NSP compute. Unset (-1) keeps the
+// per-mode default. Values are DCVS_VOLTAGE_VCORNER_* (0x20 MIN .. 0xA0 MAX).
+#define QNN_RUNTIME_HTP_BUS_VOLTAGE_CORNER \
+  "qnn_runtime_htp_bus_voltage_corner"
+#define QNN_RUNTIME_HTP_CORE_VOLTAGE_CORNER \
+  "qnn_runtime_htp_core_voltage_corner"
 
 #ifdef __cplusplus
 extern "C" {

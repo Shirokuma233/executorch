@@ -60,6 +60,10 @@ class QnnBackendUnifiedRegistry {
       const QnnExecuTorchOptions* options,
       std::shared_ptr<QnnBackendBundle>& bundle);
 
+  executorch::runtime::Error SetHtpVoltageCorners(
+      int32_t bus_voltage_corner,
+      int32_t core_voltage_corner);
+
   void CleanupExpired();
 
  private:

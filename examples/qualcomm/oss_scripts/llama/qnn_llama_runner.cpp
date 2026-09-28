@@ -18,6 +18,8 @@
 #include <executorch/backends/qualcomm/runtime/QnnExecuTorch.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/runner.h>
 #include <executorch/extension/llm/runner/irunner.h>
+#include <executorch/runtime/backend/interface.h>
+#include <executorch/runtime/backend/options.h>
 #include <executorch/runtime/platform/log.h>
 #include <gflags/gflags.h>
 #include <fstream>
@@ -45,6 +47,46 @@ DEFINE_string(
     "",
     "If path is provided, program will dump all logits generated. This option is for analysis purpose. It is not recommended for general usage as it will cause token rate drop and increase in memory usage.");
 DEFINE_string(tokenizer_path, "tokenizer.bin", "Tokenizer stuff.");
+DEFINE_int32(
+    htp_performance_mode,
+    -1,
+    "[Power] QnnExecuTorchHtpPerformanceMode: 1 SustainedHighPerformance, "
+    "2 Burst, 3 HighPerformance, 4 PowerSaver, 5 LowPowerSaver, "
+    "6 HighPowerSaver, 7 LowBalanced, 8 Balanced. Overrides the AOT setting, "
+    "which is kHtpBurst for every build here (that is what "
+    "generate_htp_compiler_spec defaults to). Burst pins both voltage corners "
+    "to MAX, sleepLatency to 40 us and RPC polling to 9999 us -- the far end of "
+    "the energy/latency trade, so this is the knob that moves per-token energy "
+    "without touching the graph. -1 leaves the AOT value alone.");
+DEFINE_int32(
+    htp_sleep_latency,
+    -1,
+    "[Power] NSP sleep latency in us, overriding whatever the performance mode "
+    "picked (Burst uses 40). Larger keeps the NSP awake between round calls "
+    "instead of paying a wake-up each time. -1 keeps the mode's value.");
+DEFINE_int32(
+    htp_rpc_polling_time,
+    -1,
+    "[Power] RPC polling time in us (Burst uses 9999). This is the host<->NSP "
+    "completion-detection spin; shorter ends the spin sooner. -1 keeps the "
+    "mode's value.");
+DEFINE_int32(
+    htp_rpc_control_latency,
+    -1,
+    "[Power] RPC control latency in us (100 for every mode). -1 keeps it.");
+
+DEFINE_int32(
+    htp_bus_voltage_corner,
+    -1,
+    "HTP bus voltage corner (DCVS_VOLTAGE_VCORNER_*: 0x30 SVS2, 0x40 SVS, "
+    "0x60 NOM, 0x80 TURBO, 0x90 TURBO_PLUS, 0x92 TURBO_L2, 0xA0 MAX). Gates "
+    "DDR/interconnect. -1 keeps the performance mode's default.");
+
+DEFINE_int32(
+    htp_core_voltage_corner,
+    -1,
+    "HTP core voltage corner, same encoding. Gates NSP compute. -1 keeps the "
+    "performance mode's default.");
 DEFINE_string(
     prompt,
     "The answer to the ultimate question is",
@@ -65,6 +107,10 @@ DEFINE_int32(
     seq_len,
     128,
     "Total number of tokens to generate (prompt + output).");
+DEFINE_int32(
+    max_new_tokens,
+    -1,
+    "Maximum number of output tokens. Overrides seq_len when specified.");
 DEFINE_int32(
     eval_mode,
     1,
@@ -419,9 +465,9 @@ void start_runner(
       "",
       "",
       false,
-      -1,
+      FLAGS_max_new_tokens,
       false,
-      FLAGS_seq_len,
+      FLAGS_max_new_tokens == -1 ? FLAGS_seq_len : -1,
       static_cast<float>(FLAGS_temperature),
       0,
       0};
@@ -456,6 +502,59 @@ int main(int argc, char** argv) {
       FLAGS_eval_mode != 0) {
     ET_CHECK_MSG(
         false, "Only TokenGenerator(kv) mode is supported to dump all logits.");
+  }
+
+  // Must land before any Module is built: the HTP device votes its power
+  // config in AfterCreateDevice(), which runs while the first method loads.
+  if (FLAGS_htp_performance_mode >= 0 || FLAGS_htp_sleep_latency >= 0 ||
+      FLAGS_htp_rpc_polling_time >= 0 || FLAGS_htp_rpc_control_latency >= 0 ||
+      FLAGS_htp_bus_voltage_corner >= 0 || FLAGS_htp_core_voltage_corner >= 0) {
+    executorch::runtime::BackendOptions<6> backend_options;
+    // set_option takes a string-literal reference, so these cannot be folded
+    // into a loop over the keys.
+    if (FLAGS_htp_performance_mode >= 0) {
+      backend_options.set_option(
+          QNN_RUNTIME_HTP_PERFORMANCE_MODE, FLAGS_htp_performance_mode);
+      ET_LOG(
+          Info, "[Power] performance_mode = %d", FLAGS_htp_performance_mode);
+    }
+    if (FLAGS_htp_sleep_latency >= 0) {
+      backend_options.set_option(
+          QNN_RUNTIME_HTP_SLEEP_LATENCY, FLAGS_htp_sleep_latency);
+      ET_LOG(Info, "[Power] sleep_latency = %d us", FLAGS_htp_sleep_latency);
+    }
+    if (FLAGS_htp_rpc_polling_time >= 0) {
+      backend_options.set_option(
+          QNN_RUNTIME_HTP_RPC_POLLING_TIME, FLAGS_htp_rpc_polling_time);
+      ET_LOG(
+          Info, "[Power] rpc_polling_time = %d us", FLAGS_htp_rpc_polling_time);
+    }
+    if (FLAGS_htp_rpc_control_latency >= 0) {
+      backend_options.set_option(
+          QNN_RUNTIME_HTP_RPC_CONTROL_LATENCY, FLAGS_htp_rpc_control_latency);
+      ET_LOG(
+          Info,
+          "[Power] rpc_control_latency = %d us",
+          FLAGS_htp_rpc_control_latency);
+    }
+    if (FLAGS_htp_bus_voltage_corner >= 0) {
+      backend_options.set_option(
+          QNN_RUNTIME_HTP_BUS_VOLTAGE_CORNER, FLAGS_htp_bus_voltage_corner);
+      ET_LOG(
+          Info, "[Power] bus_voltage_corner = 0x%x", FLAGS_htp_bus_voltage_corner);
+    }
+    if (FLAGS_htp_core_voltage_corner >= 0) {
+      backend_options.set_option(
+          QNN_RUNTIME_HTP_CORE_VOLTAGE_CORNER, FLAGS_htp_core_voltage_corner);
+      ET_LOG(
+          Info,
+          "[Power] core_voltage_corner = 0x%x",
+          FLAGS_htp_core_voltage_corner);
+    }
+    ET_CHECK_MSG(
+        executorch::runtime::set_option(QNN_BACKEND, backend_options.view()) ==
+            executorch::runtime::Error::Ok,
+        "Failed to push backend options");
   }
 
   std::unique_ptr<executorch::extension::Module> module =

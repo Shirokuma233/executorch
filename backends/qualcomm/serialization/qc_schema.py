@@ -195,6 +195,8 @@ class QnnExecuTorchHtpBackendOptions:
     use_multi_contexts: bool = False
     use_weight_sharing: bool = False
     use_slc_allocator: bool = False
+    use_dlbc_weights: bool = False
+    use_sparse_weights_compression: bool = False
 
 
 @unique

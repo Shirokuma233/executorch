@@ -9,6 +9,11 @@
 #include <executorch/backends/qualcomm/runtime/Logging.h>
 #include <executorch/backends/qualcomm/runtime/backends/htp/HtpDevice.h>
 
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <vector>
+
 #include "HTP/QnnHtpCommon.h"
 #include "Saver/QnnSaverCommon.h"
 
@@ -131,7 +136,8 @@ std::vector<QnnHtpPerfInfrastructure_PowerConfig_t> SetVotePowerConfig(
   switch (perf_mode) {
     case QnnExecuTorchHtpPerformanceMode::kHtpBurst:
       dcvs_v3.setSleepLatency = 1; // true
-      dcvs_v3.sleepLatency = kSleepMinLatency;
+      dcvs_v3.sleepLatency =
+          get_option<int32_t>(kSleepMinLatency, QNN_RUNTIME_HTP_SLEEP_LATENCY);
 
       dcvs_v3.setBusParams = 1;
       dcvs_v3.busVoltageCornerMin = DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
@@ -146,7 +152,8 @@ std::vector<QnnHtpPerfInfrastructure_PowerConfig_t> SetVotePowerConfig(
     case QnnExecuTorchHtpPerformanceMode::kHtpSustainedHighPerformance:
     case QnnExecuTorchHtpPerformanceMode::kHtpHighPerformance:
       dcvs_v3.setSleepLatency = 1; // true
-      dcvs_v3.sleepLatency = kSleepLowLatency;
+      dcvs_v3.sleepLatency =
+          get_option<int32_t>(kSleepLowLatency, QNN_RUNTIME_HTP_SLEEP_LATENCY);
 
       dcvs_v3.setBusParams = 1;
       dcvs_v3.busVoltageCornerMin = DCVS_VOLTAGE_VCORNER_TURBO;
@@ -160,7 +167,8 @@ std::vector<QnnHtpPerfInfrastructure_PowerConfig_t> SetVotePowerConfig(
       break;
     case QnnExecuTorchHtpPerformanceMode::kHtpPowerSaver:
       dcvs_v3.setSleepLatency = 1; // true
-      dcvs_v3.sleepLatency = kSleepMediumLatency;
+      dcvs_v3.sleepLatency =
+          get_option<int32_t>(kSleepMediumLatency, QNN_RUNTIME_HTP_SLEEP_LATENCY);
 
       dcvs_v3.setBusParams = 1;
       dcvs_v3.busVoltageCornerMin = DCVS_VOLTAGE_VCORNER_SVS;
@@ -174,7 +182,8 @@ std::vector<QnnHtpPerfInfrastructure_PowerConfig_t> SetVotePowerConfig(
       break;
     case QnnExecuTorchHtpPerformanceMode::kHtpLowPowerSaver:
       dcvs_v3.setSleepLatency = 1; // true
-      dcvs_v3.sleepLatency = kSleepMediumLatency;
+      dcvs_v3.sleepLatency =
+          get_option<int32_t>(kSleepMediumLatency, QNN_RUNTIME_HTP_SLEEP_LATENCY);
 
       dcvs_v3.setBusParams = 1;
       dcvs_v3.busVoltageCornerMin = DCVS_VOLTAGE_VCORNER_SVS2;
@@ -188,7 +197,8 @@ std::vector<QnnHtpPerfInfrastructure_PowerConfig_t> SetVotePowerConfig(
       break;
     case QnnExecuTorchHtpPerformanceMode::kHtpHighPowerSaver:
       dcvs_v3.setSleepLatency = 1; // true
-      dcvs_v3.sleepLatency = kSleepMediumLatency;
+      dcvs_v3.sleepLatency =
+          get_option<int32_t>(kSleepMediumLatency, QNN_RUNTIME_HTP_SLEEP_LATENCY);
 
       dcvs_v3.setBusParams = 1;
       dcvs_v3.busVoltageCornerMin = DCVS_VOLTAGE_VCORNER_SVS_PLUS;
@@ -202,7 +212,8 @@ std::vector<QnnHtpPerfInfrastructure_PowerConfig_t> SetVotePowerConfig(
       break;
     case QnnExecuTorchHtpPerformanceMode::kHtpLowBalanced:
       dcvs_v3.setSleepLatency = 1; // true
-      dcvs_v3.sleepLatency = kSleepMediumLatency;
+      dcvs_v3.sleepLatency =
+          get_option<int32_t>(kSleepMediumLatency, QNN_RUNTIME_HTP_SLEEP_LATENCY);
 
       dcvs_v3.setBusParams = 1;
       dcvs_v3.busVoltageCornerMin = DCVS_VOLTAGE_VCORNER_NOM;
@@ -216,7 +227,8 @@ std::vector<QnnHtpPerfInfrastructure_PowerConfig_t> SetVotePowerConfig(
       break;
     case QnnExecuTorchHtpPerformanceMode::kHtpBalanced:
       dcvs_v3.setSleepLatency = 1; // true
-      dcvs_v3.sleepLatency = kSleepMediumLatency;
+      dcvs_v3.sleepLatency =
+          get_option<int32_t>(kSleepMediumLatency, QNN_RUNTIME_HTP_SLEEP_LATENCY);
 
       dcvs_v3.setBusParams = 1;
       dcvs_v3.busVoltageCornerMin = DCVS_VOLTAGE_VCORNER_NOM_PLUS;
@@ -234,6 +246,29 @@ std::vector<QnnHtpPerfInfrastructure_PowerConfig_t> SetVotePowerConfig(
           "%d to set power configs",
           perf_mode);
       break;
+  }
+
+  // Every mode above pins bus and core to the same corner, but the SDK votes
+  // them separately -- bus gates DDR/interconnect, core gates NSP compute.
+  // Unset keeps the per-mode default; splitting them is what makes the
+  // compute-vs-DRAM share of the energy a controlled experiment.
+  int32_t bus =
+      get_option<int32_t>(-1, QNN_RUNTIME_HTP_BUS_VOLTAGE_CORNER);
+  if (bus > 0) {
+    auto c = static_cast<QnnHtpPerfInfrastructure_VoltageCorner_t>(bus);
+    dcvs_v3.setBusParams = 1;
+    dcvs_v3.busVoltageCornerMin = c;
+    dcvs_v3.busVoltageCornerTarget = c;
+    dcvs_v3.busVoltageCornerMax = c;
+  }
+  int32_t core =
+      get_option<int32_t>(-1, QNN_RUNTIME_HTP_CORE_VOLTAGE_CORNER);
+  if (core > 0) {
+    auto c = static_cast<QnnHtpPerfInfrastructure_VoltageCorner_t>(core);
+    dcvs_v3.setCoreParams = 1;
+    dcvs_v3.coreVoltageCornerMin = c;
+    dcvs_v3.coreVoltageCornerTarget = c;
+    dcvs_v3.coreVoltageCornerMax = c;
   }
 
   return power_configs;
@@ -254,12 +289,14 @@ std::vector<QnnHtpPerfInfrastructure_PowerConfig_t> SetRpcPollingPowerConfig(
   rpc_polling_time.option =
       QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_RPC_POLLING_TIME;
 
-  rpc_control_latency.rpcControlLatencyConfig = kRpcControlLatency;
+  rpc_control_latency.rpcControlLatencyConfig = get_option<int32_t>(
+      kRpcControlLatency, QNN_RUNTIME_HTP_RPC_CONTROL_LATENCY);
   switch (perf_mode) {
     case QnnExecuTorchHtpPerformanceMode::kHtpBurst:
     case QnnExecuTorchHtpPerformanceMode::kHtpSustainedHighPerformance:
     case QnnExecuTorchHtpPerformanceMode::kHtpHighPerformance:
-      rpc_polling_time.rpcPollingTimeConfig = kRpcPollingTimeHighPower;
+      rpc_polling_time.rpcPollingTimeConfig =
+          get_option<int32_t>(kRpcPollingTimeHighPower, QNN_RUNTIME_HTP_RPC_POLLING_TIME);
       break;
     case QnnExecuTorchHtpPerformanceMode::kHtpPowerSaver:
     case QnnExecuTorchHtpPerformanceMode::kHtpLowPowerSaver:
@@ -267,7 +304,8 @@ std::vector<QnnHtpPerfInfrastructure_PowerConfig_t> SetRpcPollingPowerConfig(
     case QnnExecuTorchHtpPerformanceMode::kHtpLowBalanced:
     case QnnExecuTorchHtpPerformanceMode::kHtpBalanced:
     case QnnExecuTorchHtpPerformanceMode::kHtpDefault:
-      rpc_polling_time.rpcPollingTimeConfig = kRpcPollingTimeLowPower;
+      rpc_polling_time.rpcPollingTimeConfig =
+          get_option<int32_t>(kRpcPollingTimeLowPower, QNN_RUNTIME_HTP_RPC_POLLING_TIME);
       break;
     default:
       QNN_EXECUTORCH_LOG_ERROR(
@@ -374,6 +412,44 @@ void HtpDevice::ReleasePerformanceVote() {
   }
 };
 
+Error HtpDevice::SetVoltageCorners(
+    int32_t bus_voltage_corner,
+    int32_t core_voltage_corner) {
+  std::lock_guard<std::mutex> guard(performance_vote_mutex_);
+  ET_CHECK_OR_RETURN_ERROR(
+      htp_perf_infra_ != nullptr && powerconfig_client_id_ != 0 &&
+          !perf_power_configs_.empty(),
+      InvalidState,
+      "HTP performance vote is not initialized");
+
+  auto& dcvs_v3 = perf_power_configs_[0].dcvsV3Config;
+  if (bus_voltage_corner > 0) {
+    auto corner = static_cast<QnnHtpPerfInfrastructure_VoltageCorner_t>(
+        bus_voltage_corner);
+    dcvs_v3.setBusParams = 1;
+    dcvs_v3.busVoltageCornerMin = corner;
+    dcvs_v3.busVoltageCornerTarget = corner;
+    dcvs_v3.busVoltageCornerMax = corner;
+  }
+  if (core_voltage_corner > 0) {
+    auto corner = static_cast<QnnHtpPerfInfrastructure_VoltageCorner_t>(
+        core_voltage_corner);
+    dcvs_v3.setCoreParams = 1;
+    dcvs_v3.coreVoltageCornerMin = corner;
+    dcvs_v3.coreVoltageCornerTarget = corner;
+    dcvs_v3.coreVoltageCornerMax = corner;
+  }
+
+  Qnn_ErrorHandle_t error = htp_perf_infra_->setPowerConfig(
+      powerconfig_client_id_, perf_power_configs_ptr_.data());
+  ET_CHECK_OR_RETURN_ERROR(
+      error == QNN_SUCCESS,
+      Internal,
+      "HTP setPowerConfig failed with error %lu",
+      static_cast<unsigned long>(QNN_GET_ERROR_CODE(error)));
+  return Error::Ok;
+}
+
 Error HtpDevice::AfterCreateDevice() {
   if (IsPerfModeEnabled()) {
     const QnnInterface& qnn_interface = implementation_->GetQnnInterface();
@@ -421,6 +497,63 @@ Error HtpDevice::AfterCreateDevice() {
 
     htp_perf_infra_->setPowerConfig(
         powerconfig_client_id_, rpc_power_configs_ptr_.data());
+
+    // Phase-level DVFS is only viable if one vote is cheap relative to a graph.
+    // A DFlash round is ~127 ms across 4 graphs, so ~30 ms per switch point --
+    // a vote costing over ~1 ms would eat the gain. Alternate two different core
+    // corners, otherwise the driver may short-circuit a vote whose value did not
+    // change and the measurement comes out optimistic.
+    if (const char* env = std::getenv("QNN_BENCH_POWERCONFIG")) {
+      int reps = std::atoi(env);
+      if (reps > 0) {
+        auto mode = get_option(
+            htp_options_->performance_mode(), QNN_RUNTIME_HTP_PERFORMANCE_MODE);
+        auto with_core = [&](int corner) {
+          auto v = SetVotePowerConfig(
+              powerconfig_client_id_, mode, PerformanceModeVoteType::kUpVote);
+          auto c =
+              static_cast<QnnHtpPerfInfrastructure_VoltageCorner_t>(corner);
+          v[0].dcvsV3Config.setCoreParams = 1;
+          v[0].dcvsV3Config.coreVoltageCornerMin = c;
+          v[0].dcvsV3Config.coreVoltageCornerTarget = c;
+          v[0].dcvsV3Config.coreVoltageCornerMax = c;
+          return v;
+        };
+        auto hi = with_core(DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER);
+        auto lo = with_core(DCVS_VOLTAGE_VCORNER_NOM);
+        auto hi_ptr = ObtainNullTermPtrVector(hi);
+        auto lo_ptr = ObtainNullTermPtrVector(lo);
+
+        std::vector<double> us;
+        us.reserve(reps);
+        for (int i = 0; i < reps; ++i) {
+          auto* cfg = (i & 1) ? lo_ptr.data() : hi_ptr.data();
+          auto t0 = std::chrono::steady_clock::now();
+          htp_perf_infra_->setPowerConfig(powerconfig_client_id_, cfg);
+          auto t1 = std::chrono::steady_clock::now();
+          us.push_back(
+              std::chrono::duration<double, std::micro>(t1 - t0).count());
+        }
+        std::vector<double> sorted = us;
+        std::sort(sorted.begin(), sorted.end());
+        double sum = 0;
+        for (double v : us) {
+          sum += v;
+        }
+        QNN_EXECUTORCH_LOG_INFO(
+            "[BenchPowerConfig] n=%d  first=%.1f us  min=%.1f  p50=%.1f  "
+            "mean=%.1f  p95=%.1f  max=%.1f us",
+            reps,
+            us[0],
+            sorted.front(),
+            sorted[sorted.size() / 2],
+            sum / reps,
+            sorted[static_cast<size_t>(sorted.size() * 0.95)],
+            sorted.back());
+        // leave the device on the real vote, not on whatever the loop ended with
+        PerformanceVote();
+      }
+    }
   }
 
   return Error::Ok;

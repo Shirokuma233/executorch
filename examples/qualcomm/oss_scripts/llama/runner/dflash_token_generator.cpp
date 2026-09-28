@@ -10,7 +10,10 @@
 
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/dflash_token_generator.h>
 
+#include <executorch/backends/qualcomm/runtime/QnnExecuTorch.h>
 #include <executorch/extension/llm/runner/util.h>
+#include <executorch/runtime/backend/interface.h>
+#include <executorch/runtime/backend/options.h>
 #include <executorch/runtime/platform/log.h>
 
 #if defined(__ARM_NEON)
@@ -19,13 +22,16 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <fcntl.h>
 #include <limits>
 #include <queue>
 #include <utility>
 #include <vector>
+#include <unistd.h>
 
 using executorch::aten::ScalarType;
 using executorch::aten::Tensor;
@@ -421,6 +427,41 @@ DFlashTokenGenerator::DFlashTokenGenerator(
       embeds_zero_point_(embeds_zero_point),
       logits_scale_(logits_scale),
       logits_zero_point_(logits_zero_point) {
+  const auto read_corner = [](const char* name) {
+    const char* value = std::getenv(name);
+    return value == nullptr ? -1 : std::atoi(value);
+  };
+  dvfs_exec_bus_corner_ = read_corner("DFLASH_DVFS_EXEC_BUS");
+  dvfs_exec_core_corner_ = read_corner("DFLASH_DVFS_EXEC_CORE");
+  dvfs_head_bus_corner_ = read_corner("DFLASH_DVFS_HEAD_BUS");
+  dvfs_head_core_corner_ = read_corner("DFLASH_DVFS_HEAD_CORE");
+  dvfs_draft_head_uses_exec_ =
+      std::getenv("DFLASH_DVFS_DRAFT_HEAD_USES_EXEC") != nullptr;
+  const bool any_dvfs_corner = dvfs_exec_bus_corner_ > 0 ||
+      dvfs_exec_core_corner_ > 0 || dvfs_head_bus_corner_ > 0 ||
+      dvfs_head_core_corner_ > 0;
+  ET_CHECK_MSG(
+      !any_dvfs_corner ||
+          (dvfs_exec_bus_corner_ > 0 && dvfs_exec_core_corner_ > 0 &&
+           dvfs_head_bus_corner_ > 0 && dvfs_head_core_corner_ > 0),
+      "[DFlash][DVFS] set all four DFLASH_DVFS_{EXEC,HEAD}_{BUS,CORE} corners");
+  dvfs_enabled_ = any_dvfs_corner;
+  if (dvfs_enabled_) {
+    ET_LOG(
+        Info,
+        "[DFlash][DVFS] exec bus=0x%x core=0x%x, head bus=0x%x core=0x%x, "
+        "draft_head=%s",
+        dvfs_exec_bus_corner_,
+        dvfs_exec_core_corner_,
+        dvfs_head_bus_corner_,
+        dvfs_head_core_corner_,
+        dvfs_draft_head_uses_exec_ ? "exec" : "head");
+  }
+  if (getenv("DFLASH_FTRACE_MARKERS") != nullptr) {
+    trace_marker_fd_ = open(
+        "/sys/kernel/tracing/instances/dflash_dvfs/trace_marker",
+        O_WRONLY | O_CLOEXEC);
+  }
   ET_CHECK_MSG(
       emb_module_ != nullptr && lm_head_module_ != nullptr,
       "[DFlash] headless decoder requires emb + lm_head modules");
@@ -444,6 +485,56 @@ DFlashTokenGenerator::DFlashTokenGenerator(
       dflash_meta_.prefill_ar_len,
       dflash_meta_.target_ar_len,
       static_cast<long long>(dflash_meta_.mask_token_id));
+}
+
+DFlashTokenGenerator::~DFlashTokenGenerator() {
+  if (trace_marker_fd_ >= 0) {
+    close(trace_marker_fd_);
+  }
+}
+
+void DFlashTokenGenerator::set_dvfs(bool head) {
+  if (!dvfs_enabled_) {
+    return;
+  }
+  const int32_t bus =
+      head ? dvfs_head_bus_corner_ : dvfs_exec_bus_corner_;
+  const int32_t core =
+      head ? dvfs_head_core_corner_ : dvfs_exec_core_corner_;
+  if (bus == dvfs_last_bus_corner_ && core == dvfs_last_core_corner_) {
+    return;
+  }
+
+  executorch::runtime::BackendOptions<2> options;
+  ET_CHECK_MSG(
+      options.set_option(QNN_RUNTIME_HTP_BUS_VOLTAGE_CORNER, bus) ==
+          Error::Ok,
+      "[DFlash][DVFS] failed to prepare bus corner");
+  ET_CHECK_MSG(
+      options.set_option(QNN_RUNTIME_HTP_CORE_VOLTAGE_CORNER, core) ==
+          Error::Ok,
+      "[DFlash][DVFS] failed to prepare core corner");
+  const int64_t start_us = time_in_us();
+  const Error error =
+      executorch::runtime::set_option(QNN_BACKEND, options.view());
+  dvfs_switch_us_ += time_in_us() - start_us;
+  ++dvfs_switch_count_;
+  ET_CHECK_MSG(error == Error::Ok, "[DFlash][DVFS] live corner vote failed");
+  dvfs_last_bus_corner_ = bus;
+  dvfs_last_core_corner_ = core;
+}
+
+void DFlashTokenGenerator::trace_stage(
+    const char* stage,
+    const char* edge) const {
+  if (trace_marker_fd_ < 0) {
+    return;
+  }
+  char marker[96];
+  const int size = snprintf(marker, sizeof(marker), "dflash %s %s\n", stage, edge);
+  if (size > 0) {
+    write(trace_marker_fd_, marker, static_cast<size_t>(size));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -970,11 +1061,13 @@ bool DFlashTokenGenerator::sparse_pick(int32_t slot, uint64_t* out) const {
 
 void DFlashTokenGenerator::draft_topk(
     const float* hidden,
-    int32_t rows,
-    int32_t k) {
+  int32_t rows,
+  int32_t k) {
   const int H = dflash_meta_.hidden_dim;
+  trace_stage("draft_head", "begin");
   const long lm_start_ms = time_in_ms();
   const int64_t t_head = time_in_us();
+  set_dvfs(/*head=*/!dvfs_draft_head_uses_exec_);
   std::memset(draft_hidden_u16_buf_, 0, draft_hidden_u16_nbytes_);
   // TODO(dflash-uint16): 临时桥接。emb输出/draft-IO 目前是 f32(编译端边界没做成
   // uint16),故此处 host quantize。日后编译端把 emb 输出 + draft noise/hidden tag
@@ -992,6 +1085,7 @@ void DFlashTokenGenerator::draft_topk(
       own_head ? dflash_meta_.draft_hidden_zero_point : logits_zero_point_);
   run_lm_head(draft_hidden_u16_buf_, /*draft=*/true);
   stage_us_[kDraftHead] += time_in_us() - t_head;
+  trace_stage("draft_head", "end");
 
   const int64_t t_pick = time_in_us();
   const long t_smp = time_in_ms();
@@ -1475,11 +1569,20 @@ void DFlashTokenGenerator::run_draft(
       method.c_str());
 
   stage_us_[kDraftPrep] += time_in_us() - t_prep;
+  if (out_hidden != nullptr) {
+    trace_stage("draft_exec", "begin");
+  }
   const int64_t t_exec = time_in_us();
+  if (out_hidden != nullptr) {
+    set_dvfs(/*head=*/false);
+  }
   const long start_ms = time_in_ms();
   auto res = draft_module_->execute(method, inputs);
   const double elapsed = static_cast<double>(time_in_ms() - start_ms);
   stage_us_[kDraftExec] += time_in_us() - t_exec;
+  if (out_hidden != nullptr) {
+    trace_stage("draft_exec", "end");
+  }
   const int64_t t_post = time_in_us();
   ET_CHECK_MSG(res.ok(), "[DFlash] draft execute failed for %s", method.c_str());
 
@@ -1635,13 +1738,18 @@ void DFlashTokenGenerator::target_verify_tree(
   // Headless: step returns hidden in output_tensors_[0] (== logits_.data); the L
   // captured layers land in target_hidden_bufs_. We ignore the return tensor and
   // project the hidden through lm_head.pte to get the verify logits.
+  trace_stage("verify_exec", "begin");
   const int64_t t_exec = time_in_us();
+  set_dvfs(/*head=*/false);
   const long t_dec = time_in_ms();
   auto step_res = decoder_runner_->step(method_name_, inputs_);
   decoder_exec_ms_ += static_cast<double>(time_in_ms() - t_dec);
   stage_us_[kVerifyExec] += time_in_us() - t_exec;
+  trace_stage("verify_exec", "end");
   ET_CHECK_MSG(step_res.ok(), "[DFlash] target verify step failed");
+  trace_stage("verify_head", "begin");
   const int64_t t_head = time_in_us();
+  set_dvfs(/*head=*/true);
   verify_hidden_ = logits_.data;
   if (sparse_k_ > 0) {
     run_sparse_head(verify_hidden_);
@@ -1649,6 +1757,7 @@ void DFlashTokenGenerator::target_verify_tree(
     run_lm_head(verify_hidden_);
   }
   stage_us_[kVerifyHead] += time_in_us() - t_head;
+  trace_stage("verify_head", "end");
   target_verify_time_ms_ += static_cast<double>(time_in_ms() - start_ms);
   ++target_verify_calls_;
 
@@ -1906,13 +2015,16 @@ Result<int64_t> DFlashTokenGenerator::generate(
     // An EOS among the accepted tokens ends generation at that token, but must not
     // skip the summary below, so it leaves through the same exit as everything else.
     const int64_t t_emit = time_in_us();
+    const int64_t remaining = static_cast<int64_t>(seq_len) - 1 - cur_pos;
+    int32_t emitted = 0;
     uint64_t prev = last_committed;
     bool hit_eos = false;
-    for (int k = 1; k <= accepted; ++k) {
+    for (int k = 1; k <= accepted && emitted < remaining; ++k) {
       const uint64_t tok = tree_[static_cast<size_t>(path[k]) - 1].token;
       token_callback(ET_UNWRAP_TOKENIZER(tokenizer_->decode(prev, tok)));
+      ++emitted;
       if (eos_ids_->count(tok) > 0) {
-        cur_pos += k;
+        cur_pos += emitted;
         hit_eos = true;
         break;
       }
@@ -1922,10 +2034,16 @@ Result<int64_t> DFlashTokenGenerator::generate(
       stage_us_[kEmit] += time_in_us() - t_emit;
       break;
     }
-    token_callback(ET_UNWRAP_TOKENIZER(tokenizer_->decode(prev, bonus)));
+    if (emitted < remaining) {
+      token_callback(ET_UNWRAP_TOKENIZER(tokenizer_->decode(prev, bonus)));
+      ++emitted;
+    }
     stage_us_[kEmit] += time_in_us() - t_emit;
 
-    cur_pos += accepted + 1;
+    cur_pos += emitted;
+    if (emitted < accepted + 1) {
+      break;
+    }
     last_committed = bonus;
     if (eos_ids_->count(bonus) > 0) {
       break;
@@ -2016,6 +2134,16 @@ Result<int64_t> DFlashTokenGenerator::generate(
                     : 0.0,
         static_cast<unsigned long long>(rep_lag1_),
         static_cast<unsigned long long>(rep_gated_));
+
+    if (dvfs_enabled_) {
+      ET_LOG(
+          Info,
+          "[DFlash][DVFS] switches=%llu total_ms=%.1f mean_us=%.1f",
+          static_cast<unsigned long long>(dvfs_switch_count_),
+          static_cast<double>(dvfs_switch_us_) / 1000.0,
+          static_cast<double>(dvfs_switch_us_) /
+              static_cast<double>(dvfs_switch_count_));
+    }
 
     if (repeat_probe_) {
       for (size_t g = 0; g < 2; ++g) {

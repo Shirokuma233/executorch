@@ -78,6 +78,28 @@ HtpGraphCustomConfig::CreateGraphCustomConfigCommon(
       htp_options_->use_slc_allocator() ? 1.0 : 0.0;
   ret.push_back(static_cast<QnnGraph_CustomConfig_t>(p_custom_config));
 
+  // ENABLE_DLBC above is type 4, which the SDK header marks Reserved. These two
+  // are the ones that actually compress weight traffic, and decode is bound by
+  // exactly that traffic. Only emit them when asked -- they are not supported on
+  // every SoC, and an unknown optimization type fails graph finalize.
+  if (htp_options_->use_dlbc_weights()) {
+    p_custom_config = AllocGraphCustomConfig();
+    p_custom_config->option = QNN_HTP_GRAPH_CONFIG_OPTION_OPTIMIZATION;
+    p_custom_config->optimizationOption.type =
+        QNN_HTP_GRAPH_OPTIMIZATION_TYPE_ENABLE_DLBC_WEIGHTS;
+    p_custom_config->optimizationOption.floatValue = 1.0;
+    ret.push_back(static_cast<QnnGraph_CustomConfig_t>(p_custom_config));
+  }
+
+  if (htp_options_->use_sparse_weights_compression()) {
+    p_custom_config = AllocGraphCustomConfig();
+    p_custom_config->option = QNN_HTP_GRAPH_CONFIG_OPTION_OPTIMIZATION;
+    p_custom_config->optimizationOption.type =
+        QNN_HTP_GRAPH_OPTIMIZATION_TYPE_ENABLE_SPARSE_WEIGHTS_COMPRESSION;
+    p_custom_config->optimizationOption.floatValue = 1.0;
+    ret.push_back(static_cast<QnnGraph_CustomConfig_t>(p_custom_config));
+  }
+
   return ret;
 }
 } // namespace qnn

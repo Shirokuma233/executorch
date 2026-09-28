@@ -95,6 +95,10 @@ def compile_eagle_head(
         use_fp16=False,  # 走 PTQ 量化路径
         use_multi_contexts=decoder_model_config.num_sharding > 1,
         use_weight_sharing=not args.enable_x86_64,
+        use_dlbc=args.use_dlbc,
+        use_slc_allocator=args.use_slc_allocator,
+        use_dlbc_weights=args.use_dlbc_weights,
+        use_sparse_weights_compression=args.use_sparse_weights_compression,
     )
     # Both decode and prefill graphs share the same compile spec
     compile_spec_list = [
@@ -142,6 +146,10 @@ def compile_dflash(
         use_fp16=args.use_fp16,  # --use_fp16: target runs fp16 (draft is always fp16)
         use_multi_contexts=decoder_model_config.num_sharding > 1,
         use_weight_sharing=not args.enable_x86_64,
+        use_dlbc=args.use_dlbc,
+        use_slc_allocator=args.use_slc_allocator,
+        use_dlbc_weights=args.use_dlbc_weights,
+        use_sparse_weights_compression=args.use_sparse_weights_compression,
     )
     compile_spec_list = [
         generate_qnn_executorch_compiler_spec(
@@ -172,6 +180,10 @@ def compile_dflash(
     table_backend_options = generate_htp_compiler_spec(
         use_fp16=False,
         use_weight_sharing=not args.enable_x86_64,
+        use_dlbc=args.use_dlbc,
+        use_slc_allocator=args.use_slc_allocator,
+        use_dlbc_weights=args.use_dlbc_weights,
+        use_sparse_weights_compression=args.use_sparse_weights_compression,
     )
     tok_embedding_compile_spec = [
         generate_qnn_executorch_compiler_spec(
@@ -289,6 +301,10 @@ def compile(
                     use_fp16=False,
                     # x86 emulator does not support weight sharing
                     use_weight_sharing=not args.enable_x86_64,
+                    use_dlbc=args.use_dlbc,
+                    use_slc_allocator=args.use_slc_allocator,
+                    use_dlbc_weights=args.use_dlbc_weights,
+                    use_sparse_weights_compression=args.use_sparse_weights_compression,
                 )
             elif args.backend == "gpu":
                 backend_options = generate_gpu_compiler_spec()
@@ -312,6 +328,10 @@ def compile(
                     use_fp16=False,
                     # x86 emulator does not support weight sharing
                     use_weight_sharing=not args.enable_x86_64,
+                    use_dlbc=args.use_dlbc,
+                    use_slc_allocator=args.use_slc_allocator,
+                    use_dlbc_weights=args.use_dlbc_weights,
+                    use_sparse_weights_compression=args.use_sparse_weights_compression,
                 )
             elif args.backend == "gpu":
                 backend_options = generate_gpu_compiler_spec()
@@ -335,6 +355,10 @@ def compile(
                     use_multi_contexts=decoder_model_config.num_sharding > 1,
                     # x86 emulator does not support weight sharing
                     use_weight_sharing=not args.enable_x86_64,
+                    use_dlbc=args.use_dlbc,
+                    use_slc_allocator=args.use_slc_allocator,
+                    use_dlbc_weights=args.use_dlbc_weights,
+                    use_sparse_weights_compression=args.use_sparse_weights_compression,
                 )
             elif args.backend == "gpu":
                 backend_options = generate_gpu_compiler_spec()
@@ -952,6 +976,35 @@ def _build_parser():
         "-F",
         "--use_fp16",
         help="If specified, will run in fp16 precision and discard ptq setting",
+        action="store_true",
+        default=False,
+    )
+
+    parser.add_argument(
+        "--use_dlbc",
+        help="Enable Deep Learning Bandwidth Compression on the HTP graphs",
+        action="store_true",
+        default=False,
+    )
+
+    parser.add_argument(
+        "--use_slc_allocator",
+        help="Let the HTP graphs allocate out of the System Level Cache",
+        action="store_true",
+        default=False,
+    )
+
+    parser.add_argument(
+        "--use_dlbc_weights",
+        help="Enable DLBC weights compression (ENABLE_DLBC_WEIGHTS; --use_dlbc "
+        "maps to ENABLE_DLBC, which the SDK marks Reserved)",
+        action="store_true",
+        default=False,
+    )
+
+    parser.add_argument(
+        "--use_sparse_weights_compression",
+        help="Enable weight sparsity compression on the HTP graphs",
         action="store_true",
         default=False,
     )

@@ -145,7 +145,7 @@ class DFlashTokenGenerator : public TokenGenerator {
       float logits_scale,
       int32_t logits_zero_point);
 
-  ~DFlashTokenGenerator() override = default;
+  ~DFlashTokenGenerator() override;
 
   // Swap the verify head for one that only scores the drafter's candidates.
   // Must be called before init_io: it decides whether the extra IO is allocated.
@@ -196,6 +196,9 @@ class DFlashTokenGenerator : public TokenGenerator {
   void finish_prompt_seeding();
 
  private:
+  void trace_stage(const char* stage, const char* edge) const;
+  void set_dvfs(bool head);
+
   // One draft graph call. Appends `n_new` context rows (read from `stage_buf_`,
   // RoPE positions `ctx_pos_base + j`) to the KV cache and drafts the block.
   // `out_hidden` may be null when only the cache write matters. The noise
@@ -521,6 +524,17 @@ class DFlashTokenGenerator : public TokenGenerator {
   uint64_t emb_calls_{0};
   uint64_t lm_head_calls_{0};
 
+  bool dvfs_enabled_{false};
+  int32_t dvfs_exec_bus_corner_{-1};
+  int32_t dvfs_exec_core_corner_{-1};
+  int32_t dvfs_head_bus_corner_{-1};
+  int32_t dvfs_head_core_corner_{-1};
+  int32_t dvfs_last_bus_corner_{-1};
+  int32_t dvfs_last_core_corner_{-1};
+  bool dvfs_draft_head_uses_exec_{false};
+  int64_t dvfs_switch_us_{0};
+  uint64_t dvfs_switch_count_{0};
+
   // Non-overlapping stage timers, in microseconds. The counters above overlap
   // (verify contains lm_head, host argmax is charged inside two of them) and
   // leave ~8% of the round unattributed, which is not good enough to say where a
@@ -549,6 +563,7 @@ class DFlashTokenGenerator : public TokenGenerator {
   // belongs to prompt seeding, so the two phases separate without extra plumbing.
   std::array<int64_t, kNumStages> prefill_stage_us_{};
   int64_t decode_wall_us_{0};
+  int trace_marker_fd_{-1};
 };
 
 } // namespace example

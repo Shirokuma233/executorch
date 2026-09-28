@@ -66,6 +66,11 @@ class QnnExecuTorchBackend final
   RuntimeOption qnn_runtime_log_level_{false, 0};
   RuntimeOption qnn_runtime_performance_mode_{false, 0};
   RuntimeOption qnn_runtime_profile_level_{false, 0};
+  RuntimeOption qnn_runtime_htp_sleep_latency_{false, 0};
+  RuntimeOption qnn_runtime_htp_rpc_polling_time_{false, 0};
+  RuntimeOption qnn_runtime_htp_rpc_control_latency_{false, 0};
+  RuntimeOption qnn_runtime_htp_bus_voltage_corner_{false, 0};
+  RuntimeOption qnn_runtime_htp_core_voltage_corner_{false, 0};
   RuntimeOption qnn_runtime_lpai_fps_{false, 0};
   RuntimeOption qnn_runtime_lpai_ftrt_ratio_{false, 0};
   RuntimeOption qnn_runtime_lpai_client_perf_type_{false, 0};

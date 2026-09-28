@@ -202,6 +202,14 @@ table QnnExecuTorchHtpBackendOptions {
   /// It will help the by reducing overall bandwith on the use case.
   /// The feature is only supported by specific SOCs.
   use_slc_allocator:bool;
+
+  /// DLBC weights compression. Note this is a different optimization type from
+  /// use_dlbc above: the SDK marks ENABLE_DLBC (type 4) as Reserved, while
+  /// ENABLE_DLBC_WEIGHTS (type 5) is the one that compresses weight traffic.
+  use_dlbc_weights:bool;
+
+  /// Weight sparsity compression (ENABLE_SPARSE_WEIGHTS_COMPRESSION, type 6).
+  use_sparse_weights_compression:bool;
 }
 
 /// Real-time: Indicates that the model is intended for real-time use cases, where a specific performance threshold must be met.

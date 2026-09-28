@@ -12,6 +12,7 @@
 #include <executorch/backends/qualcomm/runtime/QnnExecuTorchBackend.h>
 #include <executorch/backends/qualcomm/runtime/QnnManager.h>
 #include <executorch/backends/qualcomm/runtime/backends/QnnCustomProtocol.h>
+#include <executorch/backends/qualcomm/runtime/backends/QnnBackendUnifiedRegistry.h>
 #include <executorch/runtime/backend/interface.h>
 #include <executorch/runtime/backend/options.h>
 namespace executorch {
@@ -204,6 +205,7 @@ executorch::runtime::Error QnnExecuTorchBackend::set_option(
         backend_options) {
   std::lock_guard<std::mutex> guard(runtime_option_mutex_);
   size_t matches = backend_options.size();
+  bool update_voltage_corners = false;
   for (const auto& option : backend_options) {
     if (strcmp(option.key, QNN_RUNTIME_LOG_LEVEL) == 0) {
       if (auto* val = std::get_if<int>(&option.value)) {
@@ -219,6 +221,33 @@ executorch::runtime::Error QnnExecuTorchBackend::set_option(
       if (auto* val = std::get_if<int>(&option.value)) {
         qnn_runtime_profile_level_.value = *val;
         qnn_runtime_profile_level_.is_set = true;
+      }
+    } else if (strcmp(option.key, QNN_RUNTIME_HTP_SLEEP_LATENCY) == 0) {
+      if (auto* val = std::get_if<int>(&option.value)) {
+        qnn_runtime_htp_sleep_latency_.value = *val;
+        qnn_runtime_htp_sleep_latency_.is_set = true;
+      }
+    } else if (strcmp(option.key, QNN_RUNTIME_HTP_RPC_POLLING_TIME) == 0) {
+      if (auto* val = std::get_if<int>(&option.value)) {
+        qnn_runtime_htp_rpc_polling_time_.value = *val;
+        qnn_runtime_htp_rpc_polling_time_.is_set = true;
+      }
+    } else if (strcmp(option.key, QNN_RUNTIME_HTP_RPC_CONTROL_LATENCY) == 0) {
+      if (auto* val = std::get_if<int>(&option.value)) {
+        qnn_runtime_htp_rpc_control_latency_.value = *val;
+        qnn_runtime_htp_rpc_control_latency_.is_set = true;
+      }
+    } else if (strcmp(option.key, QNN_RUNTIME_HTP_BUS_VOLTAGE_CORNER) == 0) {
+      if (auto* val = std::get_if<int>(&option.value)) {
+        qnn_runtime_htp_bus_voltage_corner_.value = *val;
+        qnn_runtime_htp_bus_voltage_corner_.is_set = true;
+        update_voltage_corners = true;
+      }
+    } else if (strcmp(option.key, QNN_RUNTIME_HTP_CORE_VOLTAGE_CORNER) == 0) {
+      if (auto* val = std::get_if<int>(&option.value)) {
+        qnn_runtime_htp_core_voltage_corner_.value = *val;
+        qnn_runtime_htp_core_voltage_corner_.is_set = true;
+        update_voltage_corners = true;
       }
     } else if (strcmp(option.key, QNN_RUNTIME_LPAI_FPS) == 0) {
       if (auto* val = std::get_if<int>(&option.value)) {
@@ -268,6 +297,20 @@ executorch::runtime::Error QnnExecuTorchBackend::set_option(
       backend_options.size(),
       matches);
 
+  if (update_voltage_corners) {
+    const int32_t bus = qnn_runtime_htp_bus_voltage_corner_.is_set
+        ? std::get<int>(qnn_runtime_htp_bus_voltage_corner_.value)
+        : -1;
+    const int32_t core = qnn_runtime_htp_core_voltage_corner_.is_set
+        ? std::get<int>(qnn_runtime_htp_core_voltage_corner_.value)
+        : -1;
+    ET_CHECK_OR_RETURN_ERROR(
+        QnnBackendUnifiedRegistry::GetInstance().SetHtpVoltageCorners(
+            bus, core) == Error::Ok,
+        Internal,
+        "Failed to update live HTP voltage corners");
+  }
+
   return Error::Ok;
 }
 
@@ -290,6 +333,26 @@ executorch::runtime::Error QnnExecuTorchBackend::get_option(
         strcmp(backend_options[i].key, QNN_RUNTIME_PROFILE_LEVEL) == 0 &&
         qnn_runtime_profile_level_.is_set) {
       backend_options[i].value = qnn_runtime_profile_level_.value;
+    } else if (
+        strcmp(backend_options[i].key, QNN_RUNTIME_HTP_SLEEP_LATENCY) == 0 &&
+        qnn_runtime_htp_sleep_latency_.is_set) {
+      backend_options[i].value = qnn_runtime_htp_sleep_latency_.value;
+    } else if (
+        strcmp(backend_options[i].key, QNN_RUNTIME_HTP_RPC_POLLING_TIME) == 0 &&
+        qnn_runtime_htp_rpc_polling_time_.is_set) {
+      backend_options[i].value = qnn_runtime_htp_rpc_polling_time_.value;
+    } else if (
+        strcmp(backend_options[i].key, QNN_RUNTIME_HTP_RPC_CONTROL_LATENCY) == 0 &&
+        qnn_runtime_htp_rpc_control_latency_.is_set) {
+      backend_options[i].value = qnn_runtime_htp_rpc_control_latency_.value;
+    } else if (
+        strcmp(backend_options[i].key, QNN_RUNTIME_HTP_BUS_VOLTAGE_CORNER) == 0 &&
+        qnn_runtime_htp_bus_voltage_corner_.is_set) {
+      backend_options[i].value = qnn_runtime_htp_bus_voltage_corner_.value;
+    } else if (
+        strcmp(backend_options[i].key, QNN_RUNTIME_HTP_CORE_VOLTAGE_CORNER) == 0 &&
+        qnn_runtime_htp_core_voltage_corner_.is_set) {
+      backend_options[i].value = qnn_runtime_htp_core_voltage_corner_.value;
     } else if (
         strcmp(backend_options[i].key, QNN_RUNTIME_LPAI_FPS) == 0 &&
         qnn_runtime_lpai_fps_.is_set) {

@@ -163,6 +163,23 @@ Error QnnBackendUnifiedRegistry::GetOrCreateBackendBundle(
   return Error::Ok;
 }
 
+Error QnnBackendUnifiedRegistry::SetHtpVoltageCorners(
+    int32_t bus_voltage_corner,
+    int32_t core_voltage_corner) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it =
+      qnn_backend_bundles_map_.find(QnnExecuTorchBackendType::kHtpBackend);
+  if (it == qnn_backend_bundles_map_.end()) {
+    return Error::Ok;
+  }
+  auto bundle = it->second.lock();
+  if (!bundle || !bundle->qnn_device_ptr) {
+    return Error::Ok;
+  }
+  return static_cast<HtpDevice*>(bundle->qnn_device_ptr.get())
+      ->SetVoltageCorners(bus_voltage_corner, core_voltage_corner);
+}
+
 void QnnBackendUnifiedRegistry::CleanupExpired() {
   std::lock_guard<std::mutex> lock(mutex_);
 

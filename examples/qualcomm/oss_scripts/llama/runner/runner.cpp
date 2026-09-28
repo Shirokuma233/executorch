@@ -1029,8 +1029,24 @@ Error Runner::generate_from_prompt_or_file(
   int64_t end_pos = 0;
   ET_CHECK_MSG(
       !c10::add_overflows(
-          cur_pos_, static_cast<int64_t>(num_prompt_tokens), &end_pos) &&
-          end_pos < static_cast<int64_t>(seq_len),
+          cur_pos_, static_cast<int64_t>(num_prompt_tokens), &end_pos),
+      "sequence position overflow");
+  if (config.max_new_tokens >= 0) {
+    int64_t requested_seq_len = 0;
+    ET_CHECK_MSG(
+        !c10::add_overflows(
+            end_pos,
+            static_cast<int64_t>(config.max_new_tokens) + 1,
+            &requested_seq_len),
+        "sequence length overflow");
+    seq_len = static_cast<int32_t>(std::min(
+        requested_seq_len,
+        static_cast<int64_t>(attention_sink_rope_runner_ == nullptr
+                                 ? context_len_
+                                 : std::numeric_limits<int32_t>::max())));
+  }
+  ET_CHECK_MSG(
+      end_pos < static_cast<int64_t>(seq_len),
       "sequence length exceeded - please increase the seq_len value");
 
   // Prompt Processor first

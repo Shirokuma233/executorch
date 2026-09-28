@@ -12,6 +12,7 @@
 #include <executorch/backends/qualcomm/runtime/backends/htp/HtpDeviceCustomConfig.h>
 #include <executorch/backends/qualcomm/runtime/backends/htp/HtpDevicePlatformInfoConfig.h>
 #include <memory>
+#include <mutex>
 
 #include "HTP/QnnHtpDevice.h"
 
@@ -37,6 +38,10 @@ class HtpDevice : public QnnDevice {
         std::make_unique<HtpDeviceCustomConfig>(htp_options);
   }
   ~HtpDevice();
+
+  executorch::runtime::Error SetVoltageCorners(
+      int32_t bus_voltage_corner,
+      int32_t core_voltage_corner);
 
   // Defines Qnn performance mode vote types for htp
   enum PerformanceModeVoteType {
@@ -91,6 +96,7 @@ class HtpDevice : public QnnDevice {
       perf_power_configs_ptr_;
   std::vector<const QnnHtpPerfInfrastructure_PowerConfig_t*>
       down_vote_power_configs_ptr_;
+  std::mutex performance_vote_mutex_;
 
   const SocInfo* qcom_target_soc_info_;
   const QnnExecuTorchHtpBackendOptions* htp_options_;

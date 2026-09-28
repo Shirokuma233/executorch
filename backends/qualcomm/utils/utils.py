@@ -1020,6 +1020,8 @@ def generate_htp_compiler_spec(
     use_multi_contexts: bool = False,
     use_weight_sharing: bool = False,
     use_slc_allocator: bool = False,
+    use_dlbc_weights: bool = False,
+    use_sparse_weights_compression: bool = False,
     htp_performance_mode: QnnExecuTorchHtpPerformanceMode = QnnExecuTorchHtpPerformanceMode.kHtpBurst,
 ) -> QnnExecuTorchBackendOptions:
     """
@@ -1039,6 +1041,11 @@ def generate_htp_compiler_spec(
         use_slc_allocator: Allows user to enable the usage of the System Level Cache Allocator for a given graph.
             It will help the by reducing overall bandwith on the use case.
             The feature is only supported by specific SOCs.
+        use_dlbc_weights: DLBC weights compression. use_dlbc above maps to
+            ENABLE_DLBC, which the SDK header marks Reserved; this one maps to
+            ENABLE_DLBC_WEIGHTS, which is what compresses weight traffic.
+        use_sparse_weights_compression: Weight sparsity compression. Like
+            use_dlbc_weights, only supported on some SoCs.
 
     Returns:
         QnnExecuTorchHtpBackendOptions: backend options for QNN HTP.
@@ -1057,6 +1064,8 @@ def generate_htp_compiler_spec(
     htp_options.use_weight_sharing = use_weight_sharing
     htp_options.use_dlbc = use_dlbc
     htp_options.use_slc_allocator = use_slc_allocator
+    htp_options.use_dlbc_weights = use_dlbc_weights
+    htp_options.use_sparse_weights_compression = use_sparse_weights_compression
     return QnnExecuTorchBackendOptions(
         backend_type=QnnExecuTorchBackendType.kHtpBackend,
         htp_options=htp_options,
