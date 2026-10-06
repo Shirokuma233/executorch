@@ -117,6 +117,13 @@ class DFlashTokenGenerator : public TokenGenerator {
     float draft_logit_out_scale;
     // Charge the tree for repeated tokens (see kRepPenalty). Tree path only.
     bool repeat_calib;
+    // Energy-isolation experiment (uncommitted): skip the real target-argmax
+    // tree walk and force every round to advance by a fixed path length, so
+    // two configs being A/B'd (e.g. full vs pruned draft lm_head) run the
+    // exact same number of rounds regardless of whether either one's output
+    // is actually correct. See generate()'s accept-walk block.
+    bool force_fixed_accept = false;
+    int32_t force_fixed_accept_len = 4; // includes the bonus token
   };
 
   DFlashTokenGenerator(
@@ -158,6 +165,17 @@ class DFlashTokenGenerator : public TokenGenerator {
       int32_t hot_rows,
       int32_t threads,
       bool check);
+
+  // Energy-isolation experiment (uncommitted): redirect draft's own lm_head
+  // call (draft_topk -> run_lm_head(..., draft=true)) at a standalone pte
+  // holding only the first half of the vocab rows, same quantization as the
+  // deployed lm_head. Content of the kept half is irrelevant here -- this only
+  // exists to compare the draft lm_head's real bandwidth/dispatch cost at full
+  // vs half vocab with everything else (round count, target side) held fixed.
+  void enable_draft_lm_head_pruned(
+      executorch::extension::Module* module,
+      std::unique_ptr<executorch::runtime::MethodMeta> meta,
+      int32_t vocab_size);
 
   // Bind target IO (incl. the L extra hidden outputs) + draft scratch buffers.
   void init_io(
@@ -295,6 +313,16 @@ class DFlashTokenGenerator : public TokenGenerator {
   std::unique_ptr<executorch::runtime::MethodMeta> lm_head_kv_meta_;
   std::unique_ptr<executorch::runtime::MethodMeta> emb_draft_meta_;
   std::unique_ptr<executorch::runtime::MethodMeta> lm_head_draft_meta_;
+
+  // --- energy-isolation experiment (uncommitted, see set_draft_lm_head_pruned /
+  // set_force_fixed_accept below): a standalone single-method pte holding only
+  // the first half of lm_head's vocab rows, same per-channel scale/zero-point/
+  // bitwidth as the deployed lm_head (truncated in place from qdq_lm_head.pt2,
+  // not recalibrated), used ONLY for draft's own topk call. Reuses
+  // lm_head_logits_buf_ (sized for the full vocab, so a smaller write fits).
+  executorch::extension::Module* lm_head_draft_pruned_module_ = nullptr;
+  std::unique_ptr<executorch::runtime::MethodMeta> lm_head_draft_pruned_meta_;
+  int32_t lm_head_draft_pruned_vocab_size_ = 0;
   // Boundary QDQ, read off the decoder pte getters at load time.
   float embeds_scale_;
   int32_t embeds_zero_point_;

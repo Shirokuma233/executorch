@@ -893,6 +893,30 @@ void DFlashTokenGenerator::run_embedding(
 }
 
 void DFlashTokenGenerator::run_lm_head(std::byte* hidden_u16, bool draft) {
+  // Energy-isolation experiment (uncommitted): draft's own topk call can be
+  // redirected at a standalone half-vocab pte. Only draft=true is affected;
+  // target's verify call always uses the real, full-vocab lm_head_module_.
+  if (draft && lm_head_draft_pruned_module_ != nullptr) {
+    auto* meta = lm_head_draft_pruned_meta_.get();
+    auto in_meta = meta->input_tensor_meta(0).get();
+    auto out_meta = meta->output_tensor_meta(0).get();
+    TensorImpl in_impl = make_impl(in_meta, hidden_u16);
+    // lm_head_logits_buf_ is sized for the full vocab; the pruned graph only
+    // writes its first lm_head_draft_pruned_vocab_size_ rows worth of bytes.
+    TensorImpl out_impl = make_impl(out_meta, lm_head_logits_buf_);
+    std::vector<EValue> ins{EValue(Tensor(&in_impl))};
+    std::vector<EValue> outs{EValue(Tensor(&out_impl))};
+    ET_CHECK_MSG(
+        lm_head_draft_pruned_module_->set_outputs("forward", outs) ==
+            Error::Ok,
+        "[DFlash] pruned draft lm_head set_outputs failed");
+    const long t0 = time_in_ms();
+    auto res = lm_head_draft_pruned_module_->execute("forward", ins);
+    lm_head_exec_ms_ += static_cast<double>(time_in_ms() - t0);
+    ++lm_head_calls_;
+    ET_CHECK_MSG(res.ok(), "[DFlash] pruned draft lm_head execute failed");
+    return;
+  }
   const bool use_draft = draft && lm_head_draft_meta_ != nullptr;
   MethodMeta* meta =
       use_draft ? lm_head_draft_meta_.get() : lm_head_kv_meta_.get();
@@ -999,6 +1023,15 @@ void DFlashTokenGenerator::enable_sparse_verify(
   sparse_check_ = check;
 }
 
+void DFlashTokenGenerator::enable_draft_lm_head_pruned(
+    executorch::extension::Module* module,
+    std::unique_ptr<executorch::runtime::MethodMeta> meta,
+    int32_t vocab_size) {
+  lm_head_draft_pruned_module_ = module;
+  lm_head_draft_pruned_meta_ = std::move(meta);
+  lm_head_draft_pruned_vocab_size_ = vocab_size;
+}
+
 void DFlashTokenGenerator::run_sparse_head(std::byte* hidden_u16) {
   sparse_gather_.wait();
   // The decoder emits hidden as uint16 codes and the full head's pte is tagged
@@ -1089,7 +1122,12 @@ void DFlashTokenGenerator::draft_topk(
 
   const int64_t t_pick = time_in_us();
   const long t_smp = time_in_ms();
-  const size_t V = static_cast<size_t>(lm_head_vocab_size_);
+  // Energy-isolation experiment (uncommitted): the pruned draft lm_head wrote
+  // only its own (smaller) vocab worth of columns per row, contiguously -- the
+  // row stride below must match what was actually written, not the real vocab.
+  const size_t V = lm_head_draft_pruned_module_ != nullptr
+      ? static_cast<size_t>(lm_head_draft_pruned_vocab_size_)
+      : static_cast<size_t>(lm_head_vocab_size_);
   const uint16_t* lg = reinterpret_cast<const uint16_t*>(lm_head_logits_buf_);
   // These are the DRAFT's code gaps, so they want the scale the draft-width graph
   // calibrated on draft logits. The other one is dominated by the target's.
@@ -1285,6 +1323,44 @@ void DFlashTokenGenerator::build_tree(int32_t budget, int32_t depth_limit) {
   // common repeat, so this seeding is not an edge case.
   path_len_[0] = static_cast<int32_t>(committed_tail_.size());
   std::copy(committed_tail_.begin(), committed_tail_.end(), path_tail_.begin());
+
+  if (dflash_meta_.force_fixed_accept) {
+    // Energy-isolation experiment (uncommitted): the heap below picks shape
+    // (depth vs width) from real candidate SCORES, which real-device testing
+    // showed collapses to a much shallower tree under a degraded draft lm_head
+    // (noisier/flatter candidates -> best-first prefers width), breaking round
+    // -count parity between configs being A/B'd. Bypass shape entirely: chain
+    // exactly (force_fixed_accept_len - 1) nodes, always the top-ranked REAL
+    // candidate at each step (fill_candidates still runs for real -- this is
+    // still real draft compute, just not a real tree SEARCH). Guarantees an
+    // identical, content-independent round count across any two configs run
+    // with this flag on, regardless of candidate quality.
+    const int32_t chain_len = std::min(
+        dflash_meta_.force_fixed_accept_len - 1, std::min(depth_limit, budget));
+    int32_t parent = 0;
+    for (int32_t depth = 1; depth <= chain_len; ++depth) {
+      fill_candidates(parent, depth, k, calib);
+      const uint64_t token = cand_token_[static_cast<size_t>(parent) * k];
+      const int32_t slot = static_cast<int32_t>(tree_.size()) + 1;
+      tree_.push_back(TreeNode{token, parent, depth});
+      tree_children_[static_cast<size_t>(parent)].emplace_back(token, slot);
+      const uint64_t* ppath =
+          path_tail_.data() + static_cast<size_t>(parent) * kRepLag;
+      uint64_t* npath = path_tail_.data() + static_cast<size_t>(slot) * kRepLag;
+      const int32_t plen = path_len_[parent];
+      if (plen < kRepLag) {
+        std::copy(ppath, ppath + plen, npath);
+        npath[plen] = token;
+        path_len_[slot] = plen + 1;
+      } else {
+        std::copy(ppath + 1, ppath + kRepLag, npath);
+        npath[kRepLag - 1] = token;
+        path_len_[slot] = kRepLag;
+      }
+      parent = slot;
+    }
+    return;
+  }
 
   std::priority_queue<Cand> heap;
   fill_candidates(0, 1, k, calib);
@@ -1935,11 +2011,63 @@ Result<int64_t> DFlashTokenGenerator::generate(
       }
       return argmax_u16_row(lg + static_cast<size_t>(slot) * V, V);
     };
-    uint64_t bonus = pick(0);
-    for (int32_t child = tree_child(0, bonus); child >= 0;
-         child = tree_child(path.back(), bonus)) {
-      path.push_back(child);
-      bonus = pick(child);
+    uint64_t bonus;
+    if (dflash_meta_.force_fixed_accept) {
+      // Energy-isolation experiment (uncommitted): ignore whether the tree
+      // actually contains the target's real continuation. Walk UP from any
+      // real tree node at depth (force_fixed_accept_len - 1) to the root via
+      // .parent, so `path` is a genuine, structurally valid sequence of tree
+      // slots (required by update_cache/update_attention_mask below) of the
+      // requested length -- content (which tokens) is irrelevant to what this
+      // experiment measures. Falls back to the deepest node reachable if the
+      // tree doesn't reach the requested depth (rare, e.g. near EOS); that
+      // round will accept fewer than requested and should be flagged, not
+      // silently treated as a full-length round, if this shows up often.
+      const int32_t want_depth = dflash_meta_.force_fixed_accept_len - 1;
+      int32_t best_idx = -1;
+      int32_t best_depth = 0;
+      for (size_t i = 0; i < tree_.size(); ++i) {
+        if (tree_[i].depth == want_depth) {
+          best_idx = static_cast<int32_t>(i);
+          break;
+        }
+        if (tree_[i].depth > best_depth && tree_[i].depth < want_depth) {
+          best_depth = tree_[i].depth;
+          best_idx = static_cast<int32_t>(i);
+        }
+      }
+      if (best_idx >= 0) {
+        std::vector<int32_t> rev;
+        int32_t idx = best_idx;
+        while (true) {
+          rev.push_back(idx + 1);
+          const int32_t parent_slot = tree_[static_cast<size_t>(idx)].parent;
+          if (parent_slot == 0) {
+            break;
+          }
+          idx = parent_slot - 1;
+        }
+        for (auto it = rev.rbegin(); it != rev.rend(); ++it) {
+          path.push_back(*it);
+        }
+      }
+      if (static_cast<int>(path.size()) - 1 < want_depth) {
+        ET_LOG(
+            Info,
+            "[DFlash][force_fixed_accept] tree only reached depth %d < requested %d "
+            "at cur_pos=%lld -- this round accepts short",
+            best_depth,
+            want_depth,
+            static_cast<long long>(cur_pos));
+      }
+      bonus = pick(path.back());
+    } else {
+      bonus = pick(0);
+      for (int32_t child = tree_child(0, bonus); child >= 0;
+           child = tree_child(path.back(), bonus)) {
+        path.push_back(child);
+        bonus = pick(child);
+      }
     }
     const int accepted = static_cast<int>(path.size()) - 1;
     stage_us_[kVerifyPick] += time_in_us() - t_acc;

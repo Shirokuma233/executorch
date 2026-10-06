@@ -125,7 +125,11 @@ Runner::Runner(
     int32_t dflash_sparse_k,
     int32_t dflash_sparse_hot_rows,
     int32_t dflash_sparse_threads,
-    bool dflash_sparse_check)
+    bool dflash_sparse_check,
+    std::unique_ptr<executorch::extension::Module>
+        dflash_draft_lm_head_pruned_module,
+    bool dflash_force_fixed_accept,
+    int32_t dflash_force_fixed_accept_len)
     : module_(std::move(module)),
       attention_sink_rope_module_(std::move(attention_sink_rope_module)),
       eagle_head_module_(std::move(eagle_head_module)),
@@ -146,6 +150,10 @@ Runner::Runner(
       dflash_sparse_hot_rows_(dflash_sparse_hot_rows),
       dflash_sparse_threads_(dflash_sparse_threads),
       dflash_sparse_check_(dflash_sparse_check),
+      dflash_draft_lm_head_pruned_module_(
+          std::move(dflash_draft_lm_head_pruned_module)),
+      dflash_force_fixed_accept_(dflash_force_fixed_accept),
+      dflash_force_fixed_accept_len_(dflash_force_fixed_accept_len),
       block_size_(block_size),
       dflash_max_context_len_(dflash_max_context_len),
       dflash_tree_budget_(dflash_tree_budget),
@@ -858,6 +866,8 @@ Error Runner::load() {
         /*draft_hidden_zero_point=*/dflash_draft_hidden_zp,
         /*draft_logit_out_scale=*/dflash_draft_logit_out_scale,
         /*repeat_calib=*/dflash_repeat_calib_,
+        /*force_fixed_accept=*/dflash_force_fixed_accept_,
+        /*force_fixed_accept_len=*/dflash_force_fixed_accept_len_,
     };
 
     auto dflash_gen = std::make_unique<DFlashTokenGenerator>(
@@ -895,6 +905,21 @@ Error Runner::load() {
           dflash_sparse_hot_rows_,
           dflash_sparse_threads_,
           dflash_sparse_check_);
+    }
+    if (dflash_draft_lm_head_pruned_module_ != nullptr) {
+      ET_CHECK_MSG(
+          dflash_draft_lm_head_pruned_module_->load_method("forward") ==
+              Error::Ok,
+          "[DFlash] pruned draft lm_head load_method failed");
+      auto pruned_meta = ET_UNWRAP(
+          dflash_draft_lm_head_pruned_module_->method_meta("forward"));
+      const auto pruned_sizes = pruned_meta.output_tensor_meta(0)->sizes();
+      const int32_t pruned_vocab =
+          static_cast<int32_t>(pruned_sizes[pruned_sizes.size() - 1]);
+      dflash_gen->enable_draft_lm_head_pruned(
+          dflash_draft_lm_head_pruned_module_.get(),
+          std::make_unique<MethodMeta>(std::move(pruned_meta)),
+          pruned_vocab);
     }
     token_generator_ = std::move(dflash_gen);
   } else {

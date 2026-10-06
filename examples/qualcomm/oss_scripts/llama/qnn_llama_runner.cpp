@@ -218,6 +218,32 @@ DEFINE_string(
     "[DFlash Decoding] Path to the compiled lm_head pte (headless decoder emits "
     "hidden, not logits). "
     "Default: <dflash_draft dir>/lm_head_qnn.pte");
+DEFINE_string(
+    dflash_draft_lm_head_pruned_pte_path,
+    "",
+    "[DFlash Decoding, uncommitted energy-isolation experiment] Path to a "
+    "standalone lm_head pte holding only a prefix of the vocab rows (same "
+    "per-channel scale/zero-point/bitwidth as the real lm_head, truncated in "
+    "place -- see ddtree/workspace/build_pruned_lm_head.py). When set, ONLY "
+    "draft's own topk call (draft_topk -> run_lm_head(draft=true)) is "
+    "redirected here; target's verify call is unaffected. Empty keeps the "
+    "stock path bit-identical.");
+DEFINE_bool(
+    dflash_force_fixed_accept,
+    false,
+    "[DFlash Decoding, uncommitted energy-isolation experiment] Skip the real "
+    "target-argmax tree walk and force every round to accept exactly "
+    "dflash_force_fixed_accept_len tokens (a real, structurally valid tree "
+    "path, picked without regard to whether it matches the target's actual "
+    "continuation). Exists to A/B two configs (e.g. full vs pruned draft "
+    "lm_head) with an identical round count, isolating one variable's cost. "
+    "Do not use for anything but a controlled energy/latency comparison -- "
+    "generated text is meaningless with this on.");
+DEFINE_int32(
+    dflash_force_fixed_accept_len,
+    4,
+    "[DFlash Decoding, uncommitted energy-isolation experiment] Tokens per "
+    "round (including the bonus token) when dflash_force_fixed_accept is set.");
 DEFINE_int32(
     dflash_sparse_k,
     0,
@@ -408,7 +434,9 @@ void start_runner(
     std::unique_ptr<executorch::extension::Module> dflash_lm_head_module,
     std::unique_ptr<executorch::extension::Module> dflash_sparse_head_module,
     const std::string& dflash_sparse_table_path,
-    const std::string& dflash_sparse_scale_path) {
+    const std::string& dflash_sparse_scale_path,
+    std::unique_ptr<executorch::extension::Module>
+        dflash_draft_lm_head_pruned_module) {
   bool use_tokenized_prompt =
       gflags::GetCommandLineFlagInfoOrDie("tokenized_prompt").is_default ? false
                                                                          : true;
@@ -450,7 +478,10 @@ void start_runner(
       FLAGS_dflash_sparse_k,
       FLAGS_dflash_sparse_hot_rows,
       FLAGS_dflash_sparse_threads,
-      FLAGS_dflash_sparse_check);
+      FLAGS_dflash_sparse_check,
+      std::move(dflash_draft_lm_head_pruned_module),
+      FLAGS_dflash_force_fixed_accept,
+      FLAGS_dflash_force_fixed_accept_len);
   auto decoder_model_version = runner.get_decoder_model_version();
   std::vector<char> buf;
   buf.reserve(5 * FLAGS_seq_len); // assume each token is around 5 char
@@ -599,6 +630,8 @@ int main(int argc, char** argv) {
   std::unique_ptr<executorch::extension::Module> dflash_emb_module;
   std::unique_ptr<executorch::extension::Module> dflash_lm_head_module;
   std::unique_ptr<executorch::extension::Module> dflash_sparse_head_module;
+  std::unique_ptr<executorch::extension::Module>
+      dflash_draft_lm_head_pruned_module;
   std::string sparse_table;
   std::string sparse_scale;
   if (!FLAGS_dflash_draft_path.empty()) {
@@ -619,6 +652,13 @@ int main(int argc, char** argv) {
     dflash_lm_head_module = std::make_unique<executorch::extension::Module>(
         lm_head_pte.c_str(),
         executorch::extension::Module::LoadMode::MmapUseMlockIgnoreErrors);
+    if (!FLAGS_dflash_draft_lm_head_pruned_pte_path.empty()) {
+      dflash_draft_lm_head_pruned_module =
+          std::make_unique<executorch::extension::Module>(
+              FLAGS_dflash_draft_lm_head_pruned_pte_path.c_str(),
+              executorch::extension::Module::LoadMode::
+                  MmapUseMlockIgnoreErrors);
+    }
     if (FLAGS_dflash_sparse_k > 0) {
       std::string sparse_pte = FLAGS_dflash_sparse_head_pte_path.empty()
           ? sibling_path(FLAGS_dflash_draft_path, "sparse_lm_head_qnn.pte")
@@ -649,7 +689,8 @@ int main(int argc, char** argv) {
       std::move(dflash_lm_head_module),
       std::move(dflash_sparse_head_module),
       sparse_table,
-      sparse_scale);
+      sparse_scale,
+      std::move(dflash_draft_lm_head_pruned_module));
 
   return 0;
 }

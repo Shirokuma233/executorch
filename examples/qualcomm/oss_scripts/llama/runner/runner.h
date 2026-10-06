@@ -91,7 +91,14 @@ class Runner : public executorch::extension::llm::IRunner {
       int32_t dflash_sparse_k = 0,
       int32_t dflash_sparse_hot_rows = 0,
       int32_t dflash_sparse_threads = 1,
-      bool dflash_sparse_check = false);
+      bool dflash_sparse_check = false,
+      // Energy-isolation experiment (uncommitted): see
+      // dflash_token_generator.h's enable_draft_lm_head_pruned /
+      // Metadata::force_fixed_accept.
+      std::unique_ptr<executorch::extension::Module>
+          dflash_draft_lm_head_pruned_module = nullptr,
+      bool dflash_force_fixed_accept = false,
+      int32_t dflash_force_fixed_accept_len = 4);
 
   bool is_loaded() const override;
   executorch::runtime::Error load() override;
@@ -153,6 +160,11 @@ class Runner : public executorch::extension::llm::IRunner {
   int32_t dflash_sparse_hot_rows_ = 0;
   int32_t dflash_sparse_threads_ = 1;
   bool dflash_sparse_check_ = false;
+  // Energy-isolation experiment (uncommitted).
+  std::unique_ptr<executorch::extension::Module>
+      dflash_draft_lm_head_pruned_module_;
+  bool dflash_force_fixed_accept_ = false;
+  int32_t dflash_force_fixed_accept_len_ = 4;
   int block_size_{16};
   int dflash_max_context_len_{0};
   int dflash_tree_budget_{0};
