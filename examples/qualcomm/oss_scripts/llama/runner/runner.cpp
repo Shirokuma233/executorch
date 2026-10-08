@@ -798,7 +798,6 @@ Error Runner::load() {
     };
     int32_t block_size = read_int_meta("get_dflash_block_size", block_size_);
     bool shifted_decode = read_int_meta("get_dflash_shifted_decode", 0) != 0;
-    bool drop_sink = read_int_meta("get_dflash_drop_sink", 0) != 0;
     int32_t hidden_dim = read_int_meta("get_dflash_hidden_size", 0);
     int32_t num_ctx_layers = read_int_meta("get_dflash_num_ctx_layers", 0);
     int32_t num_draft_layers = read_int_meta(
@@ -859,7 +858,6 @@ Error Runner::load() {
         /*prefill_ar_len=*/dflash_prefill_ar,
         /*mask_token_id=*/mask_token_id,
         /*shifted_decode=*/shifted_decode,
-        /*drop_sink=*/drop_sink,
         /*tree_budget=*/dflash_tree_budget_,
         /*logit_out_scale=*/dflash_logit_out_scale_,
         /*draft_hidden_scale=*/dflash_draft_hidden_scale,

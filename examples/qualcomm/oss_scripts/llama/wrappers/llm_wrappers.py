@@ -140,7 +140,6 @@ class TextDecoder(Component):
         output_hidden_layers: Optional[List[int]] = None,
         apply_output: bool = True,
         draft_head_ar: Optional[int] = None,
-        fork_captured_hiddens: bool = False,
     ):
         self.control_args = control_args
         self.config = config
@@ -149,10 +148,6 @@ class TextDecoder(Component):
         self.dep_table = get_passes_dependency_for_capture_program()
         self.meta = {}
         self.output_hidden_layers = output_hidden_layers
-        # Only --no_sink needs the captured hiddens on their own quantization point,
-        # and the fork is not free (five elementwise muls plus a requant per forward),
-        # so keep-sink builds export the residual tensor directly as they always did.
-        self.fork_captured_hiddens = fork_captured_hiddens
         # DFlash: a third emb/lm_head width, block_size wide, for the draft. The draft
         # produces exactly block_size rows per round, so sharing the target's
         # decode-width graphs made the vocab projection scale with the tree size while
@@ -160,9 +155,6 @@ class TextDecoder(Component):
         # all of it padding. Separate graphs also give the draft its own boundary
         # encodings, calibrated on draft traffic instead of the target's.
         self.draft_head_ar = draft_head_ar
-        # Filled at the prompt/generation boundary under --sink_split; compile()
-        # stamps it back onto the prefill graph after the decode override.
-        self.sink_split_qparams = None
         self.draft_tok_embedding = None
         self.draft_lm_head = None
         self.draft_tok_embedding_passes_job = (
@@ -402,7 +394,6 @@ class TextDecoder(Component):
             output_cache=True,
             use_i64_token=use_i64_token,
             output_hidden_layers=self.output_hidden_layers,
-            fork_captured_hiddens=self.fork_captured_hiddens,
             apply_output=self.apply_output,
             **get_model_specific_kwargs(self.control_args, self.config),
         )
@@ -924,11 +915,6 @@ class TextDecoder(Component):
                 dflash_config=dflash_config,
             )
             input_samples.extend(input_sample)
-        # Hand the phase-banked prefill encodings to compile(), which stamps them back
-        # after the decode->prefill override has overwritten them. dflash_config is
-        # local to this method, which is why the assignment lives here.
-        if dflash_config is not None:
-            self.sink_split_qparams = dflash_config.prefill_qparams
         return input_samples
 
     def _override_lm_head_input_scale(self, scale, zero_point):
@@ -1382,7 +1368,6 @@ class HybridTextDecoder(Component):
         output_hidden_layers: Optional[List[int]] = None,
         apply_output: bool = True,
         draft_head_ar: Optional[int] = None,
-        fork_captured_hiddens: bool = False,
     ):
         # The draft-width emb/lm_head hang off the decode wrapper: that is the one
         # whose calibration loop drives the draft, and the one whose encodings the
@@ -1395,7 +1380,6 @@ class HybridTextDecoder(Component):
             output_hidden_layers=output_hidden_layers,
             apply_output=apply_output,
             draft_head_ar=draft_head_ar,
-            fork_captured_hiddens=fork_captured_hiddens,
         )
         self.prefill = TextDecoder(
             control_args,
@@ -1404,7 +1388,6 @@ class HybridTextDecoder(Component):
             apply_embedding=apply_embedding,
             output_hidden_layers=output_hidden_layers,
             apply_output=apply_output,
-            fork_captured_hiddens=fork_captured_hiddens,
         )
         self.control_args = control_args
         self.config = config
@@ -1415,55 +1398,6 @@ class HybridTextDecoder(Component):
 
     # Static so the DFlash draft can reuse it: its two graphs share one KV cache
     # too, so they need identical encodings for the same reason hybrid does.
-    @staticmethod
-    def _stamp_tail_output_encoding(model, n, qparams, what):
-        """Force the encodings of the LAST `n` graph outputs.
-
-        Runs AFTER _encoding_override, whose whole job is to copy decode's encodings
-        onto prefill -- these are the two tensors that must NOT inherit them. The
-        draft-facing captured hiddens are the only outputs whose prefill and decode
-        ranges legitimately differ, because prefill is the only graph that ever sees
-        position 0 and because that boundary crosses to the draft as f32, not as a
-        shared uint16 buffer like the KV cache.
-
-        Positional, matching _captured_hidden_observers: the decoder returns
-        (final_hidden, k..., v..., *captured), so the captured ones are the tail.
-        """
-        out_node = next(x for x in model.graph.nodes if x.op == "output")
-        outs = list(out_node.args[0])[-n:]
-        q_op = torch.ops.quantized_decomposed.quantize_per_tensor.default
-        dq_op = torch.ops.quantized_decomposed.dequantize_per_tensor.default
-        patched = 0
-        # Every consumer of the quantize, not just the one on the output path. Without
-        # the captured_gain fork this node is the residual stream's own and has THREE
-        # dequantize users (graph output, next layer, residual add); leaving two of
-        # them on the decode scale while the tensor is stored on the prefill scale
-        # multiplies the residual by their ratio -- a silent corruption that compiles
-        # clean and shows up on device as EOS from the first token.
-        deqs = 0
-        for out, (scale, zp) in zip(outs, qparams):
-            if out.target is not dq_op:
-                continue
-            src = out.args[0]
-            if getattr(src, "target", None) is not q_op:
-                continue
-            src.args = (src.args[0], scale, zp, *src.args[3:])
-            for user in list(src.users):
-                if user.target is dq_op:
-                    user.args = (user.args[0], scale, zp, *user.args[3:])
-                    deqs += 1
-            patched += 1
-        model.recompile()
-        logging.info(
-            "sink_split: stamped prefill encoding onto %d/%d %s outputs "
-            "(%d dequantize users) -> %s",
-            patched, n, what, deqs, [f"{s:.8f}" for s, _ in qparams],
-        )
-        if patched != n or deqs < patched:
-            raise RuntimeError(
-                f"sink_split stamped {patched} of {n} {what} outputs, {deqs} dequantizes"
-            )
-
     @staticmethod
     def _encoding_override(decode_model, prefill_model):  # noqa: C901
         pbq_target = {
@@ -1585,11 +1519,6 @@ class HybridTextDecoder(Component):
                 decode_model=self.decode.decoder,
                 prefill_model=self.prefill.decoder,
             )
-            qp = getattr(self.decode, "sink_split_qparams", None)
-            if qp:
-                self._stamp_tail_output_encoding(
-                    self.prefill.decoder, len(qp), qp, "captured-hidden"
-                )
             if self.apply_embedding:
                 self._encoding_override(
                     decode_model=self.decode.tok_embedding,

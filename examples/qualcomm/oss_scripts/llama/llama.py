@@ -848,29 +848,6 @@ def _build_parser():
         "draft is quantized to 16a4w, calibrated on the quantized target's hidden.",
     )
     parser.add_argument(
-        "--no_sink",
-        action="store_true",
-        help="[DFlash mode] Exclude the attention-sink token (position 0) from the "
-        "draft. The whole prompt is still processed -- the sink is only left out of "
-        "two places: the quantization statistics during calibration, and the draft's "
-        "context at inference. Measured on Qwen3-4B, position 0's captured hidden is "
-        "58x the next largest row (16391.8 vs 280.3), so a per-tensor range that "
-        "includes it costs ~5.9 effective bits on every other row. Read only from "
-        "here, never from the checkpoint: a stale field there used to decide this "
-        "silently for every build.",
-    )
-    parser.add_argument(
-        "--sink_split",
-        action="store_true",
-        help="[DFlash mode] Keep feeding the sink to the draft, but calibrate the "
-        "draft-facing encodings separately per phase. Only the prefill graph ever "
-        "processes position 0 at runtime, so its captured/new_context ranges are "
-        "banked at the end of the prompt (covering the sink) and the observers are "
-        "then reset, leaving the speculative loop to calibrate the decode graphs on "
-        "generation rows alone. Gets --no_sink's ~4.4 bits on every generation row "
-        "without giving up the sink's context. Mutually exclusive with --no_sink.",
-    )
-    parser.add_argument(
         "--dflash_tree_nodes",
         default=0,
         type=int,

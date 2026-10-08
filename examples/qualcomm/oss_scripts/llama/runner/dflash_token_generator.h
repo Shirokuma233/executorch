@@ -92,11 +92,6 @@ class DFlashTokenGenerator : public TokenGenerator {
     // verify block = B. Reading a shifted draft with the aligned rule puts every
     // token one slot early and acceptance collapses to zero.
     bool shifted_decode;
-    // Skip the sink token's hidden when seeding, because the draft graph was
-    // calibrated without it (DFlashConfig.drop_sink). Read from the pte rather
-    // than configured here: seeding a row the quantizer never saw silently costs
-    // acceptance instead of failing.
-    bool drop_sink;
     // DDTree: non-root nodes to spend on the draft tree. 0 keeps the chain.
     // Capped at target_ar_len - 1 -- the verify window is compiled, not
     // configurable, so a budget of 15 costs the target exactly what the chain
