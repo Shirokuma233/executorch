@@ -166,10 +166,21 @@ def compile_dflash(
     # cat[cache | new_context | block]) goes to DFlashMhaToSha, which splits symmetrically
     # and shallowly (batched proj/norm/RoPE -> per-head slice) so the HTP skel runs it
     # (no QNN 1003) while activations stay calibrated as MHA (shared per-head scale).
+    draft_backend_options = backend_options
+    if args.dflash_draft_no_weight_sharing:
+        draft_backend_options = generate_htp_compiler_spec(
+            use_fp16=args.use_fp16,
+            use_multi_contexts=decoder_model_config.num_sharding > 1,
+            use_weight_sharing=False,
+            use_dlbc=args.use_dlbc,
+            use_slc_allocator=args.use_slc_allocator,
+            use_dlbc_weights=args.use_dlbc_weights,
+            use_sparse_weights_compression=args.use_sparse_weights_compression,
+        )
     draft_compile_spec_list = [
         generate_qnn_executorch_compiler_spec(
             soc_model=get_soc_to_chipset_map()[args.soc_model],
-            backend_options=backend_options,
+            backend_options=draft_backend_options,
             shared_buffer=not args.enable_x86_64,
             use_mha2sha=True,
             online_prepare=args.online_prepare,
@@ -833,13 +844,76 @@ def _build_parser():
         help="[DFlash mode] Path to the DFlash draft checkpoint dir (config.json + model.safetensors).",
     )
     parser.add_argument(
-        "--dflash_draft_w8",
+        "--dflash_draft_only",
         action="store_true",
-        help="[DFlash mode] Quantize the draft's weights to 8 bits per-channel "
-        "instead of the 4-bit per-block default. The draft is 361 MB of a 3.23 GB "
-        "round, so this costs ~12% more decode bandwidth; whether it pays for "
-        "itself depends on how much of the measured weight-quantization accept "
-        "loss sits in the draft rather than the target.",
+        help="[DFlash mode] Calibrate as usual but lower only the draft pte, skipping "
+        "the target, emb and lm_head (about 2 of the 2.2 hours of a full build). "
+        "Calibration runs in fp32 with transparent observers, so the target's "
+        "encodings do not depend on the draft's quantization: use the target, emb "
+        "and lm_head ptes of any earlier build with the same calibration "
+        "(--prompt, --seed, --dflash_tree_nodes, --max_seq_len, --prefill_ar_len).",
+    )
+    parser.add_argument(
+        "--dflash_draft_w_bits",
+        type=int,
+        choices=[4, 8, 16],
+        default=4,
+        help="[DFlash mode] Weight bits of every draft conv (q/k/v/o/gate/up/down_proj "
+        "and fc). 4-bit is per-block (LPBQ) with 16-bit activations, per-channel "
+        "otherwise.",
+    )
+    parser.add_argument(
+        "--dflash_draft_w4_per_channel",
+        action="store_true",
+        help="[DFlash mode] 4-bit draft weights per-channel (16a4w) instead of per-block "
+        "LPBQ. Coarser (one scale per output channel) but a different HTP kernel.",
+    )
+    parser.add_argument(
+        "--dflash_draft_fc_granularity",
+        choices=["block", "channel"],
+        default=None,
+        help="[DFlash mode] Granularity of the draft fc's 4-bit weights alone. Defaults to "
+        "the body's (--dflash_draft_w4_per_channel).",
+    )
+    parser.add_argument(
+        "--dflash_draft_fc_block_size",
+        type=int,
+        default=None,
+        help="[DFlash mode] LPBQ block size along fc's 12800 input channels (default 16).",
+    )
+    parser.add_argument(
+        "--dflash_draft_lpbq_groups",
+        default=None,
+        help="[DFlash mode, diagnostics] Comma list of attn,gate_up,down: with "
+        "--dflash_draft_w4_per_channel, keep these body modules per-block (LPBQ).",
+    )
+    parser.add_argument(
+        "--dflash_draft_no_weight_sharing",
+        action="store_true",
+        help="[DFlash mode, diagnostics] Do not share weights between the draft's decode "
+        "and prefill graphs.",
+    )
+    parser.add_argument(
+        "--dflash_draft_pc_modules",
+        default=None,
+        help="[DFlash mode, diagnostics] Comma list of module-path regexes forced to "
+        "per-channel 4-bit, e.g. 'layers\\.0\\.self_attn\\.v_proj\\.conv'.",
+    )
+    parser.add_argument(
+        "--dflash_draft_fc_bits",
+        type=int,
+        choices=[4, 8, 16],
+        default=None,
+        help="[DFlash mode] Weight bits of the draft's fc alone. Defaults to "
+        "--dflash_draft_w_bits.",
+    )
+    parser.add_argument(
+        "--dflash_draft_a_bits",
+        type=int,
+        choices=[8, 16],
+        default=16,
+        help="[DFlash mode] Activation bits of the draft. QNN has no 8a16w, so 8 "
+        "needs --dflash_draft_w_bits 4 or 8.",
     )
     parser.add_argument(
         "--dflash_draft_no_ptq",

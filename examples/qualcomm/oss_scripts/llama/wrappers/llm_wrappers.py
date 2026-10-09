@@ -1221,7 +1221,9 @@ class TextDecoder(Component):
                 )
 
             # Saving Decode QDQ Model EP for SQNR evaluation
-            if self.mode == Mode.DECODE:
+            if self.mode == Mode.DECODE and not getattr(
+                self.control_args, "dflash_draft_only", False
+            ):
                 qdq_ep = torch.export.export(
                     self.decoder, self.export_input, strict=True
                 )

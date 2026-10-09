@@ -770,60 +770,101 @@ class Qwen3_4B_Head4wQuantRecipe(StaticLLMQuantRecipe):
         return QuantDtype.use_16a4w
 
 
-class DFlashDraftQuantRecipe(StaticLLMQuantRecipe):
-    """16a4w recipe for the DFlash draft (block-speculative head).
+class Qwen3_8BQuantRecipe(Qwen3_4BQuantRecipe):
+    """Qwen3-8B (36 layers, hidden 4096) takes the 4B rules unchanged: 16a4w LPBQ block 16,
+    MLP down_proj and lm_head 16a8w per-channel, 8-bit KV."""
 
-    Mirrors Qwen3_4BQuantRecipe (16a4w default, per-block conv2d) and protects the
-    two outlier-heavy projections at 16a8w per-channel:
-      - fc: sums num_ctx_layers*H target-hidden values including the attention-sink
-        outlier (host measured peak |fc(x)| up to ~281k).
-      - mlp.down_proj: writes into the residual stream (classic PTQ outlier layer).
-    The draft shares the target's emb/lm_head (has neither in-graph), so there is
-    nothing else to protect. convert_linear_to_conv2d turns each nn.Linear into a
-    Conv2D wrapper whose inner conv is `<name>.conv`, hence the regex names.
+
+class DFlashDraftQuantRecipe(StaticLLMQuantRecipe):
+    """Uniform-width recipe for the DFlash draft (block-speculative head).
+
+    Every conv2d (q/k/v/o/gate/up/down_proj and fc) gets `w_bits` weights and
+    `a_bits` activations; fc alone can be given its own width via `fc_bits` (it sums
+    num_ctx_layers*H target-hidden values including the attention-sink outlier, host
+    measured peak |fc(x)| up to ~281k). The draft shares the target's emb/lm_head, so
+    there is nothing else to quantize. convert_linear_to_conv2d turns each nn.Linear
+    into a Conv2D wrapper whose inner conv is `<name>.conv`, hence the regex names.
+
+    4-bit weights are per-block (LPBQ, block 16) when activations are 16-bit, or
+    per-channel with `w4_per_channel`; QNN has no 8-bit-activation block scheme and no
+    8a16w, so 8-bit activations are always per-channel and 16-bit weights with 8-bit
+    activations is rejected.
     """
 
-    default_quant_dtype = QuantDtype.use_16a4w
+    CONV_DTYPE = {
+        (16, 4): (QuantDtype.use_16a4w_block, QuantGranularity.PER_BLOCK),
+        (16, 8): (QuantDtype.use_16a8w, QuantGranularity.PER_CHANNEL),
+        (16, 16): (QuantDtype.use_16a16w, QuantGranularity.PER_CHANNEL),
+        (8, 4): (QuantDtype.use_8a4w, QuantGranularity.PER_CHANNEL),
+        (8, 8): (QuantDtype.use_8a8w, QuantGranularity.PER_CHANNEL),
+    }
 
-    def __init__(self, verbose: bool = False, w8: bool = False):
-        """w8 raises every draft weight to 8 bits (per-channel) instead of the
-        4-bit per-block default. The draft is 361 MB of a 3.23 GB round, so this
-        buys precision for ~12% more decode bandwidth -- the only place in this
-        deployment where more weight bits is even arguably affordable."""
-        super().__init__()
-        base = QuantDtype.use_16a8w if w8 else self.default_quant_dtype
-        self.recipe = (
-            QuantRecipe(
-                base,
-                False,
-                act_observer=MinMaxObserver,
-                granularity=QuantGranularity.PER_TENSOR,
-                verbose=verbose,
-            )
-            .add_node_target(
-                {
-                    torch.ops.aten.conv2d.default,
-                },
-                QuantDtype.use_16a8w if w8 else QuantDtype.use_16a4w_block,
-                False,
-                act_observer=MinMaxObserver,
-                granularity=(
-                    QuantGranularity.PER_CHANNEL if w8 else QuantGranularity.PER_BLOCK
-                ),
-                extra_kwargs=None if w8 else {"block_size": (1, 16, 1, 1)},
-            )
-            .add_regex(
-                {
-                    r"fc\.conv",
-                    r"layers\..*\.mlp\.down_proj\.conv",
-                    r"lm_head\.conv",  # only present when the draft keeps an in-graph
-                },                     # lm_head; harmless (no match) when it shares the
-                QuantDtype.use_16a8w,  # target's lm_head.pte.
-                False,
-                act_observer=MinMaxObserver,
-                granularity=QuantGranularity.PER_CHANNEL,
-            )
+    def __init__(
+        self,
+        verbose: bool = False,
+        w_bits: int = 4,
+        fc_bits: Optional[int] = None,
+        a_bits: int = 16,
+        w4_per_channel: bool = False,
+        fc_per_channel: Optional[bool] = None,
+        fc_block_size: Optional[int] = None,
+        lpbq_groups: Optional[tuple] = None,
+        pc_modules: Optional[tuple] = None,
+    ):
+        self.default_quant_dtype = (
+            QuantDtype.use_16a4w if a_bits == 16 else QuantDtype.use_8a8w
         )
+        super().__init__()
+        fc_bits = w_bits if fc_bits is None else fc_bits
+
+        def conv_rule(w, per_channel=False, block=16):
+            if (a_bits, w) not in self.CONV_DTYPE:
+                raise ValueError(f"QNN has no {a_bits}a{w}w quantization")
+            dtype, granularity = self.CONV_DTYPE[(a_bits, w)]
+            if w == 4 and per_channel and a_bits == 16:
+                dtype, granularity = QuantDtype.use_16a4w, QuantGranularity.PER_CHANNEL
+            extra = (
+                {"block_size": (1, block, 1, 1)}
+                if granularity == QuantGranularity.PER_BLOCK
+                else None
+            )
+            return dtype, False, MinMaxObserver, granularity, extra
+
+        def add(builder, target, w, per_channel=False, block=16):
+            dtype, qat, observer, granularity, extra = conv_rule(w, per_channel, block)
+            return builder(
+                target,
+                dtype,
+                qat,
+                act_observer=observer,
+                granularity=granularity,
+                extra_kwargs=extra,
+            )
+
+        self.recipe = QuantRecipe(
+            self.default_quant_dtype,
+            False,
+            act_observer=MinMaxObserver,
+            granularity=QuantGranularity.PER_TENSOR,
+            verbose=verbose,
+        )
+        add(self.recipe.add_node_target, {torch.ops.aten.conv2d.default}, w_bits, w4_per_channel)
+        fc_pc = w4_per_channel if fc_per_channel is None else fc_per_channel
+        if fc_bits != w_bits or fc_pc != w4_per_channel or fc_block_size is not None:
+            add(self.recipe.add_regex, {r"fc\.conv"}, fc_bits, fc_pc, fc_block_size or 16)
+        # Diagnostics: the body is per-channel except for the named module groups, which stay LPBQ.
+        group_regex = {
+            "attn": r"layers\.\d+\.self_attn\.(q|k|v|o)_proj\.conv",
+            "gate_up": r"layers\.\d+\.mlp\.(gate|up)_proj\.conv",
+            "down": r"layers\.\d+\.mlp\.down_proj\.conv",
+        }
+        for g in lpbq_groups or ():
+            add(self.recipe.add_regex, {group_regex[g]}, w_bits, False)
+        for rx in pc_modules or ():     # diagnostics: force these modules to per-channel
+            add(self.recipe.add_regex, {rx}, w_bits, True)
+        # Only present when the draft keeps an in-graph lm_head; harmless (no match)
+        # when it shares the target's lm_head.pte.
+        add(self.recipe.add_regex, {r"lm_head\.conv"}, 8)
         # Quantize the K/V cache to 8-bit IN-GRAPH (same as Qwen3_4BQuantRecipe).
         # Without this the draft's KV is 16a4w's default 16-bit activation, and
         # tagging the pte's KV IO as u8 at lower time then reuses the 16-bit scale
