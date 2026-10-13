@@ -23,6 +23,7 @@
 #include <executorch/runtime/platform/log.h>
 #include <gflags/gflags.h>
 #include <fstream>
+#include <sstream>
 #include <vector>
 
 DEFINE_string(decoder_model_version, "llama2", "The decoder model to execute.");
@@ -218,6 +219,46 @@ DEFINE_string(
     "[DFlash Decoding] Path to the compiled lm_head pte (headless decoder emits "
     "hidden, not logits). "
     "Default: <dflash_draft dir>/lm_head_qnn.pte");
+DEFINE_string(
+    dflash_lm_head_pieces_pte_path,
+    "",
+    "[DFlash Decoding] Path to a pte of the lm_head cut into row-disjoint pieces "
+    "(llama.py --dflash_lm_head_pieces writes lm_head_qnn_pieces<N>.pte). Used "
+    "instead of --dflash_lm_head_pte_path: verify runs every piece, so its result "
+    "is the unsplit head's. Empty keeps the unsplit head.");
+DEFINE_string(
+    dflash_lm_head_pieces_meta_path,
+    "",
+    "[DFlash Decoding] The .bin written next to the pieces pte. "
+    "Default: the pieces pte path with .pte replaced by .bin");
+DEFINE_string(
+    dflash_draft_vocab,
+    "all",
+    "[DFlash Decoding] With --dflash_lm_head_pieces_pte_path, the tokens the draft "
+    "may propose: all (every piece, the unsplit head's behaviour), hot (the hot "
+    "pieces only) or hot_ctx (the hot pieces plus every token of the prompt and of "
+    "the text committed so far). Verify always sees the whole vocabulary.");
+DEFINE_bool(
+    dflash_draft_vocab_simulate,
+    false,
+    "[DFlash Decoding] hot_ctx without the CPU head: run every piece anyway and read "
+    "the context tokens' codes out of the cold pieces. Same candidates, no saving; "
+    "for measuring accept.");
+DEFINE_string(
+    dflash_cpu_head_table,
+    "",
+    "[DFlash Decoding] Row-major int8 copy of the lm_head weights ([vocab, hidden]) for "
+    "--dflash_draft_vocab hot_ctx. Default: lm_head_rowmajor.bin next to the draft pte.");
+DEFINE_string(
+    dflash_cpu_head_scale,
+    "",
+    "[DFlash Decoding] The lm_head's per-channel weight scales (float32 [vocab]). "
+    "Default: lm_head_pc_scale.f32 next to the draft pte.");
+DEFINE_string(
+    dflash_draft_pieces_hot,
+    "0",
+    "[DFlash Decoding] Comma-separated ids of the hot pieces (llama.py puts the "
+    "frequent tokens in piece 0 of a 2@<tag> partition).");
 DEFINE_string(
     dflash_draft_lm_head_pruned_pte_path,
     "",
@@ -436,7 +477,9 @@ void start_runner(
     const std::string& dflash_sparse_table_path,
     const std::string& dflash_sparse_scale_path,
     std::unique_ptr<executorch::extension::Module>
-        dflash_draft_lm_head_pruned_module) {
+        dflash_draft_lm_head_pruned_module,
+    std::unique_ptr<example::LmHeadPieces> dflash_lm_head_pieces,
+    std::unique_ptr<example::CpuRowHead> dflash_cpu_head) {
   bool use_tokenized_prompt =
       gflags::GetCommandLineFlagInfoOrDie("tokenized_prompt").is_default ? false
                                                                          : true;
@@ -481,7 +524,9 @@ void start_runner(
       FLAGS_dflash_sparse_check,
       std::move(dflash_draft_lm_head_pruned_module),
       FLAGS_dflash_force_fixed_accept,
-      FLAGS_dflash_force_fixed_accept_len);
+      FLAGS_dflash_force_fixed_accept_len,
+      std::move(dflash_lm_head_pieces),
+      std::move(dflash_cpu_head));
   auto decoder_model_version = runner.get_decoder_model_version();
   std::vector<char> buf;
   buf.reserve(5 * FLAGS_seq_len); // assume each token is around 5 char
@@ -632,6 +677,8 @@ int main(int argc, char** argv) {
   std::unique_ptr<executorch::extension::Module> dflash_sparse_head_module;
   std::unique_ptr<executorch::extension::Module>
       dflash_draft_lm_head_pruned_module;
+  std::unique_ptr<example::LmHeadPieces> dflash_lm_head_pieces;
+  std::unique_ptr<example::CpuRowHead> dflash_cpu_head;
   std::string sparse_table;
   std::string sparse_scale;
   if (!FLAGS_dflash_draft_path.empty()) {
@@ -649,9 +696,47 @@ int main(int argc, char** argv) {
     dflash_emb_module = std::make_unique<executorch::extension::Module>(
         emb_pte.c_str(),
         executorch::extension::Module::LoadMode::MmapUseMlockIgnoreErrors);
-    dflash_lm_head_module = std::make_unique<executorch::extension::Module>(
-        lm_head_pte.c_str(),
-        executorch::extension::Module::LoadMode::MmapUseMlockIgnoreErrors);
+    if (FLAGS_dflash_lm_head_pieces_pte_path.empty()) {
+      dflash_lm_head_module = std::make_unique<executorch::extension::Module>(
+          lm_head_pte.c_str(),
+          executorch::extension::Module::LoadMode::MmapUseMlockIgnoreErrors);
+    } else {
+      example::LmHeadPiecesOptions options;
+      options.meta_path = FLAGS_dflash_lm_head_pieces_meta_path.empty()
+          ? FLAGS_dflash_lm_head_pieces_pte_path.substr(
+                0, FLAGS_dflash_lm_head_pieces_pte_path.rfind('.')) + ".bin"
+          : FLAGS_dflash_lm_head_pieces_meta_path;
+      if (FLAGS_dflash_draft_vocab == "all") {
+        options.draft_vocab = example::DraftVocab::kAll;
+      } else if (FLAGS_dflash_draft_vocab == "hot") {
+        options.draft_vocab = example::DraftVocab::kHot;
+      } else if (FLAGS_dflash_draft_vocab == "hot_ctx") {
+        options.draft_vocab = example::DraftVocab::kHotContext;
+      } else {
+        ET_LOG(Error, "--dflash_draft_vocab must be all, hot or hot_ctx");
+        return 1;
+      }
+      options.simulate = FLAGS_dflash_draft_vocab_simulate;
+      if (options.draft_vocab == example::DraftVocab::kHotContext) {
+        dflash_cpu_head = std::make_unique<example::CpuRowHead>(
+            FLAGS_dflash_cpu_head_table.empty()
+                ? sibling_path(FLAGS_dflash_draft_path, "lm_head_rowmajor.bin")
+                : FLAGS_dflash_cpu_head_table,
+            FLAGS_dflash_cpu_head_scale.empty()
+                ? sibling_path(FLAGS_dflash_draft_path, "lm_head_pc_scale.f32")
+                : FLAGS_dflash_cpu_head_scale);
+      }
+      std::stringstream hot(FLAGS_dflash_draft_pieces_hot);
+      for (std::string id; std::getline(hot, id, ',');) {
+        options.hot_pieces.push_back(std::stoi(id));
+      }
+      dflash_lm_head_pieces = std::make_unique<example::LmHeadPieces>(
+          std::make_unique<executorch::extension::Module>(
+              FLAGS_dflash_lm_head_pieces_pte_path.c_str(),
+              executorch::extension::Module::LoadMode::
+                  MmapUseMlockIgnoreErrors),
+          std::move(options));
+    }
     if (!FLAGS_dflash_draft_lm_head_pruned_pte_path.empty()) {
       dflash_draft_lm_head_pruned_module =
           std::make_unique<executorch::extension::Module>(
@@ -690,7 +775,9 @@ int main(int argc, char** argv) {
       std::move(dflash_sparse_head_module),
       sparse_table,
       sparse_scale,
-      std::move(dflash_draft_lm_head_pruned_module));
+      std::move(dflash_draft_lm_head_pruned_module),
+      std::move(dflash_lm_head_pieces),
+      std::move(dflash_cpu_head));
 
   return 0;
 }

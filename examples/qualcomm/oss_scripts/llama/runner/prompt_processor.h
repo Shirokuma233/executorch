@@ -7,6 +7,7 @@
  */
 
 #pragma once
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/lm_head_pieces.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/attention_sink_rope_runner.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/cache_utils.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/decoder_runner.h>
@@ -52,7 +53,9 @@ class PromptProcessor {
       float embeds_scale = 1.0f,
       int32_t embeds_zero_point = 0,
       float logits_scale = 1.0f,
-      int32_t logits_zero_point = 0);
+      int32_t logits_zero_point = 0,
+      // Replaces lm_head_module: the prefill head as row-disjoint pieces.
+      LmHeadPieces* lm_head_pieces = nullptr);
 
   virtual ~PromptProcessor() = default;
 
@@ -162,6 +165,8 @@ class PromptProcessor {
   // DFlash headless-decoder companions. Null for every other eval mode.
   executorch::extension::Module* emb_module_ = nullptr;
   executorch::extension::Module* lm_head_module_ = nullptr;
+  LmHeadPieces* lm_head_pieces_ = nullptr;
+  std::vector<std::byte*> piece_logits_bufs_;
   std::unique_ptr<executorch::extension::MethodMeta> emb_prefill_meta_;
   std::unique_ptr<executorch::extension::MethodMeta> lm_head_prefill_meta_;
   float embeds_scale_ = 1.0f;

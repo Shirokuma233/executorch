@@ -9,6 +9,7 @@
 // DFlashTokenGenerator — block-diffusion speculative decoding.
 
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/dflash_token_generator.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/u16_scan.h>
 
 #include <executorch/backends/qualcomm/runtime/QnnExecuTorch.h>
 #include <executorch/extension/llm/runner/util.h>
@@ -74,130 +75,6 @@ inline int64_t time_in_us() {
   timespec_get(&t, TIME_UTC);
 #endif
   return static_cast<int64_t>(t.tv_sec) * 1000000 + t.tv_nsec / 1000;
-}
-
-// Argmax per row over raw uint16 logit codes. The lm_head's encoding is a
-// monotone affine map, so the winning index is the same as on dequantized
-// values, and strict `>` breaks ties toward the lower id exactly as
-// Sampler::sample_argmax does.
-//
-// This exists because DecoderRunner::logits_to_token cannot be used cheaply: for
-// every row it expands all 151936 codes into a float vector (608 KB of stores)
-// through a per-element dtype switch, then rescans that vector. Measured on
-// device at 0.42 ms/row against 0.080 ms/row here.
-// The scalar form below carries the index in a loop-carried dependency behind a
-// data-dependent branch, which no compiler will vectorise. Splitting it into a
-// max reduction and a first-match search makes both halves pure SIMD and keeps
-// the result identical: strict `>` means the answer is the FIRST position
-// holding the maximum, which is what the second pass looks for. Starting the
-// reduction at 0 mirrors `best = 0`, so an all-zero row still answers 0.
-inline uint64_t argmax_u16_row(const uint16_t* row, size_t vocab) {
-#if defined(__ARM_NEON)
-  uint16x8_t acc = vdupq_n_u16(0);
-  size_t v = 0;
-  for (; v + 8 <= vocab; v += 8) {
-    acc = vmaxq_u16(acc, vld1q_u16(row + v));
-  }
-  uint16_t best = vmaxvq_u16(acc);
-  for (size_t t = v; t < vocab; ++t) {
-    best = row[t] > best ? row[t] : best;
-  }
-  const uint16x8_t want = vdupq_n_u16(best);
-  for (v = 0; v + 8 <= vocab; v += 8) {
-    if (vmaxvq_u16(vceqq_u16(vld1q_u16(row + v), want)) != 0) {
-      for (size_t t = v; t < v + 8; ++t) {
-        if (row[t] == best) {
-          return static_cast<uint64_t>(t);
-        }
-      }
-    }
-  }
-  for (; v < vocab; ++v) {
-    if (row[v] == best) {
-      return static_cast<uint64_t>(v);
-    }
-  }
-  return 0;
-#else
-  uint16_t best = 0;
-  uint64_t arg = 0;
-  for (size_t v = 0; v < vocab; ++v) {
-    if (row[v] > best) {
-      best = row[v];
-      arg = static_cast<uint64_t>(v);
-    }
-  }
-  return arg;
-#endif
-}
-
-// Top-k of one row, descending, into `codes`/`ids` (both at least k long).
-// Seeded with the first k entries so the threshold is valid from the start, then
-// one pass where the common case is a single comparison against it.
-inline void topk_u16_row(
-    const uint16_t* row,
-    size_t vocab,
-    int k,
-    uint16_t* codes,
-    uint64_t* ids) {
-  for (int i = 0; i < k; ++i) {
-    codes[i] = row[i];
-    ids[i] = static_cast<uint64_t>(i);
-  }
-  for (int i = 1; i < k; ++i) {
-    uint16_t c = codes[i];
-    uint64_t d = ids[i];
-    int j = i - 1;
-    for (; j >= 0 && codes[j] < c; --j) {
-      codes[j + 1] = codes[j];
-      ids[j + 1] = ids[j];
-    }
-    codes[j + 1] = c;
-    ids[j + 1] = d;
-  }
-  size_t v = static_cast<size_t>(k);
-#if defined(__ARM_NEON)
-  // Almost every element loses to the threshold, so the scan is one compare and
-  // a branch per element -- exactly what a SIMD pre-filter is for. A block that
-  // holds no candidate is skipped whole; a block that does falls through to the
-  // scalar body below, element by element in increasing v, re-reading the
-  // threshold each time. That keeps insertion order and tie-breaking identical
-  // to the pure scalar loop, which matters because the threshold rises as
-  // elements go in.
-  uint16x8_t thr = vdupq_n_u16(codes[k - 1]);
-  for (; v + 8 <= vocab; v += 8) {
-    if (vmaxvq_u16(vcgtq_u16(vld1q_u16(row + v), thr)) == 0) {
-      continue;
-    }
-    for (size_t u = v; u < v + 8; ++u) {
-      const uint16_t c = row[u];
-      if (c <= codes[k - 1]) {
-        continue;
-      }
-      int j = k - 2;
-      for (; j >= 0 && codes[j] < c; --j) {
-        codes[j + 1] = codes[j];
-        ids[j + 1] = ids[j];
-      }
-      codes[j + 1] = c;
-      ids[j + 1] = static_cast<uint64_t>(u);
-    }
-    thr = vdupq_n_u16(codes[k - 1]);
-  }
-#endif
-  for (; v < vocab; ++v) {
-    const uint16_t c = row[v];
-    if (c <= codes[k - 1]) {
-      continue;
-    }
-    int j = k - 2;
-    for (; j >= 0 && codes[j] < c; --j) {
-      codes[j + 1] = codes[j];
-      ids[j + 1] = ids[j];
-    }
-    codes[j + 1] = c;
-    ids[j + 1] = static_cast<uint64_t>(v);
-  }
 }
 
 // fp16_to_fp32 lives in runner/utils.h (shared with the EAGLE sampler).
@@ -463,8 +340,8 @@ DFlashTokenGenerator::DFlashTokenGenerator(
         O_WRONLY | O_CLOEXEC);
   }
   ET_CHECK_MSG(
-      emb_module_ != nullptr && lm_head_module_ != nullptr,
-      "[DFlash] headless decoder requires emb + lm_head modules");
+      emb_module_ != nullptr,
+      "[DFlash] headless decoder requires an emb module");
   // The draft KVManager sizes its buffer as context_len - min(ar), and its
   // dtype scan matches kv_forward's cache length. Both assume kv_forward has
   // the shorter append length.
@@ -545,13 +422,12 @@ size_t DFlashTokenGenerator::draft_io_size_in_bytes(
     const MethodMeta& prefill_meta) {
   size_t total = 0;
   for (size_t i = 0; i < kNumDraftNonKvInputs; ++i) {
-    total += std::max(
-        tensor_nbytes(kv_meta.input_tensor_meta(i).get()),
-        tensor_nbytes(prefill_meta.input_tensor_meta(i).get()));
+    const size_t kv_bytes = tensor_nbytes(kv_meta.input_tensor_meta(i).get());
+    total += (i == 2 || i == 3)
+        ? std::max(kv_bytes, tensor_nbytes(prefill_meta.input_tensor_meta(i - 2).get()))
+        : kv_bytes;
   }
-  total += std::max(
-      tensor_nbytes(kv_meta.output_tensor_meta(0).get()),
-      tensor_nbytes(prefill_meta.output_tensor_meta(0).get()));
+  total += tensor_nbytes(kv_meta.output_tensor_meta(0).get());
   // The in-graph lm_head's token ids, when present. Small, but RpcMem is a bump
   // allocator with no bounds check: anything init_io allocates and this function
   // forgets lands outside the ION region and the DSP fails the DMA (QNN 6002).
@@ -566,6 +442,14 @@ size_t DFlashTokenGenerator::draft_io_size_in_bytes(
 void DFlashTokenGenerator::init_io(
     IMemAlloc* buffer_manager,
     Result<MethodMeta> method_meta) {
+  ET_CHECK_MSG(
+      lm_head_module_ != nullptr || pieces_ != nullptr,
+      "[DFlash] headless decoder requires an lm_head module or lm_head pieces");
+  ET_CHECK_MSG(
+      pieces_ == nullptr || pieces_->options().draft_vocab != DraftVocab::kHotContext ||
+          cpu_head_ != nullptr,
+      "[DFlash] draft vocab hot_ctx needs the CPU head (--dflash_cpu_head_table / "
+      "--dflash_cpu_head_scale, or their defaults next to the draft pte)");
   const int L = dflash_meta_.num_ctx_layers;
   const size_t expected_kv =
       1 + 2 * static_cast<size_t>(dflash_meta_.target_num_layers);
@@ -635,13 +519,13 @@ void DFlashTokenGenerator::init_io(
   // block_size for kv_forward, prefill_ar_len for prefill_forward. Registering only
   // kv_forward's view leaves the DSP writing prefill's larger tensor into a region
   // QNN was told is smaller -- a DMA overrun that surfaces as skelExecute 1003.
-  const size_t cache_bytes = std::max(
-      tensor_nbytes(draft_kv_meta_->input_tensor_meta(kNumDraftNonKvInputs).get()),
-      tensor_nbytes(
-          draft_prefill_meta_->input_tensor_meta(kNumDraftNonKvInputs).get()));
+  // prefill_forward is the context-K/V-only seed graph: new_context and context_pos
+  // in, k_new/v_new out, no cache input and no hidden output.
+  const size_t cache_bytes = tensor_nbytes(
+      draft_kv_meta_->input_tensor_meta(kNumDraftNonKvInputs).get());
   const size_t cache_out_bytes = std::max(
       tensor_nbytes(draft_kv_meta_->output_tensor_meta(1).get()),
-      tensor_nbytes(draft_prefill_meta_->output_tensor_meta(1).get()));
+      tensor_nbytes(draft_prefill_meta_->output_tensor_meta(0).get()));
   const int Ld = dflash_meta_.num_draft_layers;
   for (int l = 0; l < Ld; ++l) {
     std::memset(draft_kv_manager_->get_k_cache_()[l].buffer, 0, cache_bytes);
@@ -661,8 +545,8 @@ void DFlashTokenGenerator::init_io(
     auto k_in = draft_kv_meta_->input_tensor_meta(kNumDraftNonKvInputs + l).get();
     auto v_in =
         draft_kv_meta_->input_tensor_meta(kNumDraftNonKvInputs + Ld + l).get();
-    auto k_out = draft_prefill_meta_->output_tensor_meta(1 + l).get();
-    auto v_out = draft_prefill_meta_->output_tensor_meta(1 + Ld + l).get();
+    auto k_out = draft_prefill_meta_->output_tensor_meta(l).get();
+    auto v_out = draft_prefill_meta_->output_tensor_meta(Ld + l).get();
     buffer_manager->add_memory_info(kc[l].buffer, cache_bytes, k_in);
     buffer_manager->add_memory_info(vc[l].buffer, cache_bytes, v_in);
     buffer_manager->add_memory_info(kc[l].output_buffer, cache_out_bytes, k_out);
@@ -677,24 +561,25 @@ void DFlashTokenGenerator::init_io(
 
   // The draft's non-K/V IO, likewise shared + registered. Each buffer takes the
   // wider of the two graphs' views so both can bind it.
+  // The seed graph's inputs are new_context and context_pos, i.e. kv_forward's
+  // inputs 2 and 3 at the wider append length.
   for (size_t i = 0; i < kNumDraftNonKvInputs; ++i) {
+    const bool seeded = (i == 2 || i == 3);
+    const auto wide = seeded ? draft_prefill_meta_->input_tensor_meta(i - 2).get()
+                             : draft_kv_meta_->input_tensor_meta(i).get();
     draft_in_nbytes_[i] = std::max(
         tensor_nbytes(draft_kv_meta_->input_tensor_meta(i).get()),
-        tensor_nbytes(draft_prefill_meta_->input_tensor_meta(i).get()));
+        tensor_nbytes(wide));
     draft_in_bufs_[i] = buffer_manager->allocate(draft_in_nbytes_[i]);
-    buffer_manager->add_memory_info(
-        draft_in_bufs_[i],
-        draft_in_nbytes_[i],
-        draft_prefill_meta_->input_tensor_meta(i).get());
+    buffer_manager->add_memory_info(draft_in_bufs_[i], draft_in_nbytes_[i], wide);
   }
-  draft_hidden_nbytes_ = std::max(
-      tensor_nbytes(draft_kv_meta_->output_tensor_meta(0).get()),
-      tensor_nbytes(draft_prefill_meta_->output_tensor_meta(0).get()));
+  draft_hidden_nbytes_ =
+      tensor_nbytes(draft_kv_meta_->output_tensor_meta(0).get());
   draft_hidden_buf_ = buffer_manager->allocate(draft_hidden_nbytes_);
   buffer_manager->add_memory_info(
       draft_hidden_buf_,
       draft_hidden_nbytes_,
-      draft_prefill_meta_->output_tensor_meta(0).get());
+      draft_kv_meta_->output_tensor_meta(0).get());
 
   // A draft built from a checkpoint with an lm_head appends the block's logits as
   // one extra output, so the vocab projection runs on HTP instead of scanning the
@@ -730,12 +615,26 @@ void DFlashTokenGenerator::init_io(
   buffer_manager->add_memory_info(
       emb_out_buf_, emb_out_nbytes_, emb_kv_meta_->output_tensor_meta(0).get());
 
-  lm_head_logits_nbytes_ = lm_head_kv_meta_->output_tensor_meta(0)->nbytes();
-  lm_head_logits_buf_ = buffer_manager->allocate(lm_head_logits_nbytes_);
-  buffer_manager->add_memory_info(
-      lm_head_logits_buf_,
-      lm_head_logits_nbytes_,
-      lm_head_kv_meta_->output_tensor_meta(0).get());
+  if (pieces_ != nullptr) {
+    // The draft's logits are narrower than the verify's, so one buffer per piece
+    // sized for the verify view serves both.
+    for (int32_t p = 0; p < pieces_->num_pieces(); ++p) {
+      const size_t nbytes = pieces_->out_nbytes(LmHeadPieces::kKv, p);
+      lm_head_logits_nbytes_ += nbytes;
+      piece_logits_.push_back(buffer_manager->allocate(nbytes));
+      buffer_manager->add_memory_info(
+          piece_logits_.back(),
+          nbytes,
+          pieces_->meta(LmHeadPieces::kKv, p).output_tensor_meta(0).get());
+    }
+  } else {
+    lm_head_logits_nbytes_ = lm_head_kv_meta_->output_tensor_meta(0)->nbytes();
+    lm_head_logits_buf_ = buffer_manager->allocate(lm_head_logits_nbytes_);
+    buffer_manager->add_memory_info(
+        lm_head_logits_buf_,
+        lm_head_logits_nbytes_,
+        lm_head_kv_meta_->output_tensor_meta(0).get());
+  }
 
   draft_hidden_u16_nbytes_ = lm_head_kv_meta_->input_tensor_meta(0)->nbytes();
   draft_hidden_u16_buf_ = buffer_manager->allocate(draft_hidden_u16_nbytes_);
@@ -762,10 +661,12 @@ void DFlashTokenGenerator::init_io(
         draft_hidden_u16_buf_,
         draft_hidden_u16_nbytes_,
         lm_head_draft_meta_->input_tensor_meta(0).get());
-    buffer_manager->add_memory_info(
-        lm_head_logits_buf_,
-        lm_head_logits_nbytes_,
-        lm_head_draft_meta_->output_tensor_meta(0).get());
+    if (pieces_ == nullptr) {
+      buffer_manager->add_memory_info(
+          lm_head_logits_buf_,
+          lm_head_logits_nbytes_,
+          lm_head_draft_meta_->output_tensor_meta(0).get());
+    }
   }
   ET_LOG(
       Info,
@@ -815,8 +716,9 @@ void DFlashTokenGenerator::init_io(
         static_cast<double>(sparse_logits_nbytes_) / (1 << 20));
   }
 
-  lm_head_vocab_size_ =
-      static_cast<int32_t>(lm_head_kv_meta_->output_tensor_meta(0)->sizes()[2]);
+  lm_head_vocab_size_ = pieces_ != nullptr
+      ? pieces_->vocab()
+      : static_cast<int32_t>(lm_head_kv_meta_->output_tensor_meta(0)->sizes()[2]);
   ET_LOG(
       Info,
       "[DFlash] aux IO: emb_out %.2f MB, lm_head_logits %.2f MB (vocab %d)",
@@ -893,6 +795,34 @@ void DFlashTokenGenerator::run_embedding(
 }
 
 void DFlashTokenGenerator::run_lm_head(std::byte* hidden_u16, bool draft) {
+  if (pieces_ != nullptr) {
+    const auto graph = draft ? LmHeadPieces::kDraft : LmHeadPieces::kKv;
+    const std::vector<int32_t>& active = draft ? draft_pieces_to_run() : all_pieces_;
+    const bool cpu_codes = draft && cpu_head_ != nullptr &&
+        pieces_->options().draft_vocab == DraftVocab::kHotContext &&
+        !context_extras_.empty();
+    if (cpu_codes) {
+      // Runs on the worker while the NPU executes the pieces below.
+      cpu_head_->submit(
+          reinterpret_cast<const uint16_t*>(hidden_u16),
+          draft_head_rows_,
+          context_extras_);
+    }
+    const long t0 = time_in_ms();
+    for (int32_t p : active) {
+      pieces_->run(graph, p, hidden_u16, piece_logits_[p]);
+    }
+    if (cpu_codes) {
+      cpu_head_->wait();
+    }
+    lm_head_exec_ms_ += static_cast<double>(time_in_ms() - t0);
+    ++lm_head_calls_;
+    if (draft) {
+      ++draft_head_calls_;
+      draft_pieces_run_ += active.size();
+    }
+    return;
+  }
   // Energy-isolation experiment (uncommitted): draft's own topk call can be
   // redirected at a standalone half-vocab pte. Only draft=true is affected;
   // target's verify call always uses the real, full-vocab lm_head_module_.
@@ -1032,6 +962,59 @@ void DFlashTokenGenerator::enable_draft_lm_head_pruned(
   lm_head_draft_pruned_vocab_size_ = vocab_size;
 }
 
+void DFlashTokenGenerator::enable_lm_head_pieces(LmHeadPieces* pieces) {
+  pieces_ = pieces;
+  all_pieces_.resize(pieces->num_pieces());
+  for (int32_t p = 0; p < pieces->num_pieces(); ++p) {
+    all_pieces_[p] = p;
+  }
+  hot_pieces_ = pieces->options().hot_pieces;
+  piece_is_hot_.assign(pieces->num_pieces(), 0);
+  for (int32_t p : hot_pieces_) {
+    piece_is_hot_[p] = 1;
+  }
+}
+
+void DFlashTokenGenerator::enable_cpu_head(CpuRowHead* head) {
+  cpu_head_ = head;
+}
+
+void DFlashTokenGenerator::reset_piece_context() {
+  if (pieces_ == nullptr) {
+    return;
+  }
+  token_in_context_.assign(pieces_->vocab(), 0);
+  context_extras_.clear();
+}
+
+// Called for the prompt (with the token the prefill produced) and for every token a round
+// commits, bonus included: after round r the list holds exactly T[0..cur_pos] of the next
+// round, the context the replay masks with.
+void DFlashTokenGenerator::note_piece_context(uint64_t token) {
+  if (pieces_ == nullptr ||
+      pieces_->options().draft_vocab != DraftVocab::kHotContext) {
+    return;
+  }
+  const int32_t p = pieces_->piece_of(token);
+  if (p < 0 || token_in_context_[token]) {
+    return;
+  }
+  token_in_context_[token] = 1;
+  if (!piece_is_hot_[p]) {
+    context_extras_.push_back(static_cast<int32_t>(token));
+    if (cpu_head_ != nullptr) {
+      cpu_head_->prefetch(static_cast<int32_t>(token));
+    }
+  }
+}
+
+const std::vector<int32_t>& DFlashTokenGenerator::draft_pieces_to_run() const {
+  const auto& options = pieces_->options();
+  return options.draft_vocab == DraftVocab::kAll || options.simulate
+      ? all_pieces_
+      : hot_pieces_;
+}
+
 void DFlashTokenGenerator::run_sparse_head(std::byte* hidden_u16) {
   sparse_gather_.wait();
   // The decoder emits hidden as uint16 codes and the full head's pte is tagged
@@ -1116,6 +1099,7 @@ void DFlashTokenGenerator::draft_topk(
       static_cast<size_t>(rows) * H,
       own_head ? dflash_meta_.draft_hidden_scale : logits_scale_,
       own_head ? dflash_meta_.draft_hidden_zero_point : logits_zero_point_);
+  draft_head_rows_ = rows;
   run_lm_head(draft_hidden_u16_buf_, /*draft=*/true);
   stage_us_[kDraftHead] += time_in_us() - t_head;
   trace_stage("draft_head", "end");
@@ -1129,6 +1113,59 @@ void DFlashTokenGenerator::draft_topk(
       ? static_cast<size_t>(lm_head_draft_pruned_vocab_size_)
       : static_cast<size_t>(lm_head_vocab_size_);
   const uint16_t* lg = reinterpret_cast<const uint16_t*>(lm_head_logits_buf_);
+  // With pieces, the candidates are the top-k of the pieces the draft reads plus the
+  // context tokens outside them. Their codes come from the cold pieces' output while
+  // the head is only simulated.
+  const DraftVocab draft_vocab =
+      pieces_ != nullptr ? pieces_->options().draft_vocab : DraftVocab::kAll;
+  static const std::vector<int32_t> kNoTokens;
+  const std::vector<int32_t>& extras =
+      draft_vocab == DraftVocab::kHotContext ? context_extras_ : kNoTokens;
+  if (pieces_ != nullptr) {
+    draft_rows_read_ += draft_vocab == DraftVocab::kAll ? pieces_->vocab() : 0;
+    if (draft_vocab != DraftVocab::kAll) {
+      for (int32_t p : hot_pieces_) {
+        draft_rows_read_ += pieces_->width(p);
+      }
+      draft_rows_read_ += extras.size();
+      draft_extras_ += extras.size();
+    }
+  }
+  extra_codes_.resize(extras.size());
+  // The CPU's codes replace the cold pieces' unless the NPU ran them for a simulation.
+  const bool codes_from_cpu = cpu_head_ != nullptr && !extras.empty() &&
+      !pieces_->options().simulate;
+  if (cpu_head_ != nullptr && !extras.empty() && pieces_->options().simulate) {
+    // Both exist: candidates keep the NPU's codes, and the CPU's are only compared.
+    for (int d = 0; d < rows; ++d) {
+      for (size_t j = 0; j < extras.size(); ++j) {
+        const int32_t diff = static_cast<int32_t>(cpu_head_->codes()[d * extras.size() + j]) -
+            static_cast<int32_t>(pieces_->code(piece_logits_, d, extras[j]));
+        ++cpu_check_values_;
+        cpu_check_equal_ += diff == 0;
+        cpu_check_off_by_one_ += std::abs(diff) == 1;
+      }
+    }
+  }
+  auto row_topk = [&](int d, int kk, uint16_t* codes_out, uint64_t* ids_out) {
+    if (pieces_ != nullptr) {
+      for (size_t j = 0; j < extras.size(); ++j) {
+        extra_codes_[j] = codes_from_cpu ? cpu_head_->codes()[d * extras.size() + j]
+                                         : pieces_->code(piece_logits_, d, extras[j]);
+      }
+      pieces_->topk(
+          piece_logits_,
+          draft_vocab == DraftVocab::kAll ? all_pieces_ : hot_pieces_,
+          extras,
+          extra_codes_.data(),
+          d,
+          kk,
+          codes_out,
+          ids_out);
+    } else {
+      topk_u16_row(lg + static_cast<size_t>(d) * V, V, kk, codes_out, ids_out);
+    }
+  };
   // These are the DRAFT's code gaps, so they want the scale the draft-width graph
   // calibrated on draft logits. The other one is dominated by the target's.
   const float s = own_head ? dflash_meta_.draft_logit_out_scale
@@ -1139,7 +1176,7 @@ void DFlashTokenGenerator::draft_topk(
   for (int d = 0; d < rows; ++d) {
     uint64_t* ids = draft_ids_.data() + static_cast<size_t>(d) * k;
     float* logp = draft_logp_.data() + static_cast<size_t>(d) * k;
-    topk_u16_row(lg + static_cast<size_t>(d) * V, V, k, codes.data(), ids);
+    row_topk(d, k, codes.data(), ids);
     // The zero point cancels in a difference, so it never has to be known here;
     // only the scale survives, and it is what turns a code gap into nats.
     double sum = 0.0;
@@ -1150,6 +1187,49 @@ void DFlashTokenGenerator::draft_topk(
     const float log_z = static_cast<float>(std::log(sum));
     for (int i = 0; i < k; ++i) {
       logp[i] -= log_z;
+    }
+  }
+  if (restrict_dump_ != nullptr) {
+    // The unrestricted top-128 and the restricted top-k of the same row from the same
+    // logits, so a host script can check the restriction against the replay's rule.
+    const int32_t header[3] = {rows, k, static_cast<int32_t>(extras.size())};
+    std::fwrite(header, sizeof(header), 1, restrict_dump_);
+    std::fwrite(extras.data(), sizeof(int32_t), extras.size(), restrict_dump_);
+    std::vector<uint16_t> full_codes(128), kept_codes(static_cast<size_t>(k));
+    std::vector<uint64_t> full_ids(128), kept_ids(static_cast<size_t>(k));
+    for (int d = 0; d < rows; ++d) {
+      pieces_->topk(piece_logits_, all_pieces_, kNoTokens, nullptr, d, 128,
+                    full_codes.data(), full_ids.data());
+      row_topk(d, k, kept_codes.data(), kept_ids.data());
+      for (int i = 0; i < 128; ++i) {
+        const int32_t pair[2] = {static_cast<int32_t>(full_ids[i]), full_codes[i]};
+        std::fwrite(pair, sizeof(pair), 1, restrict_dump_);
+      }
+      for (int i = 0; i < k; ++i) {
+        const int32_t pair[2] = {static_cast<int32_t>(kept_ids[i]), kept_codes[i]};
+        std::fwrite(pair, sizeof(pair), 1, restrict_dump_);
+      }
+    }
+  }
+  if (topk_dump_ != nullptr) {
+    constexpr int kd = 128;
+    dump_ids_.assign(static_cast<size_t>(rows) * kd, 0);
+    dump_logp_.assign(static_cast<size_t>(rows) * kd, 0.0f);
+    std::vector<uint16_t> dcodes(kd);
+    std::vector<uint64_t> dids(kd);
+    for (int d = 0; d < rows; ++d) {
+      row_topk(d, kd, dcodes.data(), dids.data());
+      double sum = 0.0;
+      float* lp = dump_logp_.data() + static_cast<size_t>(d) * kd;
+      for (int i = 0; i < kd; ++i) {
+        dump_ids_[static_cast<size_t>(d) * kd + i] = static_cast<int32_t>(dids[i]);
+        lp[i] = s * (static_cast<float>(dcodes[i]) - static_cast<float>(dcodes[0]));
+        sum += std::exp(static_cast<double>(lp[i]));
+      }
+      const float log_z = static_cast<float>(std::log(sum));
+      for (int i = 0; i < kd; ++i) {
+        lp[i] -= log_z;
+      }
     }
   }
   sample_ms_ += static_cast<double>(time_in_ms() - t_smp);
@@ -1437,6 +1517,7 @@ void DFlashTokenGenerator::run_draft(
   const int Ld = dflash_meta_.num_draft_layers;
   const size_t LH =
       static_cast<size_t>(dflash_meta_.num_ctx_layers) * dflash_meta_.hidden_dim;
+  const bool seed = (&meta == draft_prefill_meta_.get());
   const int32_t n_past = draft_ctx_len_;
   const int32_t Cc = dflash_meta_.max_context_len - ar;
   const int32_t mask_w = Cc + ar + B;
@@ -1461,11 +1542,13 @@ void DFlashTokenGenerator::run_draft(
       n_new,
       ar);
 
+  // The seed graph only has new_context and context_pos; the noise/mask/block
+  // metas below alias input 0 and are never bound for it.
   auto n_meta = meta.input_tensor_meta(0).get();
-  auto m_meta = meta.input_tensor_meta(1).get();
-  auto c_meta = meta.input_tensor_meta(2).get();
-  auto cp_meta = meta.input_tensor_meta(3).get();
-  auto bp_meta = meta.input_tensor_meta(4).get();
+  auto m_meta = meta.input_tensor_meta(seed ? 0 : 1).get();
+  auto c_meta = meta.input_tensor_meta(seed ? 0 : 2).get();
+  auto cp_meta = meta.input_tensor_meta(seed ? 1 : 3).get();
+  auto bp_meta = meta.input_tensor_meta(seed ? 0 : 4).get();
   auto h_meta = meta.output_tensor_meta(0).get();
 
   // Shared + QNN-registered buffers (see init_io); a heap buffer here would be
@@ -1477,20 +1560,24 @@ void DFlashTokenGenerator::run_draft(
   std::byte* bpos_buf = draft_in_bufs_[4];
   std::byte* hidden_buf = draft_hidden_buf_;
   // Padded rows must read as zero; mask is fully rewritten below.
-  std::memset(noise_buf, 0, draft_in_nbytes_[0]);
+  if (!seed) {
+    std::memset(noise_buf, 0, draft_in_nbytes_[0]);
+    std::memset(bpos_buf, 0, draft_in_nbytes_[4]);
+  }
   std::memset(ctx_buf, 0, draft_in_nbytes_[2]);
   std::memset(cpos_buf, 0, draft_in_nbytes_[3]);
-  std::memset(bpos_buf, 0, draft_in_nbytes_[4]);
 
   // noise_embedding: emb.pte over the block tokens (<= B <= emb kv AR).
   // emb.pte emits uint16 in the decoder's embeds encoding (the program declares
   // the output Float, but the payload is u16 -- see target_verify_block). The
   // draft's IO is genuinely f32, so dequantize across this boundary.
   const int32_t n_block =
-      std::min(static_cast<int32_t>(block_tokens.size()), B);
-  run_embedding(block_tokens.data(), n_block, /*draft=*/true);
+      seed ? 0 : std::min(static_cast<int32_t>(block_tokens.size()), B);
+  if (!seed) {
+    run_embedding(block_tokens.data(), n_block, /*draft=*/true);
+  }
   const uint16_t* emb_rows = reinterpret_cast<const uint16_t*>(emb_out_buf_);
-  {
+  if (!seed) {
     const ScalarType ndt = n_meta.scalar_type();
     const size_t n_elem = static_cast<size_t>(n_block) * H;
     const float zp = static_cast<float>(embeds_zero_point_);
@@ -1515,7 +1602,7 @@ void DFlashTokenGenerator::run_draft(
   // Visibility depends only on the column, so every query row is the same row of
   // bytes: lay down five contiguous runs once and copy it B-1 times, instead of
   // B * mask_w calls each re-deciding the dtype.
-  {
+  if (!seed) {
     const ScalarType mdt = m_meta.scalar_type();
     const size_t row_bytes = static_cast<size_t>(mask_w) * dtype_size(mdt);
     auto fill = [&](int from, int to, bool vis) {
@@ -1567,7 +1654,7 @@ void DFlashTokenGenerator::run_draft(
     reinterpret_cast<int32_t*>(cpos_buf)[j] =
         static_cast<int32_t>(ctx_pos_base + j);
   }
-  for (int k = 0; k < B; ++k) {
+  for (int k = 0; !seed && k < B; ++k) {
     reinterpret_cast<int32_t*>(bpos_buf)[k] =
         static_cast<int32_t>(block_pos_base + k);
   }
@@ -1585,31 +1672,41 @@ void DFlashTokenGenerator::run_draft(
   std::vector<TensorInfo> kv_in_meta, kv_out_meta;
   kv_in_meta.reserve(2 * Ld);
   kv_out_meta.reserve(2 * Ld);
+  const size_t ko = seed ? 0 : 1;
   for (int l = 0; l < Ld; ++l) {
-    kv_in_meta.emplace_back(meta.input_tensor_meta(5 + l).get());
-    kv_out_meta.emplace_back(meta.output_tensor_meta(1 + l).get());
+    if (!seed) {
+      kv_in_meta.emplace_back(meta.input_tensor_meta(5 + l).get());
+    }
+    kv_out_meta.emplace_back(meta.output_tensor_meta(ko + l).get());
   }
   for (int l = 0; l < Ld; ++l) {
-    kv_in_meta.emplace_back(meta.input_tensor_meta(5 + Ld + l).get());
-    kv_out_meta.emplace_back(meta.output_tensor_meta(1 + Ld + l).get());
+    if (!seed) {
+      kv_in_meta.emplace_back(meta.input_tensor_meta(5 + Ld + l).get());
+    }
+    kv_out_meta.emplace_back(meta.output_tensor_meta(ko + Ld + l).get());
   }
 
   std::vector<TensorImpl> kv_in_impls;
   kv_in_impls.reserve(2 * Ld);
-  for (int l = 0; l < Ld; ++l) {
+  for (int l = 0; !seed && l < Ld; ++l) {
     kv_in_impls.emplace_back(make_impl(kv_in_meta[l], k_caches[l].buffer));
   }
-  for (int l = 0; l < Ld; ++l) {
+  for (int l = 0; !seed && l < Ld; ++l) {
     kv_in_impls.emplace_back(make_impl(kv_in_meta[Ld + l], v_caches[l].buffer));
   }
 
-  std::vector<EValue> inputs{
-      EValue(Tensor(&n_impl)),
-      EValue(Tensor(&m_impl)),
-      EValue(Tensor(&c_impl)),
-      EValue(Tensor(&cp_impl)),
-      EValue(Tensor(&bp_impl)),
-  };
+  std::vector<EValue> inputs;
+  if (seed) {
+    inputs = {EValue(Tensor(&c_impl)), EValue(Tensor(&cp_impl))};
+  } else {
+    inputs = {
+        EValue(Tensor(&n_impl)),
+        EValue(Tensor(&m_impl)),
+        EValue(Tensor(&c_impl)),
+        EValue(Tensor(&cp_impl)),
+        EValue(Tensor(&bp_impl)),
+    };
+  }
   for (auto& impl : kv_in_impls) {
     inputs.emplace_back(EValue(Tensor(&impl)));
   }
@@ -1625,14 +1722,17 @@ void DFlashTokenGenerator::run_draft(
     kv_out_impls.emplace_back(
         make_impl(kv_out_meta[Ld + l], v_caches[l].output_buffer));
   }
-  std::vector<EValue> outputs{EValue(Tensor(&h_impl))};
+  std::vector<EValue> outputs;
+  if (!seed) {
+    outputs.emplace_back(EValue(Tensor(&h_impl)));
+  }
   for (auto& impl : kv_out_impls) {
     outputs.emplace_back(EValue(Tensor(&impl)));
   }
   // TensorImpl is neither default-constructible nor assignable, so it has to be
   // built in place; the vector just gives it a stable address to hand to EValue.
   std::vector<TensorImpl> logits_impl;
-  if (draft_has_lm_head_) {
+  if (draft_has_lm_head_ && !seed) {
     logits_impl.reserve(1);
     logits_impl.emplace_back(
         make_impl(meta.output_tensor_meta(1 + 2 * Ld).get(), draft_logits_buf_));
@@ -1863,6 +1963,23 @@ Result<int64_t> DFlashTokenGenerator::generate(
 
   int64_t cur_pos = start_pos; // position of the block's slot 0
   uint64_t last_committed = tokens.back();
+  if (const char* path = std::getenv("DFLASH_DUMP_RESTRICT")) {
+    ET_CHECK_MSG(
+        pieces_ != nullptr &&
+            (pieces_->options().draft_vocab == DraftVocab::kAll ||
+             pieces_->options().simulate),
+        "[DFlash] DFLASH_DUMP_RESTRICT needs every piece to run (kAll or simulate)");
+    restrict_dump_ = std::fopen(path, "wb");
+  }
+  if (const char* dump_path = std::getenv("DFLASH_DUMP_TOPK")) {
+    topk_dump_ = std::fopen(dump_path, "wb");
+    const int32_t n_prompt = static_cast<int32_t>(tokens.size());
+    std::fwrite(&n_prompt, sizeof(n_prompt), 1, topk_dump_);
+    for (uint64_t t : tokens) {
+      const int32_t v = static_cast<int32_t>(t);
+      std::fwrite(&v, sizeof(v), 1, topk_dump_);
+    }
+  }
 
   // The repeat gate learns from the prompt too -- a code prompt hands it the
   // indentation and separator tokens that legitimately double before the first
@@ -1871,8 +1988,10 @@ Result<int64_t> DFlashTokenGenerator::generate(
     seen.clear();
   }
   committed_tail_.clear();
+  reset_piece_context();
   for (uint64_t t : tokens) {
     note_committed(t);
+    note_piece_context(t);
   }
 
   // Rows staged for the next draft call: the hidden of the tokens committed by
@@ -2002,7 +2121,9 @@ Result<int64_t> DFlashTokenGenerator::generate(
         full_head_valid = true;
         ++sparse_fallback_rounds_;
       }
-      return argmax_u16_row(lg + static_cast<size_t>(slot) * V, V);
+      return pieces_ != nullptr
+          ? pieces_->argmax(piece_logits_, slot)
+          : argmax_u16_row(lg + static_cast<size_t>(slot) * V, V);
     };
     uint64_t bonus;
     if (dflash_meta_.force_fixed_accept) {
@@ -2115,11 +2236,23 @@ Result<int64_t> DFlashTokenGenerator::generate(
       committed_now.push_back(tree_[static_cast<size_t>(path[k]) - 1].token);
     }
     committed_now.push_back(bonus);
+    if (topk_dump_ != nullptr) {
+      const int32_t hdr[3] = {
+          static_cast<int32_t>(cur_pos), n_draft, static_cast<int32_t>(committed_now.size())};
+      std::fwrite(hdr, sizeof(hdr), 1, topk_dump_);
+      std::fwrite(dump_ids_.data(), sizeof(int32_t), dump_ids_.size(), topk_dump_);
+      std::fwrite(dump_logp_.data(), sizeof(float), dump_logp_.size(), topk_dump_);
+      for (uint64_t t : committed_now) {
+        const int32_t v = static_cast<int32_t>(t);
+        std::fwrite(&v, sizeof(v), 1, topk_dump_);
+      }
+    }
     if (repeat_probe_) {
       probe_round(committed_now, n_draft);
     }
     for (uint64_t t : committed_now) {
       note_committed(t);
+      note_piece_context(t);
     }
 
     total_accepted_ += static_cast<uint64_t>(accepted);
@@ -2176,6 +2309,14 @@ Result<int64_t> DFlashTokenGenerator::generate(
     }
   }
   decode_wall_us_ = time_in_us() - t_decode;
+  if (restrict_dump_ != nullptr) {
+    std::fclose(restrict_dump_);
+    restrict_dump_ = nullptr;
+  }
+  if (topk_dump_ != nullptr) {
+    std::fclose(topk_dump_);
+    topk_dump_ = nullptr;
+  }
 
   if (target_verify_calls_ > 0) {
     // accept_len is the metric that matters: tokens committed per target forward.
@@ -2234,6 +2375,37 @@ Result<int64_t> DFlashTokenGenerator::generate(
         lm_head_exec_ms_,
         static_cast<unsigned long long>(lm_head_calls_),
         sample_ms_);
+    if (pieces_ != nullptr && draft_head_calls_ > 0) {
+      const double calls = static_cast<double>(draft_head_calls_);
+      ET_LOG(
+          Info,
+          "[LmHeadPieces] draft vocab %s%s: ran %.1f of %d pieces per round, "
+          "candidates from %.1f%% of the vocabulary rows (%.1f context tokens outside "
+          "the hot pieces per round)",
+          pieces_->options().draft_vocab == DraftVocab::kAll
+              ? "all"
+              : pieces_->options().draft_vocab == DraftVocab::kHot ? "hot" : "hot_ctx",
+          pieces_->options().simulate ? " (simulated)" : "",
+          static_cast<double>(draft_pieces_run_) / calls,
+          pieces_->num_pieces(),
+          100.0 * static_cast<double>(draft_rows_read_) /
+              (calls * pieces_->vocab()),
+          static_cast<double>(draft_extras_) / calls);
+      if (cpu_head_ != nullptr) {
+        cpu_head_->wait();
+        ET_LOG(
+            Info,
+            "[CpuRowHead] per draft round: compute %.3f ms on the worker, %.3f ms of "
+            "waiting in the draft head, %.3f ms spent faulting rows in; %llu codes "
+            "compared with the NPU's: %.2f%% equal, %.2f%% off by one",
+            cpu_head_->compute_us() / calls / 1000.0,
+            cpu_head_->wait_us() / calls / 1000.0,
+            cpu_head_->prefetch_us() / calls / 1000.0,
+            static_cast<unsigned long long>(cpu_check_values_),
+            cpu_check_values_ ? 100.0 * cpu_check_equal_ / cpu_check_values_ : 0.0,
+            cpu_check_values_ ? 100.0 * cpu_check_off_by_one_ / cpu_check_values_ : 0.0);
+      }
+    }
 
     // Tree shape. Depth well below the budget means breadth is winning the
     // allocation, which is the whole point; depth pinned at the block horizon

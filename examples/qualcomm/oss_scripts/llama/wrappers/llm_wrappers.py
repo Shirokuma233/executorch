@@ -88,6 +88,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.model.static_llama import (
 from executorch.examples.qualcomm.oss_scripts.llama.static_llm_quant_recipe import (
     StaticLLMQuantRecipe,
 )
+from executorch.examples.qualcomm.oss_scripts.llama.wrappers import lm_head_pieces
 from executorch.examples.qualcomm.oss_scripts.llama.wrappers.base_component import (
     Component,
     get_model_specific_kwargs,
@@ -1221,8 +1222,10 @@ class TextDecoder(Component):
                 )
 
             # Saving Decode QDQ Model EP for SQNR evaluation
-            if self.mode == Mode.DECODE and not getattr(
-                self.control_args, "dflash_draft_only", False
+            if (
+                self.mode == Mode.DECODE
+                and not getattr(self.control_args, "dflash_draft_only", False)
+                and not getattr(self.control_args, "dflash_lm_head_only", False)
             ):
                 qdq_ep = torch.export.export(
                     self.decoder, self.export_input, strict=True
@@ -1499,6 +1502,110 @@ class HybridTextDecoder(Component):
 
         prefill_model.recompile()
 
+    @staticmethod
+    def _piece_passes_job(job, vocab, width):
+        """`job` with the lm_head output tagging extended to [b, ar, width]. The tagger
+        recognises the logits by shape, so a piece's narrower output would otherwise stay
+        float32 instead of the full head's uint16."""
+        tag_fn = job[TagQuantIO][QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY][
+            "get_quant_io_dtype_fn"
+        ]
+        # The kv/prefill jobs leave io_shape to the owner's default, the draft job sets it.
+        base_shape = tag_fn.keywords.get("io_shape") or tag_fn.func.__self__.lm_head_io_shape
+        io_shape = set(base_shape) | {
+            (b, ar, width) for b, ar, last in base_shape if last == vocab
+        }
+        piece_job = {key: dict(value) for key, value in job.items()}
+        piece_job[TagQuantIO][QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY] = {
+            **job[TagQuantIO][QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY],
+            "get_quant_io_dtype_fn": partial(
+                tag_fn.func, *tag_fn.args, **{**tag_fn.keywords, "io_shape": io_shape}
+            ),
+        }
+        return piece_job
+
+    def _lower_lm_head_pieces(
+        self,
+        lm_head_data,
+        graph_names,
+        modules,
+        example_inputs,
+        dep_tables,
+        passes_jobs,
+    ):
+        """One pte per requested piece count, each holding every lm_head width
+        (kv / prefill / draft) cut into the same row-disjoint pieces. Lowered exactly like
+        the full lm_head.pte, so the pieces' encodings and weight sharing match it."""
+        exported = [
+            lm_head_pieces.export_graph(m, e) for m, e in zip(modules, example_inputs)
+        ]
+        vocab = exported[0][1]
+        assert all(v == vocab for _, v in exported)
+        entries = list(
+            zip(
+                exported,
+                graph_names,
+                example_inputs,
+                lm_head_data.compile_spec,
+                dep_tables,
+                passes_jobs,
+            )
+        )
+        for n, tag in lm_head_pieces.parse_pieces(
+            self.control_args.dflash_lm_head_pieces
+        ):
+            ids = lm_head_pieces.partition(
+                vocab, n, self.control_args.dflash_lm_head_assign_dir, tag
+            )
+            keep = list(range(len(graph_names)))
+            if len(keep) * n > lm_head_pieces.MAX_GRAPHS_PER_PTE:
+                # The prefill graph goes first: the runner reuses the kv graph for it,
+                # which only works when the two take the same input.
+                prefill = graph_names.index("lm_head_prefill_forward")
+                assert (
+                    example_inputs[prefill][0].shape == example_inputs[0][0].shape
+                ), "cannot drop the prefill lm_head: its width differs from kv's"
+                keep.remove(prefill)
+                assert len(keep) * n <= lm_head_pieces.MAX_GRAPHS_PER_PTE, n
+                logging.info("lm_head pieces: n=%d drops the prefill graph", n)
+            mods, inputs, specs, deps, jobs = {}, {}, {}, {}, {}
+            for p, piece_ids in enumerate(ids):
+                for i in keep:
+                    (gm, _), graph, example, spec, dep, job = entries[i]
+                    name = f"{graph}_p{p}"
+                    mods[name] = lm_head_pieces.cut(gm, piece_ids, vocab)
+                    inputs[name], specs[name] = example, spec
+                    deps[name] = dep
+                    jobs[name] = self._piece_passes_job(job, vocab, len(piece_ids))
+            edge_prog_mgr = to_edge_transform_and_lower_to_qnn(
+                module=mods,
+                inputs=inputs,
+                compiler_specs=specs,
+                dep_table=deps,
+                passes_job=jobs,
+            )
+            exec_prog_mgr = edge_prog_mgr.to_executorch(
+                ExecutorchBackendConfig(
+                    memory_planning_pass=MemoryPlanningPass(
+                        alloc_graph_input=False,
+                        alloc_graph_output=False,
+                    ),
+                    passes=[BuildQuantIo()],
+                )
+            )
+            name = f"{lm_head_data.pte_filename}_{lm_head_pieces.pieces_name(n, tag)}"
+            with open(f"{self.control_args.artifact}/{name}.pte", "wb") as file:
+                exec_prog_mgr.write_to_file(file)
+            lm_head_pieces.write_metadata(
+                self.control_args.artifact,
+                name,
+                vocab,
+                [graph_names[i] for i in keep],
+                list(graph_names),
+                ids,
+            )
+            logging.info("lm_head pieces: %d pieces -> %s.pte", n, name)
+
     @log_info
     def compile(self, request: Request):  # noqa: C901
         # perform encoding override for hybrid mode
@@ -1579,8 +1686,10 @@ class HybridTextDecoder(Component):
         example_inputs = [m.export_input for m in models if m is not None]
         graph_names = DECODER_GRAPH_NAMES[: len(models)]
 
+        lm_head_only = getattr(self.control_args, "dflash_lm_head_only", False)
+
         # start lowering
-        if self.apply_embedding:
+        if self.apply_embedding and not lm_head_only:
             tok_embedding_edge_prog_mgr = to_edge_transform_and_lower_to_qnn(
                 module=dict(zip(tok_embedding_graph_names, tok_embedding_modules)),
                 inputs=dict(
@@ -1660,6 +1769,16 @@ class HybridTextDecoder(Component):
                 # lm_head -> logits, logging the decoded text for coherence check.
                 self.decode._verify_generate()
 
+            if getattr(self.control_args, "dflash_lm_head_pieces", ""):
+                self._lower_lm_head_pieces(
+                    lm_head_data,
+                    lm_head_graph_names,
+                    lm_head_modules,
+                    lm_head_example_inputs,
+                    lm_head_dep_tables,
+                    lm_head_passes_jobs,
+                )
+
             lm_head_edge_prog_mgr = to_edge_transform_and_lower_to_qnn(
                 module=dict(zip(lm_head_graph_names, lm_head_modules)),
                 inputs=dict(zip(lm_head_graph_names, lm_head_example_inputs)),
@@ -1687,6 +1806,9 @@ class HybridTextDecoder(Component):
                 f"{self.control_args.artifact}/{lm_head_data.pte_filename}.pte", "wb"
             ) as file:
                 lm_head_exec_prog_mgr.write_to_file(file)
+
+        if lm_head_only:
+            return
 
         # emb -> decoder boundary: inject the emb-output scale onto both decoders'
         # inputs_embeds so the uint16 boundary is lossless (mirror of the lm_head

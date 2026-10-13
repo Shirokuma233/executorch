@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/cpu_row_head.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/lm_head_pieces.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/sparse_verify.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/token_generator.h>
 #include <executorch/extension/module/module.h>
@@ -172,6 +174,14 @@ class DFlashTokenGenerator : public TokenGenerator {
       std::unique_ptr<executorch::runtime::MethodMeta> meta,
       int32_t vocab_size);
 
+  // Use the lm_head as row-disjoint pieces instead of lm_head_module. Verify runs
+  // every piece and takes the argmax across them, which is the unsplit head's answer.
+  // What the draft proposes from is pieces->options().draft_vocab.
+  void enable_lm_head_pieces(LmHeadPieces* pieces);
+  // The CPU computes the codes of the context tokens outside the hot pieces (draft vocab
+  // hot_ctx); without --dflash_draft_vocab_simulate the NPU then runs the hot pieces only.
+  void enable_cpu_head(CpuRowHead* head);
+
   // Bind target IO (incl. the L extra hidden outputs) + draft scratch buffers.
   void init_io(
       IMemAlloc* buffer_manager,
@@ -324,6 +334,33 @@ class DFlashTokenGenerator : public TokenGenerator {
   float logits_scale_;
   int32_t logits_zero_point_;
   int32_t lm_head_vocab_size_ = 0;
+
+  // lm_head pieces (see enable_lm_head_pieces). piece_logits_[p] is piece p's
+  // output buffer; lm_head_logits_buf_ is unused while they are in force.
+  LmHeadPieces* pieces_ = nullptr;
+  std::vector<std::byte*> piece_logits_;
+  std::vector<int32_t> all_pieces_;
+  // Restricted draft vocabulary: the pieces the draft always reads, and the tokens of
+  // the prompt and of the text committed so far that lie outside them, first seen first.
+  std::vector<int32_t> hot_pieces_;
+  std::vector<uint8_t> piece_is_hot_;
+  std::vector<uint8_t> token_in_context_;
+  std::vector<int32_t> context_extras_;
+  std::vector<uint16_t> extra_codes_;
+  CpuRowHead* cpu_head_ = nullptr;
+  int32_t draft_head_rows_ = 0;
+  uint64_t cpu_check_values_ = 0;
+  uint64_t cpu_check_equal_ = 0;
+  uint64_t cpu_check_off_by_one_ = 0;
+  FILE* restrict_dump_{nullptr};
+  uint64_t draft_head_calls_ = 0;
+  uint64_t draft_pieces_run_ = 0;
+  uint64_t draft_rows_read_ = 0;
+  uint64_t draft_extras_ = 0;
+  void reset_piece_context();
+  void note_piece_context(uint64_t token);
+  // Pieces the draft head executes this round.
+  const std::vector<int32_t>& draft_pieces_to_run() const;
 
   // emb/lm_head IO, carved from the shared (ION) region and registered with QNN.
   std::byte* emb_tok_buf_ = nullptr; // i32 token ids into emb.pte
@@ -487,6 +524,9 @@ class DFlashTokenGenerator : public TokenGenerator {
   std::vector<uint64_t> cand_tmp_token_;
   // Per-depth top-k of the drafted block, row-major [depth][k].
   std::vector<float> draft_logp_;
+  FILE* topk_dump_{nullptr};
+  std::vector<int32_t> dump_ids_;
+  std::vector<float> dump_logp_;
   std::vector<uint64_t> draft_ids_;
   int32_t draft_topk_ = 1;
 

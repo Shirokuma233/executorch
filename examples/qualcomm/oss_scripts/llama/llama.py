@@ -854,6 +854,29 @@ def _build_parser():
         "(--prompt, --seed, --dflash_tree_nodes, --max_seq_len, --prefill_ar_len).",
     )
     parser.add_argument(
+        "--dflash_lm_head_only",
+        action="store_true",
+        help="[DFlash mode] Calibrate as usual but lower only the lm_head (and its "
+        "--dflash_lm_head_pieces), skipping the target, emb and draft.",
+    )
+    parser.add_argument(
+        "--dflash_lm_head_pieces",
+        default="",
+        type=str,
+        help="[DFlash mode] Comma-separated piece counts, e.g. 4,8,16. For each, "
+        "also write lm_head_qnn_pieces<N>.pte (+ .json/.bin): the lm_head cut into N "
+        "row-disjoint pieces whose logits are bit-identical to the full head's columns. "
+        "N@tag (e.g. 2@hot32k) takes its partition from assign_<N>_<tag>.npy in "
+        "--dflash_lm_head_assign_dir and writes lm_head_qnn_pieces<N>_<tag>.pte.",
+    )
+    parser.add_argument(
+        "--dflash_lm_head_assign_dir",
+        default=None,
+        type=str,
+        help="[DFlash mode] Directory with assign_<N>.npy (length-vocab piece id per "
+        "token) overriding the default N contiguous id ranges.",
+    )
+    parser.add_argument(
         "--dflash_draft_w_bits",
         type=int,
         choices=[4, 8, 16],

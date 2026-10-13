@@ -47,6 +47,11 @@ list(
   ${CMAKE_CURRENT_LIST_DIR}/runner/tree_attention.h
   ${CMAKE_CURRENT_LIST_DIR}/runner/dflash_token_generator.cpp
   ${CMAKE_CURRENT_LIST_DIR}/runner/dflash_token_generator.h
+  ${CMAKE_CURRENT_LIST_DIR}/runner/cpu_row_head.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/runner/cpu_row_head.h
+  ${CMAKE_CURRENT_LIST_DIR}/runner/lm_head_pieces.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/runner/lm_head_pieces.h
+  ${CMAKE_CURRENT_LIST_DIR}/runner/u16_scan.h
   ${CMAKE_CURRENT_LIST_DIR}/runner/sparse_verify.cpp
   ${CMAKE_CURRENT_LIST_DIR}/runner/sparse_verify.h
   ${CMAKE_CURRENT_LIST_DIR}/runner/attention_sink_rope_runner.cpp
@@ -93,6 +98,30 @@ target_compile_options(qnn_llama_runner PUBLIC ${_common_compile_options})
 set_target_properties(
   qnn_llama_runner PROPERTIES LINK_FLAGS "-Wl,-rpath='$ORIGIN'"
 )
+
+add_executable(qnn_method_switch_bench qnn_method_switch_bench.cpp)
+target_include_directories(
+  qnn_method_switch_bench PUBLIC ${_common_include_directories}
+)
+target_link_libraries(
+  qnn_method_switch_bench
+  qnn_executorch_backend
+  executorch_core
+  extension_data_loader
+  extension_flat_tensor
+  extension_module
+  extension_tensor
+  gflags
+  quantized_ops_lib
+  quantized_kernels
+)
+target_compile_options(qnn_method_switch_bench PUBLIC ${_common_compile_options})
+set_target_properties(
+  qnn_method_switch_bench PROPERTIES LINK_FLAGS "-Wl,-rpath='$ORIGIN'"
+)
+
+add_executable(cpu_row_bench cpu_row_bench.cpp)
+target_compile_options(cpu_row_bench PRIVATE -O3)
 
 # build qnn multimodal runner preprocess qnn runner src files for multimodal
 set(_multimodal_runner__srcs ${_llama_runner__srcs})

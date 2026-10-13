@@ -555,6 +555,30 @@ def _draft_atten_mask(B, Cc, AR, n_past, n_new):
     return row.view(1, 1, W).expand(1, B, W).contiguous()
 
 
+def prune_to_ctx_kv(gm: torch.fx.GraphModule, n_layers: int) -> torch.fx.GraphModule:
+    """Cut a converted draft graph down to the part that produces the context K/V.
+
+    The context K/V of every layer comes straight from fc(new_context) -- noise, mask,
+    block positions and the cached K/V never reach it -- so dropping everything else
+    leaves a graph whose weights are a subset of the original's and whose k_new/v_new
+    encodings are the original's by construction. Seeding the cache from a prompt then
+    reads fc + k_proj/v_proj instead of the whole draft.
+    """
+    out = next(n for n in gm.graph.nodes if n.op == "output")
+    outs = list(out.args[0])
+    out.args = (tuple(outs[1 : 1 + 2 * n_layers]),)
+    gm.graph.eliminate_dead_code()
+    for n in list(gm.graph.nodes):
+        if n.op == "placeholder" and not n.users:
+            gm.graph.erase_node(n)
+    # ExportedProgram.module() wraps the graph in a pytree codegen that still
+    # expects the full input spec; the pruned graph takes its two inputs flat.
+    gm.graph._codegen = torch.fx.graph.CodeGen()
+    gm.graph.lint()
+    gm.recompile()
+    return gm
+
+
 class DFlashCalibrator:
     """Drives the draft inside the target's calibration loop, so both graphs'
     observers see the traffic they actually get at inference.
@@ -886,6 +910,7 @@ class DFlashDraftCompiler(Component):
         HybridTextDecoder._encoding_override(
             decode_model=self.decode, prefill_model=self.prefill
         )
+        self.seed = prune_to_ctx_kv(self.prefill, self.dflash_cfg.num_hidden_layers)
         logging.info(
             "DFlash draft quantized over %d speculative rounds (%s)",
             self.calibrator.rounds,
@@ -953,8 +978,14 @@ class DFlashDraftCompiler(Component):
         data = request.method_data[DFLASH_DRAFT]
         out_path = f"{self.control_args.artifact}/{data.pte_filename}.pte"
         graph_names = list(DFLASH_GRAPH_NAMES)
-        modules = [self.decode, self.prefill]
-        inputs = [self.decode_input, self.prefill_input]
+        seed = getattr(self, "seed", None)
+        if seed is None:
+            seed = prune_to_ctx_kv(
+                torch.export.export(self.prefill, self.prefill_input).module(),
+                self.dflash_cfg.num_hidden_layers,
+            )
+        modules = [self.decode, seed]
+        inputs = [self.decode_input, (self.prefill_input[2], self.prefill_input[3])]
 
         if self.backend == "cpu":
             _export_dflash_cpu_pte(
@@ -1223,7 +1254,9 @@ class DFlashManager(Component):
             ),
         }
         request = Request(method_name="compile", method_data=method_data)
-        if getattr(self.control_args, "dflash_draft_only", False):
+        if getattr(self.control_args, "dflash_lm_head_only", False):
+            self.target.compile(request)
+        elif getattr(self.control_args, "dflash_draft_only", False):
             self.draft_compiler.compile(request)
         else:
             self.process(request)

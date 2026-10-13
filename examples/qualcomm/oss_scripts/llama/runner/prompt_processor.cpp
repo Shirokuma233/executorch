@@ -46,13 +46,15 @@ PromptProcessor::PromptProcessor(
     float embeds_scale,
     int32_t embeds_zero_point,
     float logits_scale,
-    int32_t logits_zero_point)
+    int32_t logits_zero_point,
+    LmHeadPieces* lm_head_pieces)
     : decoder_runner_(decoder_runner),
       kv_manager_(kv_manager),
       method_name_(method_name),
       metadata_(metadata),
       emb_module_(emb_module),
       lm_head_module_(lm_head_module),
+      lm_head_pieces_(lm_head_pieces),
       emb_prefill_meta_(std::move(emb_prefill_meta)),
       lm_head_prefill_meta_(std::move(lm_head_prefill_meta)),
       embeds_scale_(embeds_scale),
@@ -301,16 +303,32 @@ void PromptProcessor::init_io(
         emb_out_nbytes_,
         emb_prefill_meta_->output_tensor_meta(0).get());
 
-    lm_head_logits_nbytes_ =
-        lm_head_prefill_meta_->output_tensor_meta(0)->nbytes();
-    lm_head_logits_buf_ = buffer_manager->allocate(lm_head_logits_nbytes_);
-    buffer_manager->add_memory_info(
-        lm_head_logits_buf_,
-        lm_head_logits_nbytes_,
-        lm_head_prefill_meta_->output_tensor_meta(0).get());
+    if (lm_head_pieces_ != nullptr) {
+      for (int32_t p = 0; p < lm_head_pieces_->num_pieces(); ++p) {
+        const size_t nbytes =
+            lm_head_pieces_->out_nbytes(LmHeadPieces::kPrefill, p);
+        std::byte* buf = buffer_manager->allocate(nbytes);
+        buffer_manager->add_memory_info(
+            buf,
+            nbytes,
+            lm_head_pieces_->meta(LmHeadPieces::kPrefill, p)
+                .output_tensor_meta(0)
+                .get());
+        piece_logits_bufs_.push_back(buf);
+      }
+      lm_head_vocab_size_ = lm_head_pieces_->vocab();
+    } else {
+      lm_head_logits_nbytes_ =
+          lm_head_prefill_meta_->output_tensor_meta(0)->nbytes();
+      lm_head_logits_buf_ = buffer_manager->allocate(lm_head_logits_nbytes_);
+      buffer_manager->add_memory_info(
+          lm_head_logits_buf_,
+          lm_head_logits_nbytes_,
+          lm_head_prefill_meta_->output_tensor_meta(0).get());
 
-    lm_head_vocab_size_ = static_cast<int32_t>(
-        lm_head_prefill_meta_->output_tensor_meta(0)->sizes()[2]);
+      lm_head_vocab_size_ = static_cast<int32_t>(
+          lm_head_prefill_meta_->output_tensor_meta(0)->sizes()[2]);
+    }
   }
 
   // Prepare the vector of EValue to run inference
@@ -517,24 +535,32 @@ Result<uint64_t> PromptProcessor::prefill(
     // Headless: output_tensors_[0] is hidden. Project the last chunk through
     // lm_head.pte and sample the last valid row of its logits.
     run_lm_head_prefill(logits_.data);
-    // lm_head.pte writes uint16 logits even though the program declares the
-    // output Float. Reading them as f32 yields zeros; bind as UInt16 instead.
-    // argmax is unaffected by skipping dequantization (order is preserved).
-    auto lm_out_meta = lm_head_prefill_meta_->output_tensor_meta(0).get();
-    std::vector<executorch::aten::TensorImpl::SizesType> lm_sizes(
-        lm_out_meta.sizes().begin(), lm_out_meta.sizes().end());
-    std::vector<executorch::aten::TensorImpl::DimOrderType> lm_dimo(
-        lm_out_meta.dim_order().begin(), lm_out_meta.dim_order().end());
-    TensorImpl lm_impl(
-        executorch::aten::ScalarType::UInt16,
-        lm_sizes.size(),
-        lm_sizes.data(),
-        lm_head_logits_buf_,
-        lm_dimo.data());
-    Tensor lm_logits(&lm_impl);
-    const long t_smp = time_in_ms();
-    cur_token = decoder_runner_->logits_to_token(lm_logits, last_row);
-    sample_ms_ += static_cast<double>(time_in_ms() - t_smp);
+    if (lm_head_pieces_ != nullptr) {
+      // DFlash decodes greedily, so the first token is an argmax over all pieces.
+      const long t_smp = time_in_ms();
+      cur_token = lm_head_pieces_->argmax(
+          piece_logits_bufs_, static_cast<int32_t>(last_row));
+      sample_ms_ += static_cast<double>(time_in_ms() - t_smp);
+    } else {
+      // lm_head.pte writes uint16 logits even though the program declares the
+      // output Float. Reading them as f32 yields zeros; bind as UInt16 instead.
+      // argmax is unaffected by skipping dequantization (order is preserved).
+      auto lm_out_meta = lm_head_prefill_meta_->output_tensor_meta(0).get();
+      std::vector<executorch::aten::TensorImpl::SizesType> lm_sizes(
+          lm_out_meta.sizes().begin(), lm_out_meta.sizes().end());
+      std::vector<executorch::aten::TensorImpl::DimOrderType> lm_dimo(
+          lm_out_meta.dim_order().begin(), lm_out_meta.dim_order().end());
+      TensorImpl lm_impl(
+          executorch::aten::ScalarType::UInt16,
+          lm_sizes.size(),
+          lm_sizes.data(),
+          lm_head_logits_buf_,
+          lm_dimo.data());
+      Tensor lm_logits(&lm_impl);
+      const long t_smp = time_in_ms();
+      cur_token = decoder_runner_->logits_to_token(lm_logits, last_row);
+      sample_ms_ += static_cast<double>(time_in_ms() - t_smp);
+    }
     ET_LOG(
         Info,
         "[DFlash] prefill per-pte ms: emb=%.1f (%llu chunks) decoder=%.1f (%llu) "
@@ -593,6 +619,15 @@ void PromptProcessor::run_embedding_prefill() {
 }
 
 void PromptProcessor::run_lm_head_prefill(std::byte* hidden_u16) {
+  if (lm_head_pieces_ != nullptr) {
+    const long t_pieces = time_in_ms();
+    for (int32_t p = 0; p < lm_head_pieces_->num_pieces(); ++p) {
+      lm_head_pieces_->run(
+          LmHeadPieces::kPrefill, p, hidden_u16, piece_logits_bufs_[p]);
+    }
+    lm_head_exec_ms_ += static_cast<double>(time_in_ms() - t_pieces);
+    return;
+  }
   auto in_meta = lm_head_prefill_meta_->input_tensor_meta(0).get();
   auto out_meta = lm_head_prefill_meta_->output_tensor_meta(0).get();
   TensorImpl in_impl = make_impl(in_meta, hidden_u16);

@@ -18,9 +18,11 @@
 
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/attention_sink_rope_runner.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/cache_utils.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/cpu_row_head.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/decoder_runner.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/imem_alloc.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/kv_manager.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/lm_head_pieces.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/prompt_processor.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/token_generator.h>
 #include <executorch/extension/llm/runner/irunner.h>
@@ -98,7 +100,10 @@ class Runner : public executorch::extension::llm::IRunner {
       std::unique_ptr<executorch::extension::Module>
           dflash_draft_lm_head_pruned_module = nullptr,
       bool dflash_force_fixed_accept = false,
-      int32_t dflash_force_fixed_accept_len = 4);
+      int32_t dflash_force_fixed_accept_len = 4,
+      // Row-disjoint pieces of the lm_head, used instead of dflash_lm_head_module.
+      std::unique_ptr<LmHeadPieces> dflash_lm_head_pieces = nullptr,
+      std::unique_ptr<CpuRowHead> dflash_cpu_head = nullptr);
 
   bool is_loaded() const override;
   executorch::runtime::Error load() override;
@@ -153,6 +158,8 @@ class Runner : public executorch::extension::llm::IRunner {
   std::unique_ptr<executorch::extension::Module> dflash_draft_module_;
   std::unique_ptr<executorch::extension::Module> dflash_emb_module_;
   std::unique_ptr<executorch::extension::Module> dflash_lm_head_module_;
+  std::unique_ptr<LmHeadPieces> dflash_lm_head_pieces_;
+  std::unique_ptr<CpuRowHead> dflash_cpu_head_;
   std::unique_ptr<executorch::extension::Module> dflash_sparse_head_module_;
   std::string dflash_sparse_table_path_;
   std::string dflash_sparse_scale_path_;
