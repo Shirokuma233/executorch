@@ -24,6 +24,7 @@
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/kv_manager.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/lm_head_pieces.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/prompt_processor.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/tok_embedding_table.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/token_generator.h>
 #include <executorch/extension/llm/runner/irunner.h>
 #include <executorch/extension/llm/runner/stats.h>
@@ -103,7 +104,9 @@ class Runner : public executorch::extension::llm::IRunner {
       int32_t dflash_force_fixed_accept_len = 4,
       // Row-disjoint pieces of the lm_head, used instead of dflash_lm_head_module.
       std::unique_ptr<LmHeadPieces> dflash_lm_head_pieces = nullptr,
-      std::unique_ptr<CpuRowHead> dflash_cpu_head = nullptr);
+      std::unique_ptr<CpuRowHead> dflash_cpu_head = nullptr,
+      // Serves the token embedding from the CPU in place of dflash_emb_module.
+      std::unique_ptr<TokEmbeddingTable> dflash_emb_table = nullptr);
 
   bool is_loaded() const override;
   executorch::runtime::Error load() override;
@@ -160,6 +163,7 @@ class Runner : public executorch::extension::llm::IRunner {
   std::unique_ptr<executorch::extension::Module> dflash_lm_head_module_;
   std::unique_ptr<LmHeadPieces> dflash_lm_head_pieces_;
   std::unique_ptr<CpuRowHead> dflash_cpu_head_;
+  std::unique_ptr<TokEmbeddingTable> dflash_emb_table_;
   std::unique_ptr<executorch::extension::Module> dflash_sparse_head_module_;
   std::string dflash_sparse_table_path_;
   std::string dflash_sparse_scale_path_;

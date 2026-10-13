@@ -17,6 +17,7 @@
 
 #include <executorch/backends/qualcomm/runtime/QnnExecuTorch.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/runner.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/tok_embedding_table.h>
 #include <executorch/extension/llm/runner/irunner.h>
 #include <executorch/runtime/backend/interface.h>
 #include <executorch/runtime/backend/options.h>
@@ -213,6 +214,18 @@ DEFINE_string(
     "[DFlash Decoding] Path to the compiled token-embedding pte (headless "
     "decoder consumes embeds, not token ids). "
     "Default: <dflash_draft dir>/tok_embedding_qnn.pte");
+DEFINE_string(
+    dflash_cpu_embedding_table,
+    "",
+    "[DFlash Decoding] Row-major uint16 copy of the token-embedding table "
+    "([vocab, hidden], tools/export_tok_embedding_rowmajor.py). The embedding is a CPU "
+    "lookup and the embedding pte is not loaded. Default: tok_embedding_rowmajor_u16.bin "
+    "next to the embedding pte; \"none\" (or a missing file) keeps the pte.");
+DEFINE_bool(
+    dflash_cpu_embedding_verify,
+    false,
+    "[DFlash Decoding] With --dflash_cpu_embedding_table, also load and run the "
+    "embedding pte and compare its bytes with the CPU lookup on every call.");
 DEFINE_string(
     dflash_lm_head_pte_path,
     "",
@@ -479,7 +492,8 @@ void start_runner(
     std::unique_ptr<executorch::extension::Module>
         dflash_draft_lm_head_pruned_module,
     std::unique_ptr<example::LmHeadPieces> dflash_lm_head_pieces,
-    std::unique_ptr<example::CpuRowHead> dflash_cpu_head) {
+    std::unique_ptr<example::CpuRowHead> dflash_cpu_head,
+    std::unique_ptr<example::TokEmbeddingTable> dflash_emb_table) {
   bool use_tokenized_prompt =
       gflags::GetCommandLineFlagInfoOrDie("tokenized_prompt").is_default ? false
                                                                          : true;
@@ -526,7 +540,8 @@ void start_runner(
       FLAGS_dflash_force_fixed_accept,
       FLAGS_dflash_force_fixed_accept_len,
       std::move(dflash_lm_head_pieces),
-      std::move(dflash_cpu_head));
+      std::move(dflash_cpu_head),
+      std::move(dflash_emb_table));
   auto decoder_model_version = runner.get_decoder_model_version();
   std::vector<char> buf;
   buf.reserve(5 * FLAGS_seq_len); // assume each token is around 5 char
@@ -679,6 +694,7 @@ int main(int argc, char** argv) {
       dflash_draft_lm_head_pruned_module;
   std::unique_ptr<example::LmHeadPieces> dflash_lm_head_pieces;
   std::unique_ptr<example::CpuRowHead> dflash_cpu_head;
+  std::unique_ptr<example::TokEmbeddingTable> dflash_emb_table;
   std::string sparse_table;
   std::string sparse_scale;
   if (!FLAGS_dflash_draft_path.empty()) {
@@ -693,9 +709,25 @@ int main(int argc, char** argv) {
     std::string lm_head_pte = FLAGS_dflash_lm_head_pte_path.empty()
         ? sibling_path(FLAGS_dflash_draft_path, "lm_head_qnn.pte")
         : FLAGS_dflash_lm_head_pte_path;
-    dflash_emb_module = std::make_unique<executorch::extension::Module>(
-        emb_pte.c_str(),
-        executorch::extension::Module::LoadMode::MmapUseMlockIgnoreErrors);
+    // The embedding is served from the CPU by default, from the table that sits next to
+    // the embedding pte it replaces; "none" or a missing table keeps the pte.
+    std::string emb_table_path = FLAGS_dflash_cpu_embedding_table.empty()
+        ? sibling_path(emb_pte, "tok_embedding_rowmajor_u16.bin")
+        : FLAGS_dflash_cpu_embedding_table;
+    if (emb_table_path != "none" && std::ifstream(emb_table_path).good()) {
+      dflash_emb_table =
+          std::make_unique<example::TokEmbeddingTable>(emb_table_path);
+    } else {
+      ET_LOG(
+          Info,
+          "[TokEmbedding] no table at %s: using the embedding pte",
+          emb_table_path.c_str());
+    }
+    if (dflash_emb_table == nullptr || FLAGS_dflash_cpu_embedding_verify) {
+      dflash_emb_module = std::make_unique<executorch::extension::Module>(
+          emb_pte.c_str(),
+          executorch::extension::Module::LoadMode::MmapUseMlockIgnoreErrors);
+    }
     if (FLAGS_dflash_lm_head_pieces_pte_path.empty()) {
       dflash_lm_head_module = std::make_unique<executorch::extension::Module>(
           lm_head_pte.c_str(),
@@ -777,7 +809,8 @@ int main(int argc, char** argv) {
       sparse_scale,
       std::move(dflash_draft_lm_head_pruned_module),
       std::move(dflash_lm_head_pieces),
-      std::move(dflash_cpu_head));
+      std::move(dflash_cpu_head),
+      std::move(dflash_emb_table));
 
   return 0;
 }

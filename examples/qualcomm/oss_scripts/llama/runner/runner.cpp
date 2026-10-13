@@ -131,7 +131,8 @@ Runner::Runner(
     bool dflash_force_fixed_accept,
     int32_t dflash_force_fixed_accept_len,
     std::unique_ptr<LmHeadPieces> dflash_lm_head_pieces,
-    std::unique_ptr<CpuRowHead> dflash_cpu_head)
+    std::unique_ptr<CpuRowHead> dflash_cpu_head,
+    std::unique_ptr<TokEmbeddingTable> dflash_emb_table)
     : module_(std::move(module)),
       attention_sink_rope_module_(std::move(attention_sink_rope_module)),
       eagle_head_module_(std::move(eagle_head_module)),
@@ -147,6 +148,7 @@ Runner::Runner(
       dflash_lm_head_module_(std::move(dflash_lm_head_module)),
       dflash_lm_head_pieces_(std::move(dflash_lm_head_pieces)),
       dflash_cpu_head_(std::move(dflash_cpu_head)),
+      dflash_emb_table_(std::move(dflash_emb_table)),
       dflash_sparse_head_module_(std::move(dflash_sparse_head_module)),
       dflash_sparse_table_path_(dflash_sparse_table_path),
       dflash_sparse_scale_path_(dflash_sparse_scale_path),
@@ -326,15 +328,17 @@ Error Runner::load() {
   int32_t dflash_draft_hidden_zp = 0;
   if (dflash) {
     ET_CHECK_MSG(
-        dflash_emb_module_ != nullptr &&
+        (dflash_emb_module_ != nullptr || dflash_emb_table_ != nullptr) &&
             (dflash_lm_head_module_ != nullptr ||
              dflash_lm_head_pieces_ != nullptr),
         "DFlash mode requires --dflash_emb_pte_path and --dflash_lm_head_pte_path "
         "(auto-derived as siblings of --dflash_draft_path).");
-    ET_CHECK_OK_OR_RETURN_ERROR(
-        dflash_emb_module_->load_method("tok_embedding_kv_forward"));
-    ET_CHECK_OK_OR_RETURN_ERROR(
-        dflash_emb_module_->load_method("tok_embedding_prefill_forward"));
+    if (dflash_emb_module_ != nullptr) {
+      ET_CHECK_OK_OR_RETURN_ERROR(
+          dflash_emb_module_->load_method("tok_embedding_kv_forward"));
+      ET_CHECK_OK_OR_RETURN_ERROR(
+          dflash_emb_module_->load_method("tok_embedding_prefill_forward"));
+    }
     if (dflash_lm_head_pieces_ == nullptr) {
       ET_CHECK_OK_OR_RETURN_ERROR(
           dflash_lm_head_module_->load_method("lm_head_kv_forward"));
@@ -343,10 +347,12 @@ Error Runner::load() {
     } else {
       ET_CHECK_OK_OR_RETURN_ERROR(dflash_lm_head_pieces_->load());
     }
-    dflash_emb_kv_meta = std::make_unique<MethodMeta>(
-        ET_UNWRAP(dflash_emb_module_->method_meta("tok_embedding_kv_forward")));
-    dflash_emb_prefill_meta = std::make_unique<MethodMeta>(ET_UNWRAP(
-        dflash_emb_module_->method_meta("tok_embedding_prefill_forward")));
+    if (dflash_emb_module_ != nullptr) {
+      dflash_emb_kv_meta = std::make_unique<MethodMeta>(ET_UNWRAP(
+          dflash_emb_module_->method_meta("tok_embedding_kv_forward")));
+      dflash_emb_prefill_meta = std::make_unique<MethodMeta>(ET_UNWRAP(
+          dflash_emb_module_->method_meta("tok_embedding_prefill_forward")));
+    }
     // With pieces, every piece of a graph has the same input and the same output
     // rank, so piece 0 stands in for the whole graph wherever only shapes are read.
     if (dflash_lm_head_pieces_ == nullptr) {
@@ -362,8 +368,9 @@ Error Runner::load() {
     }
     // The block_size-wide views the draft calls. Optional: ptes built before the
     // split have only the two above, and the generator falls back to them.
-    if (dflash_emb_module_->load_method("tok_embedding_draft_forward") ==
-        Error::Ok) {
+    if (dflash_emb_module_ != nullptr &&
+        dflash_emb_module_->load_method("tok_embedding_draft_forward") ==
+            Error::Ok) {
       dflash_emb_draft_meta = std::make_unique<MethodMeta>(ET_UNWRAP(
           dflash_emb_module_->method_meta("tok_embedding_draft_forward")));
     }
@@ -496,12 +503,16 @@ Error Runner::load() {
       }
       return total;
     };
-    const size_t tok_gen_aux = in0(*dflash_emb_kv_meta) +
-        out0(*dflash_emb_kv_meta) +
+    const size_t tok_gen_aux = (dflash_emb_kv_meta
+                                    ? in0(*dflash_emb_kv_meta) +
+                                        out0(*dflash_emb_kv_meta)
+                                    : 0) +
         lm_out_total(LmHeadPieces::kKv, *dflash_lm_kv_meta) +
         in0(*dflash_lm_kv_meta);
-    const size_t prompt_aux = in0(*dflash_emb_prefill_meta) +
-        out0(*dflash_emb_prefill_meta) +
+    const size_t prompt_aux = (dflash_emb_prefill_meta
+                                   ? in0(*dflash_emb_prefill_meta) +
+                                       out0(*dflash_emb_prefill_meta)
+                                   : 0) +
         lm_out_total(LmHeadPieces::kPrefill, *dflash_lm_prefill_meta);
     dflash_aux_io_size_ = tok_gen_aux + prompt_aux;
     if (dflash_sparse_k_ > 0 && dflash_sparse_head_module_ != nullptr) {
@@ -620,7 +631,8 @@ Error Runner::load() {
       dflash_embeds_zp,
       dflash_logits_scale,
       dflash_logits_zp,
-      dflash ? dflash_lm_head_pieces_.get() : nullptr);
+      dflash ? dflash_lm_head_pieces_.get() : nullptr,
+      dflash ? dflash_emb_table_.get() : nullptr);
   if (eval_mode_ == EvalMode::kLookaheadDecoding) {
     token_generator_ = std::make_unique<LhdTokenGenerator>(
         tokenizer_.get(),
@@ -934,6 +946,11 @@ Error Runner::load() {
         dflash_embeds_zp,
         dflash_logits_scale,
         dflash_logits_zp);
+    if (dflash_emb_table_ != nullptr) {
+      ET_CHECK_OK_OR_RETURN_ERROR(
+          dflash_emb_table_->load(vocab_size, dflash_md.hidden_dim));
+      dflash_gen->enable_cpu_embedding(dflash_emb_table_.get());
+    }
     if (dflash_lm_head_pieces_ != nullptr) {
       ET_CHECK_MSG(
           dflash_sparse_k_ == 0 &&

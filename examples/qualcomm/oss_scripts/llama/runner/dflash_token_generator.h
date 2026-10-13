@@ -9,6 +9,7 @@
 #pragma once
 
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/cpu_row_head.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/tok_embedding_table.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/lm_head_pieces.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/sparse_verify.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/token_generator.h>
@@ -181,6 +182,9 @@ class DFlashTokenGenerator : public TokenGenerator {
   // The CPU computes the codes of the context tokens outside the hot pieces (draft vocab
   // hot_ctx); without --dflash_draft_vocab_simulate the NPU then runs the hot pieces only.
   void enable_cpu_head(CpuRowHead* head);
+  // The token embedding is a lookup in this table instead of the emb pte. With both,
+  // the emb pte also runs and its output is compared byte for byte.
+  void enable_cpu_embedding(const TokEmbeddingTable* table);
 
   // Bind target IO (incl. the L extra hidden outputs) + draft scratch buffers.
   void init_io(
@@ -348,6 +352,9 @@ class DFlashTokenGenerator : public TokenGenerator {
   std::vector<int32_t> context_extras_;
   std::vector<uint16_t> extra_codes_;
   CpuRowHead* cpu_head_ = nullptr;
+  const TokEmbeddingTable* emb_table_ = nullptr;
+  std::vector<uint16_t> emb_cpu_out_;
+  uint64_t emb_verify_bytes_ = 0, emb_verify_bad_ = 0;
   int32_t draft_head_rows_ = 0;
   uint64_t cpu_check_values_ = 0;
   uint64_t cpu_check_equal_ = 0;

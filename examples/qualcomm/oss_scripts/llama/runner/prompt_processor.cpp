@@ -47,12 +47,15 @@ PromptProcessor::PromptProcessor(
     int32_t embeds_zero_point,
     float logits_scale,
     int32_t logits_zero_point,
-    LmHeadPieces* lm_head_pieces)
+    LmHeadPieces* lm_head_pieces,
+    const TokEmbeddingTable* emb_table)
     : decoder_runner_(decoder_runner),
       kv_manager_(kv_manager),
       method_name_(method_name),
       metadata_(metadata),
       emb_module_(emb_module),
+      emb_table_(emb_table),
+      headless_(emb_module != nullptr || emb_table != nullptr),
       lm_head_module_(lm_head_module),
       lm_head_pieces_(lm_head_pieces),
       emb_prefill_meta_(std::move(emb_prefill_meta)),
@@ -126,7 +129,7 @@ PromptProcessor::PromptProcessor(
   // while taking dtype/shape from method_meta, so resizing just these two byte
   // counts makes it carve correctly-sized embeds/hidden buffers. Doing it here
   // (not in init_io) also keeps the RpcMem budget from over-reserving vocab-wide.
-  if (emb_module_ != nullptr) {
+  if (headless_) {
     input_toks_.size = method_meta->input_tensor_meta(0)->nbytes();
     logits_.size = method_meta->output_tensor_meta(0)->nbytes();
   }
@@ -285,23 +288,25 @@ void PromptProcessor::init_io(
   // f32 logits output. lm_head's input is the decoder hidden buffer (logits_.data)
   // directly. All carved from the shared region + QNN-registered, sized for the
   // prefill views this processor binds.
-  if (emb_module_ != nullptr) {
-    emb_tok_i64_ =
-        emb_prefill_meta_->input_tensor_meta(0)->scalar_type() ==
-        executorch::aten::ScalarType::Long;
-    emb_tok_nbytes_ = emb_prefill_meta_->input_tensor_meta(0)->nbytes();
-    emb_tok_buf_ = buffer_manager->allocate(emb_tok_nbytes_);
-    buffer_manager->add_memory_info(
-        emb_tok_buf_,
-        emb_tok_nbytes_,
-        emb_prefill_meta_->input_tensor_meta(0).get());
+  if (headless_) {
+    if (emb_module_ != nullptr) {
+      emb_tok_i64_ =
+          emb_prefill_meta_->input_tensor_meta(0)->scalar_type() ==
+          executorch::aten::ScalarType::Long;
+      emb_tok_nbytes_ = emb_prefill_meta_->input_tensor_meta(0)->nbytes();
+      emb_tok_buf_ = buffer_manager->allocate(emb_tok_nbytes_);
+      buffer_manager->add_memory_info(
+          emb_tok_buf_,
+          emb_tok_nbytes_,
+          emb_prefill_meta_->input_tensor_meta(0).get());
 
-    emb_out_nbytes_ = emb_prefill_meta_->output_tensor_meta(0)->nbytes();
-    emb_out_buf_ = buffer_manager->allocate(emb_out_nbytes_);
-    buffer_manager->add_memory_info(
-        emb_out_buf_,
-        emb_out_nbytes_,
-        emb_prefill_meta_->output_tensor_meta(0).get());
+      emb_out_nbytes_ = emb_prefill_meta_->output_tensor_meta(0)->nbytes();
+      emb_out_buf_ = buffer_manager->allocate(emb_out_nbytes_);
+      buffer_manager->add_memory_info(
+          emb_out_buf_,
+          emb_out_nbytes_,
+          emb_prefill_meta_->output_tensor_meta(0).get());
+    }
 
     if (lm_head_pieces_ != nullptr) {
       for (int32_t p = 0; p < lm_head_pieces_->num_pieces(); ++p) {
@@ -346,10 +351,13 @@ void PromptProcessor::prepare_io(
     const std::vector<uint64_t>& prompt_tokens,
     int64_t prompt_pos,
     int64_t start_pos) {
-  const bool dflash = emb_module_ != nullptr;
+  const bool dflash = headless_;
   if (dflash) {
     // Padded slots must embed token 0, so clear before writing the valid ids.
-    std::memset(emb_tok_buf_, 0, emb_tok_nbytes_);
+    if (emb_module_ != nullptr) {
+      std::memset(emb_tok_buf_, 0, emb_tok_nbytes_);
+    }
+    emb_tokens_.assign(metadata_.ar_len, 0);
   }
   for (int i = 0; i < metadata_.ar_len; i++) {
     if (!is_bert()) {
@@ -361,8 +369,10 @@ void PromptProcessor::prepare_io(
     if (prompt_pos + i < prompt_tokens.size()) {
       const uint64_t tok = prompt_tokens[prompt_pos + i];
       if (dflash) {
-        // Headless decoder: token ids feed emb.pte, not the decoder directly.
-        if (emb_tok_i64_) {
+        // Headless decoder: token ids feed the embedding, not the decoder directly.
+        emb_tokens_[i] = tok;
+        if (emb_module_ == nullptr) {
+        } else if (emb_tok_i64_) {
           reinterpret_cast<int64_t*>(emb_tok_buf_)[i] =
               static_cast<int64_t>(tok);
         } else {
@@ -412,6 +422,9 @@ Result<uint64_t> PromptProcessor::prefill(
   int64_t prompt_pos = 0;
   int32_t n_update = metadata_.ar_len;
   int num_iters = 1 + ((num_prompt_tokens - 1) / metadata_.ar_len);
+  if (emb_table_ != nullptr) {
+    emb_table_->prefetch(prompt_tokens.data(), num_prompt_tokens);
+  }
   graph_execute_calls_ = 0;
   graph_execute_time_ms_ = 0.0;
   ET_LOG(
@@ -486,7 +499,7 @@ Result<uint64_t> PromptProcessor::prefill(
 
     // Headless decoder: turn token ids into quantized embeds (inputs_[0]) via
     // emb.pte before the decoder step. No-op for every other eval mode.
-    if (emb_module_ != nullptr) {
+    if (headless_) {
       run_embedding_prefill();
     }
 
@@ -531,7 +544,7 @@ Result<uint64_t> PromptProcessor::prefill(
 
   const int64_t last_row =
       (num_prompt_tokens + metadata_.ar_len - 1) % metadata_.ar_len;
-  if (emb_module_ != nullptr) {
+  if (headless_) {
     // Headless: output_tensors_[0] is hidden. Project the last chunk through
     // lm_head.pte and sample the last valid row of its logits.
     run_lm_head_prefill(logits_.data);
@@ -560,6 +573,13 @@ Result<uint64_t> PromptProcessor::prefill(
       const long t_smp = time_in_ms();
       cur_token = decoder_runner_->logits_to_token(lm_logits, last_row);
       sample_ms_ += static_cast<double>(time_in_ms() - t_smp);
+    }
+    if (emb_table_ != nullptr && emb_module_ != nullptr) {
+      ET_LOG(
+          Info,
+          "[TokEmbedding] CPU lookup vs emb pte (prefill): %llu of %llu chunks differ",
+          static_cast<unsigned long long>(emb_verify_bad_),
+          static_cast<unsigned long long>(emb_calls_ / 2));
     }
     ET_LOG(
         Info,
@@ -593,6 +613,19 @@ Result<uint64_t> PromptProcessor::prefill(
 }
 
 void PromptProcessor::run_embedding_prefill() {
+  if (emb_table_ != nullptr) {
+    const long t_cpu = time_in_ms();
+    emb_table_->gather(
+        emb_tokens_.data(),
+        static_cast<int32_t>(emb_tokens_.size()),
+        static_cast<int32_t>(emb_tokens_.size()),
+        reinterpret_cast<uint16_t*>(input_toks_.data));
+    emb_exec_ms_ += static_cast<double>(time_in_ms() - t_cpu);
+    ++emb_calls_;
+    if (emb_module_ == nullptr) {
+      return;
+    }
+  }
   auto tok_meta = emb_prefill_meta_->input_tensor_meta(0).get();
   auto out_meta = emb_prefill_meta_->output_tensor_meta(0).get();
   TensorImpl tok_impl = make_impl(tok_meta, emb_tok_buf_);
@@ -613,6 +646,10 @@ void PromptProcessor::run_embedding_prefill() {
   // tensor Float. So this boundary is a lossless uint16 hand-off -- copy the
   // bytes straight into the decoder's embeds input; quantizing here would
   // reinterpret u16 payload as f32 and destroy it.
+  if (emb_table_ != nullptr) {
+    emb_verify_bad_ +=
+        std::memcmp(input_toks_.data, emb_out_buf_, input_toks_.size) != 0;
+  }
   const long t_cp = time_in_ms();
   std::memcpy(input_toks_.data, emb_out_buf_, input_toks_.size);
   embeds_copy_ms_ += static_cast<double>(time_in_ms() - t_cp);

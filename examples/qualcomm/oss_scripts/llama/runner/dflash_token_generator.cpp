@@ -339,9 +339,6 @@ DFlashTokenGenerator::DFlashTokenGenerator(
         "/sys/kernel/tracing/instances/dflash_dvfs/trace_marker",
         O_WRONLY | O_CLOEXEC);
   }
-  ET_CHECK_MSG(
-      emb_module_ != nullptr,
-      "[DFlash] headless decoder requires an emb module");
   // The draft KVManager sizes its buffer as context_len - min(ar), and its
   // dtype scan matches kv_forward's cache length. Both assume kv_forward has
   // the shorter append length.
@@ -605,15 +602,27 @@ void DFlashTokenGenerator::init_io(
   // verify path feeds lm_head the decoder hidden buffer directly, so only the
   // draft needs its own). All carved from the shared region + QNN-registered;
   // sized for the kv views this generator binds (decode never runs prefill).
-  emb_tok_nbytes_ = emb_kv_meta_->input_tensor_meta(0)->nbytes();
-  emb_tok_buf_ = buffer_manager->allocate(emb_tok_nbytes_);
-  buffer_manager->add_memory_info(
-      emb_tok_buf_, emb_tok_nbytes_, emb_kv_meta_->input_tensor_meta(0).get());
+  ET_CHECK_MSG(
+      emb_module_ != nullptr || emb_table_ != nullptr,
+      "[DFlash] headless decoder requires an emb module or a CPU embedding table");
+  if (emb_table_ != nullptr) {
+    emb_cpu_out_.assign(
+        static_cast<size_t>(dflash_meta_.target_ar_len) * dflash_meta_.hidden_dim, 0);
+  }
+  if (emb_module_ != nullptr) {
+    emb_tok_nbytes_ = emb_kv_meta_->input_tensor_meta(0)->nbytes();
+    emb_tok_buf_ = buffer_manager->allocate(emb_tok_nbytes_);
+    buffer_manager->add_memory_info(
+        emb_tok_buf_, emb_tok_nbytes_, emb_kv_meta_->input_tensor_meta(0).get());
 
-  emb_out_nbytes_ = emb_kv_meta_->output_tensor_meta(0)->nbytes();
-  emb_out_buf_ = buffer_manager->allocate(emb_out_nbytes_);
-  buffer_manager->add_memory_info(
-      emb_out_buf_, emb_out_nbytes_, emb_kv_meta_->output_tensor_meta(0).get());
+    emb_out_nbytes_ = emb_kv_meta_->output_tensor_meta(0)->nbytes();
+    emb_out_buf_ = buffer_manager->allocate(emb_out_nbytes_);
+    buffer_manager->add_memory_info(
+        emb_out_buf_, emb_out_nbytes_, emb_kv_meta_->output_tensor_meta(0).get());
+  } else {
+    emb_out_nbytes_ = emb_cpu_out_.size() * sizeof(uint16_t);
+    emb_out_buf_ = reinterpret_cast<std::byte*>(emb_cpu_out_.data());
+  }
 
   if (pieces_ != nullptr) {
     // The draft's logits are narrower than the verify's, so one buffer per piece
@@ -646,7 +655,7 @@ void DFlashTokenGenerator::init_io(
   // The block_size-wide views share these buffers -- they are strictly smaller
   // than the kv views -- but QNN registers memory per tensor meta, so each view
   // has to be declared or the DSP has no handle for it.
-  if (emb_draft_meta_ != nullptr) {
+  if (emb_module_ != nullptr && emb_draft_meta_ != nullptr) {
     buffer_manager->add_memory_info(
         emb_tok_buf_,
         emb_tok_nbytes_,
@@ -754,6 +763,13 @@ void DFlashTokenGenerator::run_embedding(
     const uint64_t* tokens,
     int32_t n_tokens,
     bool draft) {
+  if (emb_table_ != nullptr) {
+    const int32_t rows = draft ? n_tokens : dflash_meta_.target_ar_len;
+    emb_table_->gather(tokens, n_tokens, rows, emb_cpu_out_.data());
+    if (emb_module_ == nullptr) {
+      return;
+    }
+  }
   const bool use_draft = draft && emb_draft_meta_ != nullptr;
   MethodMeta* meta = use_draft ? emb_draft_meta_.get() : emb_kv_meta_.get();
   const char* method = use_draft ? "tok_embedding_draft_forward"
@@ -784,6 +800,12 @@ void DFlashTokenGenerator::run_embedding(
   emb_exec_ms_ += static_cast<double>(time_in_ms() - t0);
   ++emb_calls_;
   ET_CHECK_MSG(res.ok(), "[DFlash] emb execute failed");
+  if (emb_table_ != nullptr) {
+    const size_t rows = draft ? n_tokens : std::min<size_t>(ar, dflash_meta_.target_ar_len);
+    const size_t bytes = rows * dflash_meta_.hidden_dim * sizeof(uint16_t);
+    emb_verify_bytes_ += bytes;
+    emb_verify_bad_ += std::memcmp(emb_cpu_out_.data(), emb_out_buf_, bytes) != 0;
+  }
   if (!dtype_checked_) {
     dtype_checked_ = true;
     check_payload_dtype(
@@ -973,6 +995,10 @@ void DFlashTokenGenerator::enable_lm_head_pieces(LmHeadPieces* pieces) {
   for (int32_t p : hot_pieces_) {
     piece_is_hot_[p] = 1;
   }
+}
+
+void DFlashTokenGenerator::enable_cpu_embedding(const TokEmbeddingTable* table) {
+  emb_table_ = table;
 }
 
 void DFlashTokenGenerator::enable_cpu_head(CpuRowHead* head) {
@@ -1818,6 +1844,11 @@ void DFlashTokenGenerator::stage_prompt_hidden(
     const std::vector<TensorStructRaw>& extra_outputs,
     int32_t n_valid,
     int64_t pos_base) {
+  // Measurement switch: prefill without any draft seeding, the TTFT floor for a draft.
+  static const bool skip_seed = getenv("DFLASH_SKIP_SEED") != nullptr;
+  if (skip_seed) {
+    return;
+  }
   const int L = dflash_meta_.num_ctx_layers;
   const int H = dflash_meta_.hidden_dim;
   const size_t LH = static_cast<size_t>(L) * H;
@@ -2375,6 +2406,15 @@ Result<int64_t> DFlashTokenGenerator::generate(
         lm_head_exec_ms_,
         static_cast<unsigned long long>(lm_head_calls_),
         sample_ms_);
+    if (emb_table_ != nullptr && emb_module_ != nullptr) {
+      ET_LOG(
+          Info,
+          "[TokEmbedding] CPU lookup vs emb pte (generator): %llu of %llu calls "
+          "differ, %.1f MB compared",
+          static_cast<unsigned long long>(emb_verify_bad_),
+          static_cast<unsigned long long>(emb_calls_),
+          static_cast<double>(emb_verify_bytes_) / (1 << 20));
+    }
     if (pieces_ != nullptr && draft_head_calls_ > 0) {
       const double calls = static_cast<double>(draft_head_calls_);
       ET_LOG(

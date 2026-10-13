@@ -49,6 +49,8 @@ list(
   ${CMAKE_CURRENT_LIST_DIR}/runner/dflash_token_generator.h
   ${CMAKE_CURRENT_LIST_DIR}/runner/cpu_row_head.cpp
   ${CMAKE_CURRENT_LIST_DIR}/runner/cpu_row_head.h
+  ${CMAKE_CURRENT_LIST_DIR}/runner/tok_embedding_table.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/runner/tok_embedding_table.h
   ${CMAKE_CURRENT_LIST_DIR}/runner/lm_head_pieces.cpp
   ${CMAKE_CURRENT_LIST_DIR}/runner/lm_head_pieces.h
   ${CMAKE_CURRENT_LIST_DIR}/runner/u16_scan.h

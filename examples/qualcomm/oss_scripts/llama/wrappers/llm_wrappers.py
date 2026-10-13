@@ -595,6 +595,22 @@ class TextDecoder(Component):
         if "get_draft_logits_out_scale" not in self.meta:
             raise RuntimeError("draft lm_head output quant params not found")
 
+    def _write_tok_embedding_table(self, path):
+        """The converted tok_embedding graph is DQ(table) -> embedding -> Q with one
+        per-tensor encoding, so its output for a token is that token's row of the
+        stored uint16 codes. Written row-major for a CPU gather."""
+        gm = self.tok_embedding
+        dq = next(
+            n
+            for n in gm.graph.nodes
+            if n.target == torch.ops.quantized_decomposed.dequantize_per_tensor.default
+        )
+        assert (dq.args[3], dq.args[4]) == (0, 65535), dq.args
+        codes = getattr(gm, dq.args[0].target)
+        assert codes.dim() == 2
+        codes.cpu().numpy().astype("<u2").tofile(path)
+        logging.info(f"tok_embedding table written to {path}")
+
     def _save_embeds_quant_attrs(self):
         # headless emb-split: read the tok_embedding output (embeds) quant scale/zp so it
         # can be injected onto the decoder's inputs_embeds input, making emb->decoder a
@@ -1541,6 +1557,7 @@ class HybridTextDecoder(Component):
         ]
         vocab = exported[0][1]
         assert all(v == vocab for _, v in exported)
+        lm_head_pieces.write_cpu_tables(exported[0][0], vocab, self.control_args.artifact)
         entries = list(
             zip(
                 exported,
@@ -1689,7 +1706,16 @@ class HybridTextDecoder(Component):
         lm_head_only = getattr(self.control_args, "dflash_lm_head_only", False)
 
         # start lowering
-        if self.apply_embedding and not lm_head_only:
+        emb_cpu = (
+            self.apply_embedding
+            and self.control_args.model_mode == "dflash"
+            and self.control_args.dflash_emb_cpu
+        )
+        if emb_cpu:
+            self.decode._write_tok_embedding_table(
+                f"{self.control_args.artifact}/tok_embedding_rowmajor_u16.bin"
+            )
+        if self.apply_embedding and not lm_head_only and not emb_cpu:
             tok_embedding_edge_prog_mgr = to_edge_transform_and_lower_to_qnn(
                 module=dict(zip(tok_embedding_graph_names, tok_embedding_modules)),
                 inputs=dict(

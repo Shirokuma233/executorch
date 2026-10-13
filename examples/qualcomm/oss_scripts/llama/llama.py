@@ -7,6 +7,7 @@
 # TODO: reenable pyre after fixing the issues
 # pyre-ignore-all-errors
 
+import argparse
 import json
 import logging
 import os
@@ -852,6 +853,14 @@ def _build_parser():
         "encodings do not depend on the draft's quantization: use the target, emb "
         "and lm_head ptes of any earlier build with the same calibration "
         "(--prompt, --seed, --dflash_tree_nodes, --max_seq_len, --prefill_ar_len).",
+    )
+    parser.add_argument(
+        "--dflash_emb_cpu",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="[DFlash mode] Serve the token embedding from the CPU: write its quantized "
+        "table row-major (tok_embedding_rowmajor_u16.bin) instead of lowering the "
+        "embedding pte. --no-dflash_emb_cpu lowers the pte.",
     )
     parser.add_argument(
         "--dflash_lm_head_only",

@@ -8,6 +8,7 @@
 
 #pragma once
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/lm_head_pieces.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/tok_embedding_table.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/attention_sink_rope_runner.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/cache_utils.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/decoder_runner.h>
@@ -55,7 +56,10 @@ class PromptProcessor {
       float logits_scale = 1.0f,
       int32_t logits_zero_point = 0,
       // Replaces lm_head_module: the prefill head as row-disjoint pieces.
-      LmHeadPieces* lm_head_pieces = nullptr);
+      LmHeadPieces* lm_head_pieces = nullptr,
+      // Serves the token embedding from the CPU in place of emb_module. With both,
+      // the emb pte also runs and its output is compared byte for byte.
+      const TokEmbeddingTable* emb_table = nullptr);
 
   virtual ~PromptProcessor() = default;
 
@@ -164,6 +168,10 @@ class PromptProcessor {
 
   // DFlash headless-decoder companions. Null for every other eval mode.
   executorch::extension::Module* emb_module_ = nullptr;
+  const TokEmbeddingTable* emb_table_ = nullptr;
+  bool headless_ = false;
+  std::vector<uint64_t> emb_tokens_;
+  uint64_t emb_verify_bad_ = 0;
   executorch::extension::Module* lm_head_module_ = nullptr;
   LmHeadPieces* lm_head_pieces_ = nullptr;
   std::vector<std::byte*> piece_logits_bufs_;
